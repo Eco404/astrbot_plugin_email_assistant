@@ -13,7 +13,10 @@ from astrbot.api.star import Context, Star, register
 from astrbot.core.message.components import Plain
 
 from .account_utils import (
+    account_owner_user_id,
+    account_target_platform,
     command_payload,
+    is_admin,
     parse_reply_payload,
     parse_send_payload,
     resolve_account,
@@ -42,7 +45,7 @@ def _one_line(value: Any, limit: int = 160) -> str:
     PLUGIN_NAME,
     "econeco",
     "支持多账户 IMAP 收信通知、查询以及 SMTP 发送和回复的邮件助手",
-    "1.1.0",
+    "1.2.0",
 )
 class EmailAssistantPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig) -> None:
@@ -87,8 +90,8 @@ class EmailAssistantPlugin(Star):
         duplicates = [item for item in self._accounts() if _one_line(item.get("account_id"), 80) == account_id]
         if len(duplicates) != 1:
             return f"account_id“{account_id}”不唯一，请修正配置。"
-        if require_owner and not _one_line(account.get("owner_umo"), 240):
-            return "账户未绑定私聊 owner_umo。"
+        if require_owner and not account_owner_user_id(account):
+            return "账户未绑定私聊目标用户 ID。"
         return ""
 
     def _cursor_key(self, account: dict[str, Any]) -> str:
@@ -131,7 +134,7 @@ class EmailAssistantPlugin(Star):
                     break
                 if not account.get("enabled", True) or not account.get("receive_enabled", True):
                     continue
-                if not _one_line(account.get("owner_umo"), 240):
+                if not account_owner_user_id(account):
                     continue
                 try:
                     await self._check_account(account)
@@ -150,13 +153,92 @@ class EmailAssistantPlugin(Star):
             except asyncio.TimeoutError:
                 continue
 
+    @staticmethod
+    def _platform_meta_value(meta: Any, key: str) -> str:
+        if isinstance(meta, dict):
+            return str(meta.get(key) or "").strip()
+        return str(getattr(meta, key, "") or "").strip()
+
+    def _platform_instances(self) -> list[Any]:
+        manager = getattr(self.context, "platform_manager", None)
+        if manager is None:
+            return []
+        try:
+            return list(manager.get_insts())
+        except Exception:
+            return list(getattr(manager, "platform_insts", []) or [])
+
+    def _resolve_notification_umo(self, account: dict[str, Any]) -> str:
+        owner_id = _one_line(account_owner_user_id(account), 160)
+        if not owner_id:
+            raise ValueError("账户未绑定私聊目标用户 ID。")
+        selector = _one_line(account_target_platform(account), 120)
+        manager = getattr(self.context, "platform_manager", None)
+        platforms = self._platform_instances()
+        if manager is None:
+            legacy_umo = _one_line(account.get("owner_umo"), 240)
+            if legacy_umo:
+                return legacy_umo
+            return f"{selector}:FriendMessage:{owner_id}"
+        if not platforms:
+            raise RuntimeError("当前没有已加载的消息平台，无法发送新邮件通知。")
+
+        matches: list[tuple[Any, str, str]] = []
+        for platform in platforms:
+            try:
+                meta = platform.meta()
+            except Exception:
+                continue
+            platform_id = self._platform_meta_value(meta, "id")
+            platform_name = self._platform_meta_value(meta, "name")
+            if selector in {platform_id, platform_name} or selector.lower() == platform_name.lower():
+                matches.append((platform, platform_id, platform_name))
+        if not matches:
+            raise RuntimeError(
+                f"未找到目标平台“{selector}”，请确认平台已启用，或填写平台实例 ID。"
+            )
+        exact_id_matches = [item for item in matches if item[1] == selector]
+        if exact_id_matches:
+            matches = exact_id_matches
+        if len(matches) > 1:
+            ids = "、".join(item[1] for item in matches if item[1])
+            raise RuntimeError(
+                f"目标平台“{selector}”匹配到多个实例，请在配置中填写平台实例 ID：{ids}"
+            )
+        platform_id = matches[0][1]
+        if not platform_id:
+            raise RuntimeError(f"目标平台“{selector}”没有可用的实例 ID。")
+        return f"{platform_id}:FriendMessage:{owner_id}"
+
+    def _account_matches_event_platform(self, account: dict[str, Any], umo: str) -> bool:
+        event_platform_id = str(umo or "").split(":", 1)[0].strip()
+        if not event_platform_id:
+            return False
+        selector = account_target_platform(account)
+        if event_platform_id == selector:
+            return True
+        for platform in self._platform_instances():
+            try:
+                meta = platform.meta()
+            except Exception:
+                continue
+            platform_id = self._platform_meta_value(meta, "id")
+            platform_name = self._platform_meta_value(meta, "name")
+            if event_platform_id == platform_id and (
+                selector in {platform_id, platform_name}
+                or selector.lower() == platform_name.lower()
+            ):
+                return True
+        legacy_umo = str(account.get("owner_umo") or "").strip()
+        return bool(legacy_umo and legacy_umo == str(umo or "").strip())
+
     async def _send_title_notification(self, account: dict[str, Any], subject: str) -> None:
-        owner_umo = _one_line(account.get("owner_umo"), 240)
-        if not owner_umo:
-            raise ValueError("账户未绑定私聊 owner_umo。")
+        owner_umo = self._resolve_notification_umo(account)
         title = _one_line(subject or "(无主题)", 300)
         text = f"📧 [{self._display_name(account)}] 新邮件：{title}"
-        await self.context.send_message(owner_umo, MessageChain([Plain(text)]))
+        sent = await self.context.send_message(owner_umo, MessageChain([Plain(text)]))
+        if sent is False:
+            raise RuntimeError(f"AstrBot 未找到目标平台，会话 {owner_umo} 未发送。")
 
     async def _check_account(self, account: dict[str, Any]) -> tuple[int, bool]:
         validation_error = self._validate_account(account, require_owner=True)
@@ -224,11 +306,15 @@ class EmailAssistantPlugin(Star):
         return "FriendMessage" in str(getattr(event, "unified_msg_origin", "") or "")
 
     def _visible_accounts(self, event: AstrMessageEvent) -> list[dict[str, Any]]:
-        return visible_accounts(
+        accounts = visible_accounts(
             self.config,
             umo=str(getattr(event, "unified_msg_origin", "") or ""),
             sender_id=self._sender_id(event),
         )
+        if is_admin(self._sender_id(event), self.config):
+            return accounts
+        umo = str(getattr(event, "unified_msg_origin", "") or "")
+        return [item for item in accounts if self._account_matches_event_platform(item, umo)]
 
     async def _guard_private(self, event: AstrMessageEvent) -> bool:
         if self._is_private(event):
@@ -245,10 +331,12 @@ class EmailAssistantPlugin(Star):
 
     @filter.command_group("email", alias={"邮箱"})
     def email_group(self):
+        """管理邮箱账户，检查、查询、发送和回复邮件"""
         pass
 
     @email_group.command("help", alias={"帮助"})
     async def cmd_help(self, event: AstrMessageEvent):
+        """查看邮件助手命令帮助"""
         if not await self._guard_private(event):
             yield event.plain_result("❌ 邮件命令只能在私聊中使用。")
             return
@@ -265,6 +353,7 @@ class EmailAssistantPlugin(Star):
 
     @email_group.command("status", alias={"状态"})
     async def cmd_status(self, event: AstrMessageEvent, account: str = ""):
+        """查看可用邮箱及最近检查状态"""
         if not await self._guard_private(event):
             yield event.plain_result("❌ 邮件命令只能在私聊中使用。")
             return
@@ -299,6 +388,7 @@ class EmailAssistantPlugin(Star):
 
     @email_group.command("test", alias={"测试"})
     async def cmd_test(self, event: AstrMessageEvent, account: str = ""):
+        """测试邮箱的 IMAP 和 SMTP 登录"""
         if not await self._guard_private(event):
             yield event.plain_result("❌ 邮件命令只能在私聊中使用。")
             return
@@ -327,6 +417,7 @@ class EmailAssistantPlugin(Star):
 
     @email_group.command("check", alias={"检查"})
     async def cmd_check(self, event: AstrMessageEvent, account: str = ""):
+        """立即检查新邮件并通知绑定用户"""
         if not await self._guard_private(event):
             yield event.plain_result("❌ 邮件命令只能在私聊中使用。")
             return
@@ -354,6 +445,7 @@ class EmailAssistantPlugin(Star):
 
     @email_group.command("list", alias={"列表"})
     async def cmd_list(self, event: AstrMessageEvent, account: str, since_date: str = ""):
+        """列出邮箱中指定日期以来的邮件"""
         if not await self._guard_private(event):
             yield event.plain_result("❌ 邮件命令只能在私聊中使用。")
             return
@@ -385,6 +477,7 @@ class EmailAssistantPlugin(Star):
 
     @email_group.command("show", alias={"详情"})
     async def cmd_show(self, event: AstrMessageEvent, account: str, uid: int):
+        """查看指定 UID 邮件的详情和正文摘要"""
         if not await self._guard_private(event):
             yield event.plain_result("❌ 邮件命令只能在私聊中使用。")
             return
@@ -413,6 +506,7 @@ class EmailAssistantPlugin(Star):
 
     @email_group.command("send", alias={"发送"})
     async def cmd_send(self, event: AstrMessageEvent):
+        """使用指定邮箱发送纯文本邮件"""
         if not await self._guard_private(event):
             yield event.plain_result("❌ 邮件命令只能在私聊中使用。")
             return
@@ -439,6 +533,7 @@ class EmailAssistantPlugin(Star):
 
     @email_group.command("reply", alias={"回复"})
     async def cmd_reply(self, event: AstrMessageEvent):
+        """回复指定 UID 的邮件并保留线程信息"""
         if not await self._guard_private(event):
             yield event.plain_result("❌ 邮件命令只能在私聊中使用。")
             return

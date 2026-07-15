@@ -4,6 +4,32 @@ import shlex
 from typing import Any
 
 
+def private_user_id(value: Any) -> str:
+    """Normalize a plain private user ID or extract it from a private UMO."""
+    text = str(value or "").strip()
+    marker = ":FriendMessage:"
+    if marker in text:
+        text = text.split(marker, 1)[1].strip()
+    return text
+
+
+def account_owner_user_id(account: dict[str, Any]) -> str:
+    owner_id = private_user_id(account.get("owner_user_id"))
+    if owner_id:
+        return owner_id
+    return private_user_id(account.get("owner_umo"))
+
+
+def account_target_platform(account: dict[str, Any]) -> str:
+    configured = str(account.get("target_platform") or "").strip()
+    if configured:
+        return configured
+    legacy_umo = str(account.get("owner_umo") or "").strip()
+    if ":FriendMessage:" in legacy_umo:
+        return legacy_umo.split(":", 1)[0].strip()
+    return "aiocqhttp"
+
+
 def enabled_accounts(config: dict[str, Any]) -> list[dict[str, Any]]:
     accounts = config.get("mail_accounts", []) if isinstance(config, dict) else []
     return [item for item in accounts if isinstance(item, dict) and item.get("enabled", True)]
@@ -20,7 +46,16 @@ def visible_accounts(
     accounts = enabled_accounts(config)
     if is_admin(sender_id, config):
         return accounts
-    return [item for item in accounts if str(item.get("owner_umo") or "").strip() == str(umo or "").strip()]
+    sender_id = private_user_id(sender_id)
+    visible: list[dict[str, Any]] = []
+    for item in accounts:
+        owner_id = account_owner_user_id(item)
+        if owner_id == sender_id or (
+            not owner_id
+            and str(item.get("owner_umo") or "").strip() == str(umo or "").strip()
+        ):
+            visible.append(item)
+    return visible
 
 
 def resolve_account(accounts: list[dict[str, Any]], selector: str) -> tuple[dict[str, Any] | None, str]:

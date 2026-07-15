@@ -102,7 +102,8 @@ ACCOUNT = {
     "account_id": "one",
     "name": "私人邮箱",
     "enabled": True,
-    "owner_umo": "p:FriendMessage:1",
+    "owner_user_id": "1",
+    "target_platform": "p",
     "receive_enabled": True,
     "query_enabled": True,
     "send_enabled": True,
@@ -122,6 +123,32 @@ class FakeContext:
         if self.fail:
             raise RuntimeError("platform unavailable")
         self.sent.append((umo, chain[0].text))
+        return True
+
+
+class FakePlatform:
+    def __init__(self, platform_id, name):
+        self._meta = types.SimpleNamespace(id=platform_id, name=name)
+
+    def meta(self):
+        return self._meta
+
+
+class FakePlatformManager:
+    def __init__(self, *platforms):
+        self.platform_insts = list(platforms)
+
+    def get_insts(self):
+        return self.platform_insts
+
+
+class FakeEvent:
+    def __init__(self, sender_id, umo):
+        self.sender_id = sender_id
+        self.unified_msg_origin = umo
+
+    def get_sender_id(self):
+        return self.sender_id
 
 
 class MainRuntimeTests(unittest.IsolatedAsyncioTestCase):
@@ -169,6 +196,55 @@ class MainRuntimeTests(unittest.IsolatedAsyncioTestCase):
             return_value=[FetchItem(2, parsed(2))],
         ):
             with self.assertRaises(RuntimeError):
+                await self.plugin._check_account(self.account)
+        self.assertEqual(await self.plugin.get_kv_data(self.plugin._cursor_key(self.account)), 1)
+
+    async def test_notification_resolves_adapter_name_to_platform_instance_id(self):
+        self.context.platform_manager = FakePlatformManager(
+            FakePlatform("onebot-instance-id", "aiocqhttp")
+        )
+        self.account["target_platform"] = "aiocqhttp"
+        await self.plugin._send_title_notification(self.account, "平台测试")
+        self.assertEqual(
+            self.context.sent[-1],
+            (
+                "onebot-instance-id:FriendMessage:1",
+                "📧 [私人邮箱] 新邮件：平台测试",
+            ),
+        )
+
+    async def test_notification_rejects_ambiguous_platform_name(self):
+        self.context.platform_manager = FakePlatformManager(
+            FakePlatform("onebot-a", "aiocqhttp"),
+            FakePlatform("onebot-b", "aiocqhttp"),
+        )
+        self.account["target_platform"] = "aiocqhttp"
+        with self.assertRaisesRegex(RuntimeError, "多个实例"):
+            await self.plugin._send_title_notification(self.account, "平台测试")
+
+    def test_visible_accounts_match_real_platform_instance_to_adapter_name(self):
+        self.context.platform_manager = FakePlatformManager(
+            FakePlatform("onebot-instance-id", "aiocqhttp"),
+            FakePlatform("telegram-instance-id", "telegram"),
+        )
+        self.account["target_platform"] = "aiocqhttp"
+        matching = FakeEvent("1", "onebot-instance-id:FriendMessage:1")
+        other_platform = FakeEvent("1", "telegram-instance-id:FriendMessage:1")
+        self.assertEqual(self.plugin._visible_accounts(matching), [self.account])
+        self.assertEqual(self.plugin._visible_accounts(other_platform), [])
+
+    async def test_false_send_result_does_not_advance_cursor(self):
+        await self.plugin.put_kv_data(self.plugin._cursor_key(self.account), 1)
+
+        async def not_sent(umo, chain):
+            return False
+
+        self.context.send_message = not_sent
+        with patch(
+            "astrbot_plugin_email_assistant.main.fetch_after_uid",
+            return_value=[FetchItem(2, parsed(2))],
+        ):
+            with self.assertRaisesRegex(RuntimeError, "未找到目标平台"):
                 await self.plugin._check_account(self.account)
         self.assertEqual(await self.plugin.get_kv_data(self.plugin._cursor_key(self.account)), 1)
 

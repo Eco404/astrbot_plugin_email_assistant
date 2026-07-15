@@ -16,14 +16,15 @@ v1 **不会调用 LLM，也不会写入 AstrBot 官方对话历史**。邮件正
 在 AstrBot 插件配置页添加 `mail_accounts`。每个账户至少配置：
 
 - `account_id`：稳定且唯一的账户标识，例如 `personal_qq`；
-- `owner_umo`：绑定用户完整的私聊 `unified_msg_origin`，例如 `aiocqhttp:FriendMessage:12345678`；
+- `owner_user_id`：绑定的私聊用户 ID；OneBot/aiocqhttp 通常填写 QQ 号，误填完整私聊 UMO 时会自动提取用户 ID；
+- `target_platform`：主动通知使用的平台适配器名，OneBot 通常填写 `aiocqhttp`；插件会在发送时匹配在线实例的真实平台 ID；
 - `email`、`username`、`password`；
 - IMAP 主机、端口和安全模式；
 - SMTP 主机、端口和安全模式。
 
 不要填写邮箱网页登录密码。优先使用邮箱服务商签发的应用密码或客户端授权码。配置文件会保存凭据，请限制 AstrBot 数据目录的文件权限，不要把真实配置提交到 Git。
 
-同一个 `owner_umo` 可以绑定多个账户；每个账户只能绑定一个私聊用户。管理员 UID 可以在私聊中管理全部账户，普通用户只能操作绑定给自己的账户。
+同一个私聊用户可以绑定多个账户；每个账户只能绑定一个私聊用户。管理员 UID 可以在私聊中管理全部账户，普通用户只能在绑定的平台中操作绑定给自己的账户。旧版 `owner_umo` 配置仍会作为兼容后备读取。
 
 首次启用接收时，插件只保存当前最大 IMAP UID 作为基线，不会推送历史邮件。关闭接收后游标会保留，重新开启会继续处理停用期间积累的新邮件，单次处理数量受 `max_fetch_per_check` 限制。
 
@@ -62,6 +63,8 @@ v1 **不会调用 LLM，也不会写入 AstrBot 官方对话历史**。邮件正
 /email send <账户> <收件人> <主题>|<正文>
 /email reply <账户> <UID> <正文>
 ```
+
+使用 `/email send` 时，主题与正文必须使用半角竖线 `|` 分隔；全角竖线 `｜` 不会被识别为分隔符。
 
 示例：
 
