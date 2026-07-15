@@ -7,6 +7,34 @@ from email.utils import formataddr, parseaddr
 from typing import Any
 
 from .mail_parser import ParsedMail
+from .proxy_utils import ProxyConfig, create_connection, proxy_config_from_account
+
+
+class _ProxySMTP(smtplib.SMTP):
+    def __init__(self, host: str, port: int, *, timeout: int, proxy: ProxyConfig) -> None:
+        self._mail_proxy = proxy
+        super().__init__(host, port, timeout=timeout)
+
+    def _get_socket(self, host, port, timeout):
+        return create_connection((host, port), proxy=self._mail_proxy, timeout=timeout)
+
+
+class _ProxySMTPSSL(smtplib.SMTP_SSL):
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        *,
+        timeout: int,
+        context: ssl.SSLContext,
+        proxy: ProxyConfig,
+    ) -> None:
+        self._mail_proxy = proxy
+        super().__init__(host, port, timeout=timeout, context=context)
+
+    def _get_socket(self, host, port, timeout):
+        raw_socket = create_connection((host, port), proxy=self._mail_proxy, timeout=timeout)
+        return self.context.wrap_socket(raw_socket, server_hostname=host)
 
 
 def _smtp_identity(account: dict[str, Any]) -> tuple[str, str, str]:
@@ -39,10 +67,17 @@ def _connect(account: dict[str, Any], timeout: int):
     if not host or port <= 0:
         raise ValueError("SMTP 服务器或端口配置无效。")
     context = ssl.create_default_context()
+    proxy = proxy_config_from_account(account)
     if security == "ssl":
+        if proxy.enabled:
+            return _ProxySMTPSSL(host, port, timeout=timeout, context=context, proxy=proxy)
         return smtplib.SMTP_SSL(host, port, timeout=timeout, context=context)
     if security == "starttls":
-        client = smtplib.SMTP(host, port, timeout=timeout)
+        client = (
+            _ProxySMTP(host, port, timeout=timeout, proxy=proxy)
+            if proxy.enabled
+            else smtplib.SMTP(host, port, timeout=timeout)
+        )
         client.ehlo()
         client.starttls(context=context)
         client.ehlo()
@@ -120,4 +155,3 @@ def test_smtp(account: dict[str, Any], timeout: int = 20) -> None:
             client.quit()
         except Exception:
             client.close()
-

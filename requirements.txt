@@ -1,2 +1,1 @@
-# v1 only uses the Python standard library.
-
+PySocks>=1.7.1,<2

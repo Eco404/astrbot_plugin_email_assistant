@@ -7,6 +7,7 @@
 - 使用 SMTP SSL/STARTTLS 发送纯文本邮件；
 - 根据原邮件 `Reply-To`、`Message-ID` 和 `References` 发送线程回复；
 - 每个邮箱独立开关接收、查询和发送权限。
+- 每个邮箱可独立设置 HTTP CONNECT、SOCKS4 或 SOCKS5 网络代理。
 
 v1 **不会调用 LLM，也不会写入 AstrBot 官方对话历史**。邮件正文只在用户主动执行详情命令时显示。
 
@@ -25,6 +26,17 @@ v1 **不会调用 LLM，也不会写入 AstrBot 官方对话历史**。邮件正
 同一个 `owner_umo` 可以绑定多个账户；每个账户只能绑定一个私聊用户。管理员 UID 可以在私聊中管理全部账户，普通用户只能操作绑定给自己的账户。
 
 首次启用接收时，插件只保存当前最大 IMAP UID 作为基线，不会推送历史邮件。关闭接收后游标会保留，重新开启会继续处理停用期间积累的新邮件，单次处理数量受 `max_fetch_per_check` 限制。
+
+### 账户级网络代理
+
+每个邮箱账户都可以单独配置代理，IMAP 和 SMTP 会共同使用该账户的代理，不影响其他账户：
+
+- `proxy_type`：`none`、`http`、`socks4` 或 `socks5`；
+- `proxy_host` / `proxy_port`：代理服务器地址和端口；
+- `proxy_username` / `proxy_password`：可选代理认证；
+- `proxy_dns`：让代理端解析邮箱服务器域名，建议开启。
+
+代理通过 PySocks 建立单次连接，没有全局修改 Python `socket`，所以多个邮箱可以同时使用不同代理。`http` 使用 HTTP CONNECT 隧道；所选代理必须允许连接目标 IMAP/SMTP 端口。代理配置错误会同时影响该账户的自动收信、查询、发送和 `/email test`，但不会阻断其他邮箱账户。
 
 ## 常见服务器配置
 
@@ -75,4 +87,3 @@ v1 **不会调用 LLM，也不会写入 AstrBot 官方对话历史**。邮件正
 ## 后续版本
 
 邮件解析、通知构造和消息发送相互独立。后续可以在通知构造阶段加入当前人格 LLM 转述，并在发送成功后把“邮件主动承接占位 + assistant 回复”写入 AstrBot 官方历史，而不改动 IMAP/SMTP 层。
-

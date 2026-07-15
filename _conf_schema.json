@@ -114,6 +114,41 @@
             "type": "string",
             "description": "发件人显示名称",
             "default": "AstrBot"
+          },
+          "proxy_type": {
+            "type": "string",
+            "description": "网络代理类型",
+            "hint": "该代理只作用于当前邮箱账户的 IMAP 和 SMTP 连接。",
+            "options": ["none", "http", "socks4", "socks5"],
+            "default": "none"
+          },
+          "proxy_host": {
+            "type": "string",
+            "description": "代理服务器地址",
+            "default": ""
+          },
+          "proxy_port": {
+            "type": "int",
+            "description": "代理服务器端口",
+            "default": 1080
+          },
+          "proxy_username": {
+            "type": "string",
+            "description": "代理用户名",
+            "hint": "代理不需要认证时留空。",
+            "default": ""
+          },
+          "proxy_password": {
+            "type": "string",
+            "description": "代理密码",
+            "hint": "代理不需要认证时留空。",
+            "default": ""
+          },
+          "proxy_dns": {
+            "type": "bool",
+            "description": "通过代理解析邮箱服务器域名",
+            "hint": "建议保持开启，避免本地 DNS 泄漏或本地无法解析目标域名。",
+            "default": true
           }
         }
       }
@@ -152,4 +187,3 @@
     "default": 4000
   }
 }
-

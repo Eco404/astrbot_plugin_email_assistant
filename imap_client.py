@@ -7,6 +7,7 @@ from datetime import datetime
 from typing import Any
 
 from .mail_parser import ParsedMail, parse_mail
+from .proxy_utils import ProxyConfig, create_connection, proxy_config_from_account
 
 
 @dataclass(slots=True)
@@ -24,6 +25,33 @@ def _positive_int(value: Any, default: int) -> int:
     return parsed if parsed > 0 else default
 
 
+class _ProxyIMAP4(imaplib.IMAP4):
+    def __init__(self, host: str, port: int, *, timeout: int, proxy: ProxyConfig) -> None:
+        self._mail_proxy = proxy
+        super().__init__(host, port, timeout=timeout)
+
+    def _create_socket(self, timeout):
+        return create_connection((self.host, self.port), proxy=self._mail_proxy, timeout=timeout)
+
+
+class _ProxyIMAP4SSL(imaplib.IMAP4_SSL):
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        *,
+        ssl_context: ssl.SSLContext,
+        timeout: int,
+        proxy: ProxyConfig,
+    ) -> None:
+        self._mail_proxy = proxy
+        super().__init__(host, port, ssl_context=ssl_context, timeout=timeout)
+
+    def _create_socket(self, timeout):
+        raw_socket = create_connection((self.host, self.port), proxy=self._mail_proxy, timeout=timeout)
+        return self.ssl_context.wrap_socket(raw_socket, server_hostname=self.host)
+
+
 class ImapMailbox:
     def __init__(self, account: dict[str, Any], timeout: int = 20) -> None:
         self.account = account
@@ -39,10 +67,24 @@ class ImapMailbox:
         if not host or not username or not password:
             raise ValueError("IMAP 配置不完整，请检查服务器、用户名和授权码。")
         context = ssl.create_default_context()
+        proxy = proxy_config_from_account(self.account)
         if security == "ssl":
-            self.connection = imaplib.IMAP4_SSL(host, port, ssl_context=context, timeout=self.timeout)
+            if proxy.enabled:
+                self.connection = _ProxyIMAP4SSL(
+                    host,
+                    port,
+                    ssl_context=context,
+                    timeout=self.timeout,
+                    proxy=proxy,
+                )
+            else:
+                self.connection = imaplib.IMAP4_SSL(host, port, ssl_context=context, timeout=self.timeout)
         elif security == "starttls":
-            self.connection = imaplib.IMAP4(host, port, timeout=self.timeout)
+            self.connection = (
+                _ProxyIMAP4(host, port, timeout=self.timeout, proxy=proxy)
+                if proxy.enabled
+                else imaplib.IMAP4(host, port, timeout=self.timeout)
+            )
             self.connection.starttls(ssl_context=context)
         else:
             raise ValueError("IMAP 安全模式仅支持 ssl 或 starttls。")

@@ -42,7 +42,7 @@ def _one_line(value: Any, limit: int = 160) -> str:
     PLUGIN_NAME,
     "econeco",
     "支持多账户 IMAP 收信通知、查询以及 SMTP 发送和回复的邮件助手",
-    "1.0.0",
+    "1.1.0",
 )
 class EmailAssistantPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig) -> None:
