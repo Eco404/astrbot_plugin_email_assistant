@@ -1,0 +1,2 @@
+"""AstrBot Email Assistant plugin."""
+

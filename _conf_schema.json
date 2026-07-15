@@ -1,0 +1,155 @@
+{
+  "mail_accounts": {
+    "type": "template_list",
+    "description": "邮箱账户",
+    "hint": "每个邮箱绑定一个私聊 unified_msg_origin；请优先使用邮箱服务商提供的应用密码或授权码。",
+    "templates": {
+      "email_account": {
+        "name": "邮箱账户",
+        "hint": "独立的 IMAP/SMTP 邮箱配置",
+        "items": {
+          "account_id": {
+            "type": "string",
+            "description": "账户 ID",
+            "hint": "稳定且唯一，只建议使用字母、数字、下划线和短横线；修改后会重新建立收信基线。",
+            "default": "mail_1"
+          },
+          "name": {
+            "type": "string",
+            "description": "显示名称",
+            "default": "我的邮箱"
+          },
+          "enabled": {
+            "type": "bool",
+            "description": "启用账户",
+            "default": true
+          },
+          "owner_umo": {
+            "type": "string",
+            "description": "绑定的私聊会话 ID",
+            "hint": "完整 unified_msg_origin，例如 aiocqhttp:FriendMessage:12345678。",
+            "default": ""
+          },
+          "receive_enabled": {
+            "type": "bool",
+            "description": "允许接收和新邮件标题通知",
+            "default": true
+          },
+          "query_enabled": {
+            "type": "bool",
+            "description": "允许查询邮件列表和详情",
+            "default": true
+          },
+          "send_enabled": {
+            "type": "bool",
+            "description": "允许发送和回复邮件",
+            "default": true
+          },
+          "email": {
+            "type": "string",
+            "description": "邮箱地址",
+            "default": ""
+          },
+          "username": {
+            "type": "string",
+            "description": "IMAP 登录用户名",
+            "hint": "留空时使用邮箱地址。",
+            "default": ""
+          },
+          "password": {
+            "type": "string",
+            "description": "邮箱应用密码/授权码",
+            "default": ""
+          },
+          "imap_host": {
+            "type": "string",
+            "description": "IMAP 服务器",
+            "default": ""
+          },
+          "imap_port": {
+            "type": "int",
+            "description": "IMAP 端口",
+            "default": 993
+          },
+          "imap_security": {
+            "type": "string",
+            "description": "IMAP 安全模式",
+            "options": ["ssl", "starttls"],
+            "default": "ssl"
+          },
+          "folder": {
+            "type": "string",
+            "description": "IMAP 文件夹",
+            "default": "INBOX"
+          },
+          "smtp_host": {
+            "type": "string",
+            "description": "SMTP 服务器",
+            "default": ""
+          },
+          "smtp_port": {
+            "type": "int",
+            "description": "SMTP 端口",
+            "default": 465
+          },
+          "smtp_security": {
+            "type": "string",
+            "description": "SMTP 安全模式",
+            "options": ["ssl", "starttls"],
+            "default": "ssl"
+          },
+          "smtp_username": {
+            "type": "string",
+            "description": "SMTP 登录用户名",
+            "hint": "留空时复用 IMAP 用户名或邮箱地址。",
+            "default": ""
+          },
+          "smtp_password": {
+            "type": "string",
+            "description": "SMTP 应用密码/授权码",
+            "hint": "留空时复用邮箱授权码。",
+            "default": ""
+          },
+          "sender_name": {
+            "type": "string",
+            "description": "发件人显示名称",
+            "default": "AstrBot"
+          }
+        }
+      }
+    }
+  },
+  "admin_uids": {
+    "type": "list",
+    "description": "管理员用户 ID",
+    "hint": "管理员仍只能在私聊中执行命令，但可以操作全部邮箱。",
+    "default": []
+  },
+  "poll_interval_seconds": {
+    "type": "int",
+    "description": "自动检查间隔（秒）",
+    "hint": "运行时最小按 30 秒处理。",
+    "default": 60
+  },
+  "network_timeout_seconds": {
+    "type": "int",
+    "description": "邮件服务器连接超时（秒）",
+    "default": 20
+  },
+  "max_fetch_per_check": {
+    "type": "int",
+    "description": "每账户单次最多处理的新邮件数",
+    "default": 20
+  },
+  "max_query_results": {
+    "type": "int",
+    "description": "列表查询最多返回邮件数",
+    "default": 20
+  },
+  "detail_body_max_chars": {
+    "type": "int",
+    "description": "单封邮件详情正文最大字符数",
+    "default": 4000
+  }
+}
+
