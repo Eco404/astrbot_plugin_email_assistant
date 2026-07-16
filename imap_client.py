@@ -168,6 +168,20 @@ def query_since(
         return results
 
 
+def fetch_latest(
+    account: dict[str, Any], since: datetime | None = None, timeout: int = 20
+) -> ParsedMail | None:
+    criterion = f'SINCE "{since.strftime("%d-%b-%Y")}"' if since else "ALL"
+    with ImapMailbox(account, timeout) as mailbox:
+        uids = mailbox.search_uids(criterion)
+        for uid in reversed(uids):
+            try:
+                return mailbox.fetch_uid(uid)
+            except Exception:
+                continue
+    return None
+
+
 def fetch_detail(account: dict[str, Any], uid: int, timeout: int = 20) -> ParsedMail:
     with ImapMailbox(account, timeout) as mailbox:
         return mailbox.fetch_uid(uid)

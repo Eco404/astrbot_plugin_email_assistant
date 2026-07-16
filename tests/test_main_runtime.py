@@ -73,9 +73,13 @@ def _install_astrbot_stubs():
     def llm_tool(*args, **kwargs):
         return lambda fn: fn
 
+    def on_llm_request(*args, **kwargs):
+        return lambda fn: fn
+
     event_mod.filter = types.SimpleNamespace(
         command_group=command_group,
         llm_tool=llm_tool,
+        on_llm_request=on_llm_request,
     )
     platform_api.MessageType = MessageType
     star_mod.Context = object
@@ -474,6 +478,32 @@ class MainRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["accounts"][0]["account_id"], "one")
         self.assertNotIn("password", result["accounts"][0])
 
+    async def test_llm_request_injects_silent_email_tool_rules_once(self):
+        event = FakeEvent("1", "p:FriendMessage:1")
+        req = types.SimpleNamespace(system_prompt="原人格提示")
+
+        await self.plugin.inject_email_tool_conversation_rules(event, req)
+        first_prompt = req.system_prompt
+        await self.plugin.inject_email_tool_conversation_rules(event, req)
+
+        self.assertIn("原人格提示", req.system_prompt)
+        self.assertIn("直接返回工具调用", req.system_prompt)
+        self.assertIn("不要逐步播报", req.system_prompt)
+        self.assertEqual(req.system_prompt, first_prompt)
+
+    async def test_llm_request_does_not_inject_for_group_or_unbound_user(self):
+        group_req = types.SimpleNamespace(system_prompt="原提示")
+        await self.plugin.inject_email_tool_conversation_rules(
+            FakeEvent("1", "p:GroupMessage:1"), group_req
+        )
+        self.assertEqual(group_req.system_prompt, "原提示")
+
+        other_req = types.SimpleNamespace(system_prompt="原提示")
+        await self.plugin.inject_email_tool_conversation_rules(
+            FakeEvent("2", "p:FriendMessage:2"), other_req
+        )
+        self.assertEqual(other_req.system_prompt, "原提示")
+
     async def test_llm_tool_lists_messages_with_limit(self):
         event = FakeEvent("1", "p:FriendMessage:1")
         mail = ParsedMail(
@@ -519,10 +549,48 @@ class MainRuntimeTests(unittest.IsolatedAsyncioTestCase):
             "",
         )
         with patch("astrbot_plugin_email_assistant.main.fetch_detail", return_value=mail):
-            result = json.loads(await self.plugin.tool_show_message(event, "one", 13))
+            result = json.loads(
+                await self.plugin.tool_show_message(event, 13, account="one")
+            )
         self.assertTrue(result["success"])
         self.assertTrue(result["message"]["body_truncated"])
         self.assertLessEqual(len(result["message"]["body"]), 201)
+
+    async def test_llm_tool_gets_latest_message_in_one_operation(self):
+        event = FakeEvent("1", "p:FriendMessage:1")
+        mail = ParsedMail(
+            14,
+            "最新主题",
+            "发件人",
+            "sender@example.com",
+            "reply@example.com",
+            "2026-07-16 10:00:00",
+            0,
+            "最新正文",
+            False,
+            "",
+            "",
+        )
+        with patch(
+            "astrbot_plugin_email_assistant.main.fetch_latest", return_value=mail
+        ) as latest:
+            result = json.loads(
+                await self.plugin.tool_get_latest_message(
+                    event, account="", since_date="2026-07-01"
+                )
+            )
+        self.assertTrue(result["success"])
+        self.assertEqual(result["account_id"], "one")
+        self.assertEqual(result["message"]["uid"], 14)
+        self.assertEqual(result["message"]["body"], "最新正文")
+        self.assertEqual(latest.call_args.args[1].strftime("%Y-%m-%d"), "2026-07-01")
+
+    async def test_llm_tool_latest_returns_empty_result(self):
+        event = FakeEvent("1", "p:FriendMessage:1")
+        with patch("astrbot_plugin_email_assistant.main.fetch_latest", return_value=None):
+            result = json.loads(await self.plugin.tool_get_latest_message(event))
+        self.assertTrue(result["success"])
+        self.assertIsNone(result["message"])
 
     async def test_llm_read_tools_reject_cron_events(self):
         event = FakeEvent(
@@ -533,9 +601,13 @@ class MainRuntimeTests(unittest.IsolatedAsyncioTestCase):
         )
         accounts = json.loads(await self.plugin.tool_list_accounts(event))
         listing = json.loads(await self.plugin.tool_list_messages(event, "one"))
-        detail = json.loads(await self.plugin.tool_show_message(event, "one", 1))
+        latest = json.loads(await self.plugin.tool_get_latest_message(event, "one"))
+        detail = json.loads(
+            await self.plugin.tool_show_message(event, 1, account="one")
+        )
         self.assertFalse(accounts["success"])
         self.assertFalse(listing["success"])
+        self.assertFalse(latest["success"])
         self.assertFalse(detail["success"])
 
     async def test_llm_read_tools_enforce_owner_and_query_switch(self):
@@ -545,7 +617,9 @@ class MainRuntimeTests(unittest.IsolatedAsyncioTestCase):
 
         self.account["query_enabled"] = False
         owner = FakeEvent("1", "p:FriendMessage:1")
-        disabled = json.loads(await self.plugin.tool_show_message(owner, "one", 1))
+        disabled = json.loads(
+            await self.plugin.tool_show_message(owner, 1, account="one")
+        )
         self.assertFalse(disabled["success"])
 
 

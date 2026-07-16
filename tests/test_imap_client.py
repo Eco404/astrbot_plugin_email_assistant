@@ -5,7 +5,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from astrbot_plugin_email_assistant.imap_client import fetch_after_uid, query_since
+from astrbot_plugin_email_assistant.imap_client import fetch_after_uid, fetch_latest, query_since
 from astrbot_plugin_email_assistant.mail_parser import ParsedMail
 
 
@@ -51,6 +51,12 @@ class IMAPClientTests(unittest.TestCase):
             results = query_since(account, datetime(2026, 7, 1), limit=4)
         self.assertEqual([item.uid for item in results], [4, 2, 1])
         self.assertEqual(account["header_fetches"], [4, 3, 2, 1])
+
+    def test_fetch_latest_returns_newest_parseable_message(self):
+        with patch("astrbot_plugin_email_assistant.imap_client.ImapMailbox", FakeMailbox):
+            result = fetch_latest({})
+        self.assertIsNotNone(result)
+        self.assertEqual(result.uid, 4)
 
 
 if __name__ == "__main__":
