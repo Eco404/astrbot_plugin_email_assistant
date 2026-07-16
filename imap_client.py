@@ -17,6 +17,29 @@ class FetchItem:
     error: str = ""
 
 
+@dataclass(slots=True)
+class HeaderSyncResult:
+    uidvalidity: int
+    uidnext: int
+    scanned_through_uid: int
+    headers: list[ParsedMail]
+    remote_uids: set[int] | None
+    uidvalidity_changed: bool
+
+
+class MailNotFoundError(RuntimeError):
+    pass
+
+
+class MailboxChangedError(RuntimeError):
+    def __init__(self, expected_uidvalidity: int, actual_uidvalidity: int) -> None:
+        self.expected_uidvalidity = int(expected_uidvalidity)
+        self.actual_uidvalidity = int(actual_uidvalidity)
+        super().__init__(
+            "IMAP 文件夹 UIDVALIDITY 已变化，原 UID 已失效。"
+        )
+
+
 def _positive_int(value: Any, default: int) -> int:
     try:
         parsed = int(value)
@@ -57,6 +80,7 @@ class ImapMailbox:
         self.account = account
         self.timeout = _positive_int(timeout, 20)
         self.connection: imaplib.IMAP4 | imaplib.IMAP4_SSL | None = None
+        self.folder = "INBOX"
 
     def __enter__(self) -> "ImapMailbox":
         host = str(self.account.get("imap_host") or "").strip()
@@ -89,8 +113,8 @@ class ImapMailbox:
         else:
             raise ValueError("IMAP 安全模式仅支持 ssl 或 starttls。")
         self.connection.login(username, password)
-        folder = str(self.account.get("folder") or "INBOX").strip() or "INBOX"
-        status, _ = self.connection.select(folder, readonly=True)
+        self.folder = str(self.account.get("folder") or "INBOX").strip() or "INBOX"
+        status, _ = self.connection.select(self.folder, readonly=True)
         if status != "OK":
             raise RuntimeError("无法打开配置的 IMAP 文件夹。")
         return self
@@ -119,17 +143,43 @@ class ImapMailbox:
             return []
         return sorted(int(item) for item in data[0].split() if item.isdigit())
 
+    def _response_int(self, name: str) -> int:
+        status, data = self.conn.response(name)
+        if status is None or not data:
+            return 0
+        for item in reversed(data):
+            text = item.decode(errors="ignore") if isinstance(item, bytes) else str(item)
+            digits = "".join(char for char in text if char.isdigit())
+            if digits:
+                return int(digits)
+        return 0
+
+    @property
+    def uidvalidity(self) -> int:
+        value = self._response_int("UIDVALIDITY")
+        if value <= 0:
+            raise RuntimeError("IMAP 服务器未返回有效的 UIDVALIDITY。")
+        return value
+
+    @property
+    def uidnext(self) -> int:
+        value = self._response_int("UIDNEXT")
+        if value > 0:
+            return value
+        uids = self.search_uids("ALL")
+        return (uids[-1] + 1) if uids else 1
+
     def fetch_uid(self, uid: int, *, headers_only: bool = False) -> ParsedMail:
         query = "(BODY.PEEK[HEADER.FIELDS (SUBJECT FROM REPLY-TO DATE MESSAGE-ID REFERENCES)])" if headers_only else "(RFC822)"
         status, data = self.conn.uid("fetch", str(uid), query)
         if status != "OK" or not data:
-            raise RuntimeError(f"IMAP 获取 UID {uid} 失败。")
+            raise MailNotFoundError(f"IMAP UID {uid} 不存在或已无法读取。")
         raw = next(
             (entry[1] for entry in data if isinstance(entry, tuple) and len(entry) > 1 and isinstance(entry[1], bytes)),
             None,
         )
         if raw is None:
-            raise RuntimeError(f"IMAP UID {uid} 没有可解析的邮件内容。")
+            raise MailNotFoundError(f"IMAP UID {uid} 不存在或已无法读取。")
         return parse_mail(raw, uid)
 
 
@@ -180,6 +230,73 @@ def fetch_latest(
             except Exception:
                 continue
     return None
+
+
+def sync_headers(
+    account: dict[str, Any],
+    known_uidvalidity: int | None,
+    after_uid: int,
+    initial_since: datetime,
+    initial_limit: int = 200,
+    batch_limit: int = 100,
+    timeout: int = 20,
+    reconcile_all: bool = False,
+    force_initial: bool = False,
+) -> HeaderSyncResult:
+    with ImapMailbox(account, timeout) as mailbox:
+        current_uidvalidity = mailbox.uidvalidity
+        uidnext = mailbox.uidnext
+        changed = (
+            known_uidvalidity is not None
+            and int(known_uidvalidity) != current_uidvalidity
+        )
+        initial = force_initial or known_uidvalidity is None or changed
+        if initial:
+            candidates = mailbox.search_uids(
+                f'SINCE "{initial_since.strftime("%d-%b-%Y")}"'
+            )
+            selected = candidates[-_positive_int(initial_limit, 200) :]
+            scanned_through = selected[-1] if selected else max(0, uidnext - 1)
+        else:
+            candidates = [
+                uid
+                for uid in mailbox.search_uids(f"UID {int(after_uid) + 1}:*")
+                if uid > int(after_uid)
+            ]
+            selected = candidates[: _positive_int(batch_limit, 100)]
+            scanned_through = selected[-1] if selected else int(after_uid)
+
+        headers: list[ParsedMail] = []
+        for uid in selected:
+            try:
+                headers.append(mailbox.fetch_uid(uid, headers_only=True))
+            except Exception:
+                continue
+        remote_uids = set(mailbox.search_uids("ALL")) if reconcile_all else None
+        return HeaderSyncResult(
+            uidvalidity=current_uidvalidity,
+            uidnext=uidnext,
+            scanned_through_uid=scanned_through,
+            headers=headers,
+            remote_uids=remote_uids,
+            uidvalidity_changed=changed,
+        )
+
+
+def fetch_detail_checked(
+    account: dict[str, Any],
+    uid: int,
+    expected_uidvalidity: int | None,
+    timeout: int = 20,
+) -> tuple[int, ParsedMail]:
+    with ImapMailbox(account, timeout) as mailbox:
+        current_uidvalidity = mailbox.uidvalidity
+        if (
+            expected_uidvalidity is not None
+            and int(expected_uidvalidity) != current_uidvalidity
+        ):
+            raise MailboxChangedError(expected_uidvalidity, current_uidvalidity)
+        return current_uidvalidity, mailbox.fetch_uid(int(uid))
 
 
 def fetch_detail(account: dict[str, Any], uid: int, timeout: int = 20) -> ParsedMail:

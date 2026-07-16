@@ -1,11 +1,19 @@
 import unittest
 import sys
+from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from astrbot_plugin_email_assistant.imap_client import fetch_after_uid, fetch_latest, query_since
+from astrbot_plugin_email_assistant.imap_client import (
+    MailboxChangedError,
+    fetch_after_uid,
+    fetch_detail_checked,
+    fetch_latest,
+    query_since,
+    sync_headers,
+)
 from astrbot_plugin_email_assistant.mail_parser import ParsedMail
 
 
@@ -34,6 +42,20 @@ class FakeMailbox:
         return mail(uid)
 
 
+class FakeSyncMailbox(FakeMailbox):
+    uidvalidity = 55
+    uidnext = 8
+
+    def search_uids(self, criterion):
+        if criterion == "ALL":
+            return [2, 4, 7]
+        if criterion.startswith("SINCE"):
+            return [2, 4, 7]
+        if criterion.startswith("UID"):
+            return [uid for uid in [2, 4, 7] if uid > 4]
+        return []
+
+
 class IMAPClientTests(unittest.TestCase):
     def test_incremental_fetch_keeps_parse_failure_as_item(self):
         with patch("astrbot_plugin_email_assistant.imap_client.ImapMailbox", FakeMailbox):
@@ -57,6 +79,30 @@ class IMAPClientTests(unittest.TestCase):
             result = fetch_latest({})
         self.assertIsNotNone(result)
         self.assertEqual(result.uid, 4)
+
+    def test_initial_header_sync_uses_recent_tail(self):
+        with patch("astrbot_plugin_email_assistant.imap_client.ImapMailbox", FakeSyncMailbox):
+            result = sync_headers(
+                {}, None, 0, datetime(2026, 7, 1), initial_limit=2
+            )
+        self.assertEqual(result.uidvalidity, 55)
+        self.assertEqual(result.uidnext, 8)
+        self.assertEqual([item.uid for item in result.headers], [4, 7])
+        self.assertEqual(result.scanned_through_uid, 7)
+
+    def test_incremental_sync_and_reconcile(self):
+        with patch("astrbot_plugin_email_assistant.imap_client.ImapMailbox", FakeSyncMailbox):
+            result = sync_headers(
+                {}, 55, 4, datetime(2026, 7, 1), reconcile_all=True
+            )
+        self.assertEqual([item.uid for item in result.headers], [7])
+        self.assertEqual(result.remote_uids, {2, 4, 7})
+        self.assertFalse(result.uidvalidity_changed)
+
+    def test_checked_detail_rejects_uidvalidity_change(self):
+        with patch("astrbot_plugin_email_assistant.imap_client.ImapMailbox", FakeSyncMailbox):
+            with self.assertRaises(MailboxChangedError):
+                fetch_detail_checked({}, 7, 54)
 
 
 if __name__ == "__main__":

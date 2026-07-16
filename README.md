@@ -3,7 +3,8 @@
 一个面向 AstrBot 的多账户邮件助手。当前版本支持：
 
 - 使用 IMAP SSL/STARTTLS 自动轮询新邮件，并按配置直发标题、调用 LLM 转述或创建官方定时任务转述；
-- 手动检查、按日期查询邮件列表、按 UID 查看正文详情；
+- 使用 `plugin_data` SQLite 本地邮件头索引，支持后台增量同步和云端删除核对；
+- 手动检查、同步索引、按日期查询邮件列表、按 UID 查看正文详情；
 - 使用 SMTP SSL/STARTTLS 发送纯文本邮件；
 - 根据原邮件 `Reply-To`、`Message-ID` 和 `References` 发送线程回复；
 - 每个邮箱独立开关接收、查询和发送权限。
@@ -58,6 +59,7 @@
 /email status [account_id]
 /email test [account_id]
 /email check [account_id]
+/email sync [account_id]
 /email list [account_id] [YYYY-MM-DD]
 /email show [account_id] [mail_uid]
 /email send [account_id] [收件人] [主题]|[正文]
@@ -70,6 +72,7 @@
 
 ```text
 /email list personal_qq 2026-07-01
+/email sync personal_qq
 /email show personal_qq 1288
 /email send personal_qq user@example.com 测试邮件|你好，这是一封测试邮件。
 /email reply personal_qq 1288 已收到，谢谢。
@@ -135,19 +138,38 @@ account_id: 账户 ID | uid: 邮件 UID
 
 若当前 AstrBot 人格配置了显式工具白名单，需要在该人格中允许上述四个工具；未限制人格工具时会按 AstrBot 默认规则自动提供。
 
-## 本地邮件索引与 `plugin_data`
+## 本地邮件头索引与 `plugin_data`
 
-当前版本不会把整个邮箱下载到本地：列表查询通过 IMAP 按日期搜索并只拉取配置上限内的邮件头；详情和“最新一封”只在用户请求时拉取正文。`email_assistant_get_latest_message` 在未指定日期时会执行 IMAP `SEARCH ALL` 获取 UID 列表，但随后只下载最新一封可解析邮件，并不是下载全部邮件正文。
+插件默认通过 `StarTools.get_data_dir(PLUGIN_NAME)` 在以下目录创建 SQLite 索引：
 
-AstrBot 的 `StarTools.get_data_dir(PLUGIN_NAME)` 可以为插件创建持久化的 `data/plugin_data/astrbot_plugin_email_assistant` 目录。若后续需要更快的历史查询，建议在该目录使用 SQLite 建立本地索引，而不是默认全量缓存所有正文：
+```text
+data/plugin_data/astrbot_plugin_email_assistant/mail_headers.db
+```
 
-- 默认只同步最近一段时间或最近固定数量的邮件头，例如 90 天或 500 封；
-- 以 `account_id + folder + UIDVALIDITY + UID` 作为唯一标识，避免文件夹 UID 重置后错配；
-- 正文按需读取，并设置可选缓存期限和总容量上限；默认不缓存附件；
-- 后台按 UID 增量同步，分批执行并记录进度，避免启动时阻塞和触发邮箱限流；
-- “同步全部历史邮件”仅作为用户显式开启的高级选项，并提供暂停、续传和清理入口。
+本地只保存账户 ID、文件夹、UIDVALIDITY、UID、主题、发件人、日期、回复地址、线程头和附件存在状态，不保存邮件正文、附件、邮箱密码或代理密码。列表查询优先使用本地索引；查看详情、读取最新一封正文和回复邮件时仍会实时连接 IMAP 验证并读取云端原件。
 
-不建议默认拉取全部邮件正文：大型邮箱会产生明显的首次同步时间、网络流量、磁盘占用和 IMAP 限流风险；邮件正文还可能包含敏感信息，而 `plugin_data` 会持久化并可能进入 AstrBot 备份。因此未来本地索引应优先保存邮件头，正文缓存需要清晰的隐私提示和清理策略。
+首次同步默认拉取最近 90 天且最多 500 封邮件的邮件头，之后按 UID 分批增量同步。可通过以下配置调整：
+
+- `local_index_enabled`：是否启用本地邮件头索引；关闭后回退为实时 IMAP 查询；
+- `local_index_initial_days`：首次索引的最近天数；
+- `local_index_initial_max_messages`：每个账户首次最多索引的邮件数；
+- `local_index_sync_batch_size`：每轮最多同步的新增邮件头数；
+- `local_index_reconcile_interval_hours`：核对云端删除状态的间隔。
+
+`/email sync [account_id]` 会立即同步新增邮件头，并强制核对当前文件夹的云端 UID 集合。`/email status` 会显示有效索引数、云端失效数和最近同步时间。后台轮询也会自动维护索引；即使账户关闭接收通知，只要查询功能开启，仍会同步邮件头。
+
+### 本地与云端不一致时的处理
+
+本地索引采用最终一致策略，所有会产生内容读取或外部操作的路径采用操作前强校验：
+
+- **云端已删除或移动邮件，本地暂时不知道**：在下一次定期核对前，该邮件可能仍出现在本地列表中。用户或 Bot 查看、读取最新邮件或回复时，插件会实时从当前 IMAP 文件夹读取；若云端不存在，会把本地项标记为 `remote_missing`、从后续列表隐藏，并拒绝本次读取或回复。
+- **云端暂时无法连接**：网络错误、认证错误和超时不会被当成删除，也不会修改邮件的有效状态。列表可以返回已有本地缓存并附带同步警告；详情和回复因无法完成云端确认而失败，避免使用可能过期的数据执行操作。
+- **邮件稍后被后台核对发现已删除**：定期核对只拉取 UID 集合，不下载全部正文；缺失 UID 会批量标记为云端失效。也可以手动执行 `/email sync` 立即核对。
+- **文件夹 UIDVALIDITY 变化**：说明服务器重建了文件夹 UID 空间，旧数字 UID 不能再信任。插件会把旧一代索引整体标记为失效、用新 UIDVALIDITY 建立索引，并把新邮件通知游标重置到当前基线，不推送重建前的历史邮件。
+- **相同数字 UID 指向新邮件的风险**：详情和回复会在同一个 IMAP 连接中先比较 UIDVALIDITY，再按 UID 获取邮件。若代际不同会拒绝读取并要求重新查询，不会把旧索引中的 UID 错用于新邮件。
+- **本地数据库丢失或被清理**：插件会按配置范围重建邮件头索引；正文仍以云端为准。重建索引不会把历史邮件当作新邮件通知。
+
+不建议默认拉取全部邮件正文：大型邮箱会产生明显的首次同步时间、网络流量、磁盘占用和 IMAP 限流风险；邮件正文还可能包含敏感信息，而 `plugin_data` 会持久化并可能进入 AstrBot 备份。当前“有限邮件头索引 + 正文按需读取”的默认方案在查询速度、隐私和一致性之间更稳妥。
 
 通知成功后才推进该账户的 UID 游标。发送失败时保留游标并在下次轮询重试；无法解析的损坏邮件会被记录并跳过，避免阻塞整个邮箱。
 

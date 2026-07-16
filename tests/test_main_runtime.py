@@ -1,8 +1,10 @@
 import asyncio
 import json
 import sys
+import tempfile
 import types
 import unittest
+from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
 
@@ -53,6 +55,11 @@ def _install_astrbot_stubs():
         async def put_kv_data(self, key, value):
             self._kv[key] = value
 
+    class StarTools:
+        @staticmethod
+        def get_data_dir(plugin_name):
+            return Path("/tmp") / str(plugin_name)
+
     def register(*args, **kwargs):
         return lambda cls: cls
 
@@ -84,6 +91,7 @@ def _install_astrbot_stubs():
     platform_api.MessageType = MessageType
     star_mod.Context = object
     star_mod.Star = Star
+    star_mod.StarTools = StarTools
     star_mod.register = register
     components.Plain = Plain
 
@@ -103,7 +111,12 @@ def _install_astrbot_stubs():
 
 _install_astrbot_stubs()
 
-from astrbot_plugin_email_assistant.imap_client import FetchItem
+from astrbot_plugin_email_assistant.imap_client import (
+    FetchItem,
+    HeaderSyncResult,
+    MailNotFoundError,
+)
+from astrbot_plugin_email_assistant.mail_index import MailHeaderIndex
 from astrbot_plugin_email_assistant.mail_parser import ParsedMail
 from astrbot_plugin_email_assistant.main import EmailAssistantPlugin
 
@@ -250,6 +263,14 @@ class MainRuntimeTests(unittest.IsolatedAsyncioTestCase):
             {"mail_accounts": [dict(ACCOUNT)], "max_fetch_per_check": 20, "network_timeout_seconds": 20},
         )
         self.account = self.plugin._accounts()[0]
+
+    def _enable_test_index(self) -> MailHeaderIndex:
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        index = MailHeaderIndex(Path(temp_dir.name) / "mail_headers.db")
+        index.initialize()
+        self.plugin._mail_index = index
+        return index
 
     async def test_first_check_only_establishes_baseline(self):
         with patch("astrbot_plugin_email_assistant.main.get_max_uid", return_value=8):
@@ -591,6 +612,132 @@ class MainRuntimeTests(unittest.IsolatedAsyncioTestCase):
             result = json.loads(await self.plugin.tool_get_latest_message(event))
         self.assertTrue(result["success"])
         self.assertIsNone(result["message"])
+
+    async def test_local_index_sync_drives_header_query(self):
+        index = self._enable_test_index()
+        timestamp = datetime(2026, 7, 16, 10, 0).timestamp()
+        header = ParsedMail(
+            21,
+            "索引主题",
+            "发件人",
+            "sender@example.com",
+            "sender@example.com",
+            "2026-07-16 10:00:00",
+            timestamp,
+            "",
+            False,
+            "",
+            "",
+        )
+        sync_result = HeaderSyncResult(10, 22, 21, [header], None, False)
+        with patch(
+            "astrbot_plugin_email_assistant.main.sync_headers",
+            return_value=sync_result,
+        ), patch("astrbot_plugin_email_assistant.main.query_since") as remote_query:
+            results = await self.plugin._query_mail_headers(
+                self.account, datetime(2026, 7, 1), 10
+            )
+        self.assertEqual([item.uid for item in results], [21])
+        remote_query.assert_not_called()
+        self.assertEqual(index.stats("one", "INBOX")["active"], 1)
+
+    async def test_deleted_cloud_mail_is_marked_missing_on_detail(self):
+        index = self._enable_test_index()
+        timestamp = datetime(2026, 7, 16, 10, 0).timestamp()
+        header = ParsedMail(
+            22,
+            "已删除",
+            "",
+            "sender@example.com",
+            "sender@example.com",
+            "2026-07-16 10:00:00",
+            timestamp,
+            "",
+            False,
+            "",
+            "",
+        )
+        index.apply_sync("one", "INBOX", 10, 22, [header])
+        with patch(
+            "astrbot_plugin_email_assistant.main.fetch_detail_checked",
+            side_effect=MailNotFoundError("missing"),
+        ):
+            with self.assertRaisesRegex(MailNotFoundError, "云端删除"):
+                await self.plugin._fetch_remote_detail(self.account, 22)
+        self.assertEqual(index.stats("one", "INBOX")["remote_missing"], 1)
+
+    async def test_transient_detail_error_does_not_mark_mail_missing(self):
+        index = self._enable_test_index()
+        timestamp = datetime(2026, 7, 16, 10, 0).timestamp()
+        header = ParsedMail(
+            23,
+            "仍然有效",
+            "",
+            "sender@example.com",
+            "sender@example.com",
+            "2026-07-16 10:00:00",
+            timestamp,
+            "",
+            False,
+            "",
+            "",
+        )
+        index.apply_sync("one", "INBOX", 10, 23, [header])
+        with patch(
+            "astrbot_plugin_email_assistant.main.fetch_detail_checked",
+            side_effect=TimeoutError("timeout"),
+        ):
+            with self.assertRaises(TimeoutError):
+                await self.plugin._fetch_remote_detail(self.account, 23)
+        self.assertEqual(index.stats("one", "INBOX")["active"], 1)
+        self.assertEqual(index.stats("one", "INBOX")["remote_missing"], 0)
+
+    async def test_index_query_uses_cache_when_cloud_sync_fails(self):
+        index = self._enable_test_index()
+        timestamp = datetime(2026, 7, 16, 10, 0).timestamp()
+        header = ParsedMail(
+            24,
+            "缓存主题",
+            "",
+            "sender@example.com",
+            "sender@example.com",
+            "2026-07-16 10:00:00",
+            timestamp,
+            "",
+            False,
+            "",
+            "",
+        )
+        index.apply_sync("one", "INBOX", 10, 24, [header])
+        with patch(
+            "astrbot_plugin_email_assistant.main.sync_headers",
+            side_effect=TimeoutError("sync timeout"),
+        ):
+            results = await self.plugin._query_mail_headers(
+                self.account, datetime(2026, 7, 1), 10
+            )
+        self.assertEqual([item.uid for item in results], [24])
+        self.assertIn("sync timeout", self.plugin._index_warnings["one"])
+
+    async def test_uidvalidity_change_resets_notification_cursor(self):
+        index = self._enable_test_index()
+        timestamp = datetime(2026, 7, 16, 10, 0).timestamp()
+        index.apply_sync("one", "INBOX", 10, 8, [
+            ParsedMail(8, "旧代", "", "a@example.com", "a@example.com", "2026-07-16", timestamp, "", False, "", "")
+        ])
+        await self.plugin.put_kv_data(self.plugin._cursor_key(self.account), 8)
+        fresh = ParsedMail(1, "新代", "", "a@example.com", "a@example.com", "2026-07-16", timestamp, "", False, "", "")
+        result = HeaderSyncResult(11, 6, 1, [fresh], {1}, True)
+        with patch(
+            "astrbot_plugin_email_assistant.main.sync_headers", return_value=result
+        ):
+            await self.plugin._sync_account_index(
+                self.account, force_reconcile=True
+            )
+        self.assertEqual(
+            await self.plugin.get_kv_data(self.plugin._cursor_key(self.account)), 5
+        )
+        self.assertEqual(index.get_state("one", "INBOX").uidvalidity, 11)
 
     async def test_llm_read_tools_reject_cron_events(self):
         event = FakeEvent(
