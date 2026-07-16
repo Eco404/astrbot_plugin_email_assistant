@@ -1,4 +1,5 @@
 import asyncio
+import json
 import sys
 import types
 import unittest
@@ -69,7 +70,13 @@ def _install_astrbot_stubs():
     api.logger = Logger()
     event_mod.AstrMessageEvent = object
     event_mod.MessageChain = MessageChain
-    event_mod.filter = types.SimpleNamespace(command_group=command_group)
+    def llm_tool(*args, **kwargs):
+        return lambda fn: fn
+
+    event_mod.filter = types.SimpleNamespace(
+        command_group=command_group,
+        llm_tool=llm_tool,
+    )
     platform_api.MessageType = MessageType
     star_mod.Context = object
     star_mod.Star = Star
@@ -206,12 +213,20 @@ class FakePlatformManager:
 
 
 class FakeEvent:
-    def __init__(self, sender_id, umo):
+    def __init__(self, sender_id, umo, platform_name="aiocqhttp", extras=None):
         self.sender_id = sender_id
         self.unified_msg_origin = umo
+        self.platform_name = platform_name
+        self.extras = extras or {}
 
     def get_sender_id(self):
         return self.sender_id
+
+    def get_platform_name(self):
+        return self.platform_name
+
+    def get_extra(self, key):
+        return self.extras.get(key)
 
 
 class MainRuntimeTests(unittest.IsolatedAsyncioTestCase):
@@ -448,6 +463,87 @@ class MainRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(job["persistent"])
         self.assertEqual(job["payload"]["email_assistant"]["uid"], 9)
         self.assertIn("send_message_to_user", job["payload"]["note"])
+
+    async def test_llm_tool_lists_only_visible_query_enabled_accounts(self):
+        event = FakeEvent("1", "p:FriendMessage:1")
+        result = json.loads(await self.plugin.tool_list_accounts(event))
+        self.assertTrue(result["success"])
+        self.assertEqual(result["accounts"][0]["account_id"], "one")
+        self.assertNotIn("password", result["accounts"][0])
+
+    async def test_llm_tool_lists_messages_with_limit(self):
+        event = FakeEvent("1", "p:FriendMessage:1")
+        mail = ParsedMail(
+            12,
+            "列表主题",
+            "发件人",
+            "sender@example.com",
+            "sender@example.com",
+            "2026-07-16 09:00:00",
+            0,
+            "不应出现在列表",
+            True,
+            "",
+            "",
+        )
+        with patch(
+            "astrbot_plugin_email_assistant.main.query_since", return_value=[mail]
+        ) as query:
+            result = json.loads(
+                await self.plugin.tool_list_messages(
+                    event, account="one", since_date="2026-07-01", limit=999
+                )
+            )
+        self.assertTrue(result["success"])
+        self.assertEqual(result["messages"][0]["uid"], 12)
+        self.assertNotIn("body", result["messages"][0])
+        self.assertEqual(query.call_args.args[3], self.plugin._query_limit())
+
+    async def test_llm_tool_shows_bounded_message_body(self):
+        event = FakeEvent("1", "p:FriendMessage:1")
+        self.plugin.config["detail_body_max_chars"] = 200
+        mail = ParsedMail(
+            13,
+            "详情主题",
+            "发件人",
+            "sender@example.com",
+            "reply@example.com",
+            "2026-07-16 09:00:00",
+            0,
+            "正" * 300,
+            False,
+            "",
+            "",
+        )
+        with patch("astrbot_plugin_email_assistant.main.fetch_detail", return_value=mail):
+            result = json.loads(await self.plugin.tool_show_message(event, "one", 13))
+        self.assertTrue(result["success"])
+        self.assertTrue(result["message"]["body_truncated"])
+        self.assertLessEqual(len(result["message"]["body"]), 201)
+
+    async def test_llm_read_tools_reject_cron_events(self):
+        event = FakeEvent(
+            "1",
+            "p:FriendMessage:1",
+            platform_name="cron",
+            extras={"cron_job": {"id": "job"}},
+        )
+        accounts = json.loads(await self.plugin.tool_list_accounts(event))
+        listing = json.loads(await self.plugin.tool_list_messages(event, "one"))
+        detail = json.loads(await self.plugin.tool_show_message(event, "one", 1))
+        self.assertFalse(accounts["success"])
+        self.assertFalse(listing["success"])
+        self.assertFalse(detail["success"])
+
+    async def test_llm_read_tools_enforce_owner_and_query_switch(self):
+        other_user = FakeEvent("2", "p:FriendMessage:2")
+        denied = json.loads(await self.plugin.tool_list_messages(other_user, "one"))
+        self.assertFalse(denied["success"])
+
+        self.account["query_enabled"] = False
+        owner = FakeEvent("1", "p:FriendMessage:1")
+        disabled = json.loads(await self.plugin.tool_show_message(owner, "one", 1))
+        self.assertFalse(disabled["success"])
 
 
 if __name__ == "__main__":
