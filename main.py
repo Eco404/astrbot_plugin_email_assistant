@@ -280,10 +280,14 @@ class EmailAssistantPlugin(Star):
         legacy_umo = str(account.get("owner_umo") or "").strip()
         return bool(legacy_umo and legacy_umo == str(umo or "").strip())
 
-    async def _send_title_notification(self, account: dict[str, Any], subject: str) -> None:
+    async def _send_title_notification(
+        self, account: dict[str, Any], subject: str, uid: int
+    ) -> None:
         owner_umo = self._resolve_notification_umo(account)
         title = _one_line(subject or "(无主题)", 300)
-        text = f"📧 [{self._display_name(account)}] 新邮件：{title}"
+        name = self._display_name(account)
+        account_id = self._account_key(account)
+        text = f"📧 [{name}] 新邮件：{title}\naccount_id: {account_id} | uid: {uid}"
         sent = await self.context.send_message(owner_umo, MessageChain([Plain(text)]))
         if sent is False:
             raise RuntimeError(f"AstrBot 未找到目标平台，会话 {owner_umo} 未发送。")
@@ -533,7 +537,7 @@ class EmailAssistantPlugin(Star):
     ) -> None:
         mode = self._notification_mode()
         if mode == "title":
-            await self._send_title_notification(account, mail.subject)
+            await self._send_title_notification(account, mail.subject, mail.uid)
             return
         owner_umo = self._resolve_notification_umo(account)
         prompt = self._render_narration_prompt(account, mail)

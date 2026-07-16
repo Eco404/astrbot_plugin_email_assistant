@@ -263,7 +263,10 @@ class MainRuntimeTests(unittest.IsolatedAsyncioTestCase):
         with patch("astrbot_plugin_email_assistant.main.fetch_after_uid", side_effect=fake_fetch):
             await asyncio.gather(self.plugin._check_account(self.account), self.plugin._check_account(self.account))
         self.assertEqual(len(self.context.sent), 1)
-        self.assertEqual(self.context.sent[0][1], "📧 [私人邮箱] 新邮件：新标题")
+        self.assertEqual(
+            self.context.sent[0][1],
+            "📧 [私人邮箱] 新邮件：新标题\naccount_id: one | uid: 2",
+        )
         self.assertEqual(await self.plugin.get_kv_data(self.plugin._cursor_key(self.account)), 2)
 
     async def test_failed_notification_does_not_advance_cursor(self):
@@ -282,12 +285,12 @@ class MainRuntimeTests(unittest.IsolatedAsyncioTestCase):
             FakePlatform("onebot-instance-id", "aiocqhttp")
         )
         self.account["target_platform"] = "aiocqhttp"
-        await self.plugin._send_title_notification(self.account, "平台测试")
+        await self.plugin._send_title_notification(self.account, "平台测试", 42)
         self.assertEqual(
             self.context.sent[-1],
             (
                 "onebot-instance-id:FriendMessage:1",
-                "📧 [私人邮箱] 新邮件：平台测试",
+                "📧 [私人邮箱] 新邮件：平台测试\naccount_id: one | uid: 42",
             ),
         )
 
@@ -298,7 +301,7 @@ class MainRuntimeTests(unittest.IsolatedAsyncioTestCase):
         )
         self.account["target_platform"] = "aiocqhttp"
         with self.assertRaisesRegex(RuntimeError, "多个实例"):
-            await self.plugin._send_title_notification(self.account, "平台测试")
+            await self.plugin._send_title_notification(self.account, "平台测试", 42)
 
     def test_visible_accounts_match_real_platform_instance_to_adapter_name(self):
         self.context.platform_manager = FakePlatformManager(

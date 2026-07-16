@@ -55,13 +55,13 @@
 
 ```text
 /email help
-/email status [账户]
-/email test [账户]
-/email check [账户]
-/email list <账户> [YYYY-MM-DD]
-/email show <账户> <UID>
-/email send <账户> <收件人> <主题>|<正文>
-/email reply <账户> <UID> <正文>
+/email status [account_id]
+/email test [account_id]
+/email check [account_id]
+/email list [account_id] [YYYY-MM-DD]
+/email show [account_id] [mail_uid]
+/email send [account_id] [收件人] [主题]|[正文]
+/email reply [account_id] [mail_uid] [正文]
 ```
 
 使用 `/email send` 时，主题与正文必须使用半角竖线 `|` 分隔；全角竖线 `｜` 不会被识别为分隔符。
@@ -89,7 +89,10 @@
 
 ```text
 📧 [账户名] 新邮件：邮件标题
+account_id: 账户 ID | uid: 邮件 UID
 ```
+
+第二行的 `account_id` 和 `uid` 可直接用于后续自然语言查询，或作为 `/email show <账户> <UID>` 的参数。
 
 直接 LLM 模式可通过 `narration_provider_id` 选择专用聊天模型；留空或不选择时使用目标私聊会话当前生效的 AstrBot 模型。该选项不影响官方定时任务模式，定时任务仍由目标会话的主 Agent 模型运行。
 
