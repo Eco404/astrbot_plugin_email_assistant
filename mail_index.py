@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import os
+import hashlib
+import json
 import sqlite3
 import time
+import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
@@ -28,9 +31,45 @@ class IndexApplyResult:
     uidvalidity_changed: bool
     header_changes: int = 0
     remote_state_changes: int = 0
+    history_state_changed: bool = False
 
     def __bool__(self) -> bool:
         return self.uidvalidity_changed
+
+
+@dataclass(frozen=True, slots=True)
+class CachedMailBody:
+    account_id: str
+    folder: str
+    uidvalidity: int
+    uid: int
+    body_text: str
+    content_hash: str
+    size_bytes: int
+    truncated: bool
+    fetched_at: float
+
+
+@dataclass(frozen=True, slots=True)
+class MailDraft:
+    draft_id: str
+    account_id: str
+    to_addrs: tuple[str, ...]
+    cc_addrs: tuple[str, ...]
+    bcc_addrs: tuple[str, ...]
+    subject: str
+    body_text: str
+    body_html: str
+    reply_folder: str
+    reply_uid: int | None
+    reply_message_id: str
+    source: str
+    status: str
+    revision: int
+    created_at: float
+    updated_at: float
+    sent_at: float | None
+    last_error: str
 
 
 class MailHeaderIndex:
@@ -94,6 +133,54 @@ class MailHeaderIndex:
                 ON mail_headers (
                     account_id, folder, uidvalidity, remote_state, date_ts DESC, uid DESC
                 );
+
+                CREATE TABLE IF NOT EXISTS mail_bodies (
+                    account_id TEXT NOT NULL,
+                    folder TEXT NOT NULL,
+                    uidvalidity INTEGER NOT NULL,
+                    uid INTEGER NOT NULL,
+                    body_text TEXT NOT NULL DEFAULT '',
+                    content_hash TEXT NOT NULL DEFAULT '',
+                    size_bytes INTEGER NOT NULL DEFAULT 0,
+                    truncated INTEGER NOT NULL DEFAULT 0,
+                    fetched_at REAL NOT NULL DEFAULT 0,
+                    last_accessed_at REAL NOT NULL DEFAULT 0,
+                    PRIMARY KEY (account_id, folder, uidvalidity, uid),
+                    FOREIGN KEY (account_id, folder, uidvalidity, uid)
+                        REFERENCES mail_headers (account_id, folder, uidvalidity, uid)
+                        ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_mail_bodies_eviction
+                ON mail_bodies (last_accessed_at, fetched_at);
+
+                CREATE TABLE IF NOT EXISTS mail_drafts (
+                    draft_id TEXT PRIMARY KEY,
+                    account_id TEXT NOT NULL,
+                    to_json TEXT NOT NULL DEFAULT '[]',
+                    cc_json TEXT NOT NULL DEFAULT '[]',
+                    bcc_json TEXT NOT NULL DEFAULT '[]',
+                    subject TEXT NOT NULL DEFAULT '',
+                    body_text TEXT NOT NULL DEFAULT '',
+                    body_html TEXT NOT NULL DEFAULT '',
+                    reply_folder TEXT NOT NULL DEFAULT '',
+                    reply_uid INTEGER,
+                    reply_message_id TEXT NOT NULL DEFAULT '',
+                    source TEXT NOT NULL DEFAULT 'user'
+                        CHECK (source IN ('user', 'bot')),
+                    status TEXT NOT NULL DEFAULT 'editing'
+                        CHECK (status IN (
+                            'editing', 'pending_review', 'approved', 'sent', 'failed'
+                        )),
+                    revision INTEGER NOT NULL DEFAULT 1,
+                    created_at REAL NOT NULL,
+                    updated_at REAL NOT NULL,
+                    sent_at REAL,
+                    last_error TEXT NOT NULL DEFAULT ''
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_mail_drafts_list
+                ON mail_drafts (account_id, status, updated_at DESC);
                 """
             )
             mailbox_columns = {
@@ -211,6 +298,13 @@ class MailHeaderIndex:
                     """,
                     (account_id, folder),
                 )
+                connection.execute(
+                    """
+                    DELETE FROM mail_bodies
+                    WHERE account_id = ? AND folder = ? AND uidvalidity != ?
+                    """,
+                    (account_id, folder, int(uidvalidity)),
+                )
 
             previous_synced = 0
             previous_history_before = 0
@@ -240,6 +334,12 @@ class MailHeaderIndex:
                 bool(history_complete)
                 if history_complete is not None
                 else previous_history_complete
+            )
+            history_state_changed = (
+                previous is None
+                or changed
+                or next_history_before != previous_history_before
+                or next_history_complete != previous_history_complete
             )
 
             connection.execute(
@@ -349,7 +449,12 @@ class MailHeaderIndex:
                         """,
                         states,
                     )
-        return IndexApplyResult(changed, header_changes, remote_state_changes)
+        return IndexApplyResult(
+            changed,
+            header_changes,
+            remote_state_changes,
+            history_state_changed,
+        )
 
     def upsert_header(
         self,
@@ -380,6 +485,407 @@ class MailHeaderIndex:
                 """,
                 (time.time(), account_id, folder, int(uidvalidity), int(uid)),
             )
+
+    @staticmethod
+    def _truncate_utf8(value: str, max_bytes: int) -> tuple[str, int, bool]:
+        raw = str(value or "").encode("utf-8")
+        limit = max(1, int(max_bytes))
+        if len(raw) <= limit:
+            return str(value or ""), len(raw), False
+        truncated = raw[:limit].decode("utf-8", errors="ignore")
+        return truncated, len(truncated.encode("utf-8")), True
+
+    def cache_body(
+        self,
+        account_id: str,
+        folder: str,
+        uidvalidity: int,
+        uid: int,
+        body_text: str,
+        max_item_bytes: int,
+    ) -> CachedMailBody:
+        original = str(body_text or "")
+        content_hash = hashlib.sha256(original.encode("utf-8")).hexdigest()
+        cached_text, size_bytes, truncated = self._truncate_utf8(
+            original, max_item_bytes
+        )
+        now = time.time()
+        with self._connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO mail_bodies (
+                    account_id, folder, uidvalidity, uid, body_text,
+                    content_hash, size_bytes, truncated,
+                    fetched_at, last_accessed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(account_id, folder, uidvalidity, uid) DO UPDATE SET
+                    body_text = excluded.body_text,
+                    content_hash = excluded.content_hash,
+                    size_bytes = excluded.size_bytes,
+                    truncated = excluded.truncated,
+                    fetched_at = excluded.fetched_at,
+                    last_accessed_at = excluded.last_accessed_at
+                """,
+                (
+                    account_id,
+                    folder,
+                    int(uidvalidity),
+                    int(uid),
+                    cached_text,
+                    content_hash,
+                    size_bytes,
+                    1 if truncated else 0,
+                    now,
+                    now,
+                ),
+            )
+        return CachedMailBody(
+            account_id,
+            folder,
+            int(uidvalidity),
+            int(uid),
+            cached_text,
+            content_hash,
+            size_bytes,
+            truncated,
+            now,
+        )
+
+    def get_cached_body(
+        self, account_id: str, folder: str, uidvalidity: int, uid: int
+    ) -> CachedMailBody | None:
+        now = time.time()
+        with self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM mail_bodies
+                WHERE account_id = ? AND folder = ? AND uidvalidity = ? AND uid = ?
+                """,
+                (account_id, folder, int(uidvalidity), int(uid)),
+            ).fetchone()
+            if row is not None:
+                connection.execute(
+                    """
+                    UPDATE mail_bodies SET last_accessed_at = ?
+                    WHERE account_id = ? AND folder = ? AND uidvalidity = ? AND uid = ?
+                    """,
+                    (now, account_id, folder, int(uidvalidity), int(uid)),
+                )
+        if row is None:
+            return None
+        return CachedMailBody(
+            account_id=str(row["account_id"]),
+            folder=str(row["folder"]),
+            uidvalidity=int(row["uidvalidity"]),
+            uid=int(row["uid"]),
+            body_text=str(row["body_text"]),
+            content_hash=str(row["content_hash"]),
+            size_bytes=int(row["size_bytes"]),
+            truncated=bool(row["truncated"]),
+            fetched_at=float(row["fetched_at"]),
+        )
+
+    def delete_cached_body(
+        self, account_id: str, folder: str, uidvalidity: int, uid: int
+    ) -> None:
+        with self._connection() as connection:
+            connection.execute(
+                """
+                DELETE FROM mail_bodies
+                WHERE account_id = ? AND folder = ? AND uidvalidity = ? AND uid = ?
+                """,
+                (account_id, folder, int(uidvalidity), int(uid)),
+            )
+
+    def clear_body_cache(self) -> int:
+        with self._connection() as connection:
+            cursor = connection.execute("DELETE FROM mail_bodies")
+            return max(0, int(cursor.rowcount))
+
+    def purge_remote_missing_bodies(self, account_id: str, folder: str) -> int:
+        with self._connection() as connection:
+            cursor = connection.execute(
+                """
+                DELETE FROM mail_bodies
+                WHERE account_id = ? AND folder = ? AND EXISTS (
+                    SELECT 1 FROM mail_headers AS headers
+                    WHERE headers.account_id = mail_bodies.account_id
+                      AND headers.folder = mail_bodies.folder
+                      AND headers.uidvalidity = mail_bodies.uidvalidity
+                      AND headers.uid = mail_bodies.uid
+                      AND headers.remote_state != 'active'
+                )
+                """,
+                (account_id, folder),
+            )
+            return max(0, int(cursor.rowcount))
+
+    def prune_body_cache(self, retention_days: int, max_total_bytes: int) -> int:
+        now = time.time()
+        removed = 0
+        with self._connection() as connection:
+            if int(retention_days) > 0:
+                cutoff = now - int(retention_days) * 86400
+                cursor = connection.execute(
+                    "DELETE FROM mail_bodies WHERE last_accessed_at < ?",
+                    (cutoff,),
+                )
+                removed += max(0, int(cursor.rowcount))
+            budget = max(0, int(max_total_bytes))
+            total = int(
+                connection.execute(
+                    "SELECT COALESCE(SUM(size_bytes), 0) FROM mail_bodies"
+                ).fetchone()[0]
+            )
+            if budget and total > budget:
+                rows = connection.execute(
+                    """
+                    SELECT account_id, folder, uidvalidity, uid, size_bytes
+                    FROM mail_bodies
+                    ORDER BY last_accessed_at ASC, fetched_at ASC
+                    """
+                ).fetchall()
+                for row in rows:
+                    if total <= budget:
+                        break
+                    connection.execute(
+                        """
+                        DELETE FROM mail_bodies
+                        WHERE account_id = ? AND folder = ?
+                          AND uidvalidity = ? AND uid = ?
+                        """,
+                        (
+                            row["account_id"],
+                            row["folder"],
+                            row["uidvalidity"],
+                            row["uid"],
+                        ),
+                    )
+                    total -= int(row["size_bytes"])
+                    removed += 1
+        return removed
+
+    @staticmethod
+    def _normalize_addresses(values) -> tuple[str, ...]:
+        if values is None:
+            return ()
+        if isinstance(values, str):
+            values = [values]
+        return tuple(str(value).strip() for value in values if str(value).strip())
+
+    @staticmethod
+    def _decode_addresses(value: str) -> tuple[str, ...]:
+        try:
+            decoded = json.loads(value or "[]")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return ()
+        if not isinstance(decoded, list):
+            return ()
+        return tuple(str(item) for item in decoded if str(item).strip())
+
+    @classmethod
+    def _row_to_draft(cls, row: sqlite3.Row) -> MailDraft:
+        return MailDraft(
+            draft_id=str(row["draft_id"]),
+            account_id=str(row["account_id"]),
+            to_addrs=cls._decode_addresses(str(row["to_json"])),
+            cc_addrs=cls._decode_addresses(str(row["cc_json"])),
+            bcc_addrs=cls._decode_addresses(str(row["bcc_json"])),
+            subject=str(row["subject"]),
+            body_text=str(row["body_text"]),
+            body_html=str(row["body_html"]),
+            reply_folder=str(row["reply_folder"]),
+            reply_uid=(int(row["reply_uid"]) if row["reply_uid"] is not None else None),
+            reply_message_id=str(row["reply_message_id"]),
+            source=str(row["source"]),
+            status=str(row["status"]),
+            revision=int(row["revision"]),
+            created_at=float(row["created_at"]),
+            updated_at=float(row["updated_at"]),
+            sent_at=(float(row["sent_at"]) if row["sent_at"] is not None else None),
+            last_error=str(row["last_error"]),
+        )
+
+    def create_draft(
+        self,
+        account_id: str,
+        *,
+        to_addrs=(),
+        cc_addrs=(),
+        bcc_addrs=(),
+        subject: str = "",
+        body_text: str = "",
+        body_html: str = "",
+        reply_folder: str = "",
+        reply_uid: int | None = None,
+        reply_message_id: str = "",
+        source: str = "user",
+        status: str = "editing",
+    ) -> MailDraft:
+        allowed_statuses = {"editing", "pending_review", "approved", "sent", "failed"}
+        if status not in allowed_statuses:
+            raise ValueError("无效的草稿状态。")
+        if source not in {"user", "bot"}:
+            raise ValueError("草稿来源只能是 user 或 bot。")
+        draft_id = uuid.uuid4().hex
+        now = time.time()
+        normalized_to = self._normalize_addresses(to_addrs)
+        normalized_cc = self._normalize_addresses(cc_addrs)
+        normalized_bcc = self._normalize_addresses(bcc_addrs)
+        with self._connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO mail_drafts (
+                    draft_id, account_id, to_json, cc_json, bcc_json,
+                    subject, body_text, body_html, reply_folder, reply_uid,
+                    reply_message_id, source, status, revision,
+                    created_at, updated_at, sent_at, last_error
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, NULL, '')
+                """,
+                (
+                    draft_id,
+                    str(account_id),
+                    json.dumps(normalized_to, ensure_ascii=False),
+                    json.dumps(normalized_cc, ensure_ascii=False),
+                    json.dumps(normalized_bcc, ensure_ascii=False),
+                    str(subject or ""),
+                    str(body_text or ""),
+                    str(body_html or ""),
+                    str(reply_folder or ""),
+                    int(reply_uid) if reply_uid is not None else None,
+                    str(reply_message_id or ""),
+                    source,
+                    status,
+                    now,
+                    now,
+                ),
+            )
+        draft = self.get_draft(draft_id)
+        if draft is None:
+            raise RuntimeError("草稿创建后无法读取。")
+        return draft
+
+    def get_draft(self, draft_id: str) -> MailDraft | None:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM mail_drafts WHERE draft_id = ?",
+                (str(draft_id),),
+            ).fetchone()
+        return self._row_to_draft(row) if row is not None else None
+
+    def list_drafts(
+        self,
+        account_id: str | None = None,
+        status: str | None = None,
+        limit: int = 100,
+    ) -> list[MailDraft]:
+        clauses = []
+        params: list[object] = []
+        if account_id:
+            clauses.append("account_id = ?")
+            params.append(str(account_id))
+        if status:
+            clauses.append("status = ?")
+            params.append(str(status))
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        params.append(max(1, min(int(limit), 1000)))
+        with self._connection() as connection:
+            rows = connection.execute(
+                f"SELECT * FROM mail_drafts {where} ORDER BY updated_at DESC LIMIT ?",
+                params,
+            ).fetchall()
+        return [self._row_to_draft(row) for row in rows]
+
+    def update_draft(
+        self,
+        draft_id: str,
+        expected_revision: int,
+        **changes,
+    ) -> MailDraft:
+        allowed = {
+            "to_addrs",
+            "cc_addrs",
+            "bcc_addrs",
+            "subject",
+            "body_text",
+            "body_html",
+            "reply_folder",
+            "reply_uid",
+            "reply_message_id",
+            "status",
+            "last_error",
+        }
+        unknown = set(changes) - allowed
+        if unknown:
+            raise ValueError(f"不支持的草稿字段：{', '.join(sorted(unknown))}")
+        if changes.get("status") not in {
+            None,
+            "editing",
+            "pending_review",
+            "approved",
+            "sent",
+            "failed",
+        }:
+            raise ValueError("无效的草稿状态。")
+        column_map = {
+            "to_addrs": "to_json",
+            "cc_addrs": "cc_json",
+            "bcc_addrs": "bcc_json",
+        }
+        assignments = []
+        params: list[object] = []
+        for key, value in changes.items():
+            column = column_map.get(key, key)
+            if key in column_map:
+                value = json.dumps(
+                    self._normalize_addresses(value), ensure_ascii=False
+                )
+            elif key == "reply_uid":
+                value = int(value) if value is not None else None
+            else:
+                value = str(value or "")
+            assignments.append(f"{column} = ?")
+            params.append(value)
+        now = time.time()
+        assignments.extend(["revision = revision + 1", "updated_at = ?"])
+        params.append(now)
+        if changes.get("status") == "sent":
+            assignments.append("sent_at = ?")
+            params.append(now)
+        params.extend([str(draft_id), int(expected_revision)])
+        with self._connection() as connection:
+            cursor = connection.execute(
+                f"""
+                UPDATE mail_drafts SET {', '.join(assignments)}
+                WHERE draft_id = ? AND revision = ?
+                """,
+                params,
+            )
+            if cursor.rowcount != 1:
+                exists = connection.execute(
+                    "SELECT 1 FROM mail_drafts WHERE draft_id = ?",
+                    (str(draft_id),),
+                ).fetchone()
+                if exists is None:
+                    raise KeyError("草稿不存在。")
+                raise RuntimeError("草稿已被其他操作修改，请刷新后重试。")
+        updated = self.get_draft(draft_id)
+        if updated is None:
+            raise KeyError("草稿不存在。")
+        return updated
+
+    def delete_draft(self, draft_id: str, expected_revision: int | None = None) -> bool:
+        params: list[object] = [str(draft_id)]
+        revision_clause = ""
+        if expected_revision is not None:
+            revision_clause = " AND revision = ?"
+            params.append(int(expected_revision))
+        with self._connection() as connection:
+            cursor = connection.execute(
+                f"DELETE FROM mail_drafts WHERE draft_id = ?{revision_clause}",
+                params,
+            )
+            return cursor.rowcount == 1
 
     @staticmethod
     def _row_to_mail(row: sqlite3.Row) -> ParsedMail:
@@ -454,6 +960,8 @@ class MailHeaderIndex:
             return {
                 "active": 0,
                 "remote_missing": 0,
+                "cached_bodies": 0,
+                "cached_body_bytes": 0,
                 "history_complete": False,
                 "history_before_uid": 0,
                 "last_sync_at": 0.0,
@@ -467,10 +975,20 @@ class MailHeaderIndex:
                 """,
                 (account_id, folder, state.uidvalidity),
             ).fetchall()
+            body_stats = connection.execute(
+                """
+                SELECT COUNT(*) AS count, COALESCE(SUM(size_bytes), 0) AS bytes
+                FROM mail_bodies
+                WHERE account_id = ? AND folder = ? AND uidvalidity = ?
+                """,
+                (account_id, folder, state.uidvalidity),
+            ).fetchone()
         counts = {str(row["remote_state"]): int(row["count"]) for row in rows}
         return {
             "active": counts.get("active", 0),
             "remote_missing": counts.get("remote_missing", 0),
+            "cached_bodies": int(body_stats["count"]),
+            "cached_body_bytes": int(body_stats["bytes"]),
             "history_complete": state.history_complete,
             "history_before_uid": state.history_before_uid,
             "last_sync_at": state.last_sync_at,

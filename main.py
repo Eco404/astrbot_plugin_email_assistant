@@ -70,7 +70,7 @@ def _one_line(value: Any, limit: int = 160) -> str:
     PLUGIN_NAME,
     "econeco",
     "支持多账户 IMAP 收信通知、LLM 只读查询以及 SMTP 发送和回复的邮件助手",
-    "1.7.0",
+    "1.8.0",
 )
 class EmailAssistantPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig) -> None:
@@ -92,6 +92,14 @@ class EmailAssistantPlugin(Star):
                 self.data_dir = StarTools.get_data_dir(PLUGIN_NAME)
                 self._mail_index = MailHeaderIndex(self.data_dir / "mail_headers.db")
                 await asyncio.to_thread(self._mail_index.initialize)
+                if self._body_cache_enabled():
+                    await asyncio.to_thread(
+                        self._mail_index.prune_body_cache,
+                        self._body_cache_retention_days(),
+                        self._body_cache_max_total_bytes(),
+                    )
+                else:
+                    await asyncio.to_thread(self._mail_index.clear_body_cache)
                 logger.info(
                     "[EmailAssistant] 本地邮件头索引已初始化 path=%s",
                     self._mail_index.path,
@@ -178,6 +186,53 @@ class EmailAssistantPlugin(Star):
             720,
         )
         return hours * 3600
+
+    def _body_cache_enabled(self) -> bool:
+        return str(self.config.get("body_cache_mode") or "on_demand").lower() == "on_demand"
+
+    def _body_cache_retention_days(self) -> int:
+        return _safe_int(
+            self.config.get("body_cache_retention_days", 90), 90, 1, 3650
+        )
+
+    def _body_cache_max_item_bytes(self) -> int:
+        kilobytes = _safe_int(
+            self.config.get("body_cache_max_item_kb", 512), 512, 16, 10240
+        )
+        return kilobytes * 1024
+
+    def _body_cache_max_total_bytes(self) -> int:
+        megabytes = _safe_int(
+            self.config.get("body_cache_max_total_mb", 200), 200, 10, 10240
+        )
+        return megabytes * 1024 * 1024
+
+    def _purge_cached_body_on_remote_delete(self) -> bool:
+        return bool(self.config.get("body_cache_purge_on_remote_delete", True))
+
+    async def _cache_mail_body(
+        self,
+        account: dict[str, Any],
+        uidvalidity: int,
+        mail: ParsedMail,
+    ) -> None:
+        index = self._mail_index
+        if index is None or not self._body_cache_enabled():
+            return
+        await asyncio.to_thread(
+            index.cache_body,
+            self._account_key(account),
+            self._folder(account),
+            int(uidvalidity),
+            int(mail.uid),
+            str(mail.body or ""),
+            self._body_cache_max_item_bytes(),
+        )
+        await asyncio.to_thread(
+            index.prune_body_cache,
+            self._body_cache_retention_days(),
+            self._body_cache_max_total_bytes(),
+        )
 
     @staticmethod
     def _folder(account: dict[str, Any]) -> str:
@@ -269,6 +324,19 @@ class EmailAssistantPlugin(Star):
             result.history_before_uid,
             result.history_complete,
         )
+        if (
+            apply_result.remote_state_changes
+            and self._purge_cached_body_on_remote_delete()
+        ):
+            await asyncio.to_thread(
+                index.purge_remote_missing_bodies, account_id, folder
+            )
+        if result.remote_uids is not None and self._body_cache_enabled():
+            await asyncio.to_thread(
+                index.prune_body_cache,
+                self._body_cache_retention_days(),
+                self._body_cache_max_total_bytes(),
+            )
         changed = apply_result.uidvalidity_changed
         if changed or result.uidvalidity_changed:
             baseline = max(0, int(result.uidnext) - 1)
@@ -279,15 +347,27 @@ class EmailAssistantPlugin(Star):
                 _one_line(folder, 100),
                 baseline,
             )
-        if apply_result.header_changes or apply_result.remote_state_changes:
+        if (
+            apply_result.header_changes
+            or apply_result.remote_state_changes
+            or apply_result.history_state_changed
+        ):
             logger.info(
-                "[EmailAssistant] 邮件头索引已更新 account=%s folder=%s headers=%s remote_changes=%s reconcile=%s history_complete=%s",
+                "[EmailAssistant] 邮件头索引已更新 account=%s folder=%s headers=%s remote_changes=%s history_changed=%s reconcile=%s history_complete=%s",
                 account_id,
                 _one_line(folder, 100),
                 apply_result.header_changes,
                 apply_result.remote_state_changes,
+                apply_result.history_state_changed,
                 bool(result.remote_uids is not None),
                 bool(result.history_complete),
+            )
+        elif not (changed or result.uidvalidity_changed):
+            logger.debug(
+                "[EmailAssistant] 邮件头索引同步无变化 account=%s folder=%s reconcile=%s",
+                account_id,
+                _one_line(folder, 100),
+                bool(result.remote_uids is not None),
             )
         self._index_warnings.pop(account_id, None)
         return result
@@ -382,6 +462,14 @@ class EmailAssistantPlugin(Star):
                         expected_uidvalidity,
                         int(uid),
                     )
+                    if self._purge_cached_body_on_remote_delete():
+                        await asyncio.to_thread(
+                            index.delete_cached_body,
+                            account_id,
+                            folder,
+                            expected_uidvalidity,
+                            int(uid),
+                        )
                 raise MailNotFoundError(
                     f"UID {uid} 已在云端删除、移动，或不再属于当前文件夹；本地索引已标记失效。"
                 ) from exc
@@ -397,6 +485,7 @@ class EmailAssistantPlugin(Star):
                 uidvalidity,
                 mail,
             )
+            await self._cache_mail_body(account, uidvalidity, mail)
             return mail
 
     async def _fetch_latest_detail(
@@ -898,6 +987,9 @@ class EmailAssistantPlugin(Star):
                             state.uidvalidity,
                             item.mail,
                         )
+                        await self._cache_mail_body(
+                            account, state.uidvalidity, item.mail
+                        )
                 await self._send_mail_notification(account, item.mail)
                 await self.put_kv_data(cursor_key, int(item.uid))
                 sent += 1
@@ -1285,10 +1377,17 @@ class EmailAssistantPlugin(Star):
                     if index_stats.get("history_complete")
                     else f"历史回填至 UID {index_stats.get('history_before_uid', 0)}"
                 )
+                cached_megabytes = float(
+                    index_stats.get("cached_body_bytes", 0) or 0
+                ) / (1024 * 1024)
                 lines.append(
                     f"   索引：有效 {index_stats.get('active', 0)}，"
                     f"云端失效 {index_stats.get('remote_missing', 0)}，"
                     f"{history_text}，{sync_text}"
+                )
+                lines.append(
+                    f"   正文缓存：{index_stats.get('cached_bodies', 0)} 封，"
+                    f"{cached_megabytes:.2f} MB"
                 )
                 warning = self._index_warnings.get(self._account_key(item), "")
                 if warning:

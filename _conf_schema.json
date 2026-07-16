@@ -246,7 +246,7 @@
   "local_index_enabled": {
     "type": "bool",
     "description": "启用本地邮件头索引",
-    "hint": "索引保存在 AstrBot plugin_data 中，只保存邮件头和同步状态；正文仍在查看或回复时从云端读取。",
+    "hint": "索引保存在 AstrBot plugin_data 中，保存邮件头、同步状态、草稿，并可按正文缓存设置保存已经读取过的纯文本。",
     "default": true
   },
   "local_index_initial_days": {
@@ -272,6 +272,37 @@
     "description": "云端删除核对间隔（小时）",
     "hint": "定期只拉取云端 UID 集合，用于把已删除或移出当前文件夹的本地索引标记为失效。运行时限制为 1 到 720 小时。",
     "default": 24
+  },
+  "body_cache_mode": {
+    "type": "string",
+    "description": "邮件正文缓存模式",
+    "hint": "off 不保存正文并在插件启动时清空已有正文缓存；on_demand 会缓存新邮件通知、查看详情或回复时已经读取过的规范化纯文本。不会后台批量下载历史正文，也不保存 HTML 和附件。",
+    "options": ["off", "on_demand"],
+    "default": "on_demand"
+  },
+  "body_cache_retention_days": {
+    "type": "int",
+    "description": "正文缓存保留天数",
+    "hint": "按最后访问时间清理，运行时限制为 1 到 3650 天。",
+    "default": 90
+  },
+  "body_cache_max_item_kb": {
+    "type": "int",
+    "description": "单封正文缓存上限（KB）",
+    "hint": "超过上限时只缓存前半部分纯文本并记录截断状态，运行时限制为 16 到 10240 KB。",
+    "default": 512
+  },
+  "body_cache_max_total_mb": {
+    "type": "int",
+    "description": "正文缓存总容量（MB）",
+    "hint": "超过容量后按最久未访问顺序清理，运行时限制为 10 到 10240 MB。",
+    "default": 200
+  },
+  "body_cache_purge_on_remote_delete": {
+    "type": "bool",
+    "description": "云端删除时清理正文缓存",
+    "hint": "邮件被确认删除或移出当前文件夹时清理本地正文，建议保持开启。UIDVALIDITY 变化时为防止 UID 错配，无论本项设置如何都会清理旧代正文。",
+    "default": true
   },
   "detail_body_max_chars": {
     "type": "int",

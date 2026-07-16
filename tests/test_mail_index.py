@@ -147,6 +147,71 @@ class MailHeaderIndexTests(unittest.TestCase):
         latest = self.index.latest("one", "INBOX")
         self.assertEqual(latest.uid, 2)
 
+    def test_body_cache_truncates_and_purges_remote_missing(self):
+        timestamp = datetime(2026, 7, 1).timestamp()
+        self.index.apply_sync(
+            "one", "INBOX", 10, 1, [mail(1, timestamp)]
+        )
+        cached = self.index.cache_body(
+            "one", "INBOX", 10, 1, "abcdef", max_item_bytes=5
+        )
+        self.assertEqual(cached.body_text, "abcde")
+        self.assertTrue(cached.truncated)
+        self.assertEqual(self.index.get_cached_body("one", "INBOX", 10, 1).body_text, "abcde")
+        stats = self.index.stats("one", "INBOX")
+        self.assertEqual(stats["cached_bodies"], 1)
+        self.index.mark_remote_missing("one", "INBOX", 10, 1)
+        self.assertEqual(self.index.purge_remote_missing_bodies("one", "INBOX"), 1)
+        self.assertIsNone(self.index.get_cached_body("one", "INBOX", 10, 1))
+
+    def test_uidvalidity_change_purges_old_body_cache(self):
+        timestamp = datetime(2026, 7, 1).timestamp()
+        self.index.apply_sync("one", "INBOX", 10, 1, [mail(1, timestamp)])
+        self.index.cache_body("one", "INBOX", 10, 1, "正文", 1024)
+        self.index.apply_sync("one", "INBOX", 11, 1, [mail(1, timestamp)])
+        self.assertIsNone(self.index.get_cached_body("one", "INBOX", 10, 1))
+
+    def test_body_cache_prunes_to_total_budget(self):
+        timestamp = datetime(2026, 7, 1).timestamp()
+        self.index.apply_sync(
+            "one", "INBOX", 10, 2,
+            [mail(1, timestamp), mail(2, timestamp + 60)]
+        )
+        self.index.cache_body("one", "INBOX", 10, 1, "1234", 1024)
+        self.index.cache_body("one", "INBOX", 10, 2, "5678", 1024)
+        self.assertEqual(self.index.prune_body_cache(90, 4), 1)
+        self.assertEqual(self.index.stats("one", "INBOX")["cached_bodies"], 1)
+
+    def test_draft_crud_uses_optimistic_revision(self):
+        draft = self.index.create_draft(
+            "one",
+            to_addrs=["reader@example.com"],
+            subject="初稿",
+            body_text="正文",
+            source="bot",
+            status="pending_review",
+        )
+        self.assertEqual(draft.revision, 1)
+        self.assertEqual(draft.to_addrs, ("reader@example.com",))
+        updated = self.index.update_draft(
+            draft.draft_id,
+            draft.revision,
+            subject="修改后的主题",
+            status="approved",
+        )
+        self.assertEqual(updated.revision, 2)
+        self.assertEqual(updated.status, "approved")
+        with self.assertRaisesRegex(RuntimeError, "已被其他操作修改"):
+            self.index.update_draft(
+                draft.draft_id, draft.revision, subject="过期修改"
+            )
+        listed = self.index.list_drafts("one", status="approved")
+        self.assertEqual([item.draft_id for item in listed], [draft.draft_id])
+        self.assertTrue(
+            self.index.delete_draft(draft.draft_id, expected_revision=2)
+        )
+        self.assertIsNone(self.index.get_draft(draft.draft_id))
+
 
 if __name__ == "__main__":
     unittest.main()

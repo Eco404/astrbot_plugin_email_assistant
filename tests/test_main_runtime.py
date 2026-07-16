@@ -25,6 +25,9 @@ def _install_astrbot_stubs():
     components = types.ModuleType("astrbot.core.message.components")
 
     class Logger:
+        def debug(self, *args, **kwargs):
+            pass
+
         def info(self, *args, **kwargs):
             pass
 
@@ -658,6 +661,7 @@ class MainRuntimeTests(unittest.IsolatedAsyncioTestCase):
             "",
         )
         index.apply_sync("one", "INBOX", 10, 22, [header])
+        index.cache_body("one", "INBOX", 10, 22, "旧缓存", 1024)
         with patch(
             "astrbot_plugin_email_assistant.main.fetch_detail_checked",
             side_effect=MailNotFoundError("missing"),
@@ -665,6 +669,28 @@ class MainRuntimeTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaisesRegex(MailNotFoundError, "云端删除"):
                 await self.plugin._fetch_remote_detail(self.account, 22)
         self.assertEqual(index.stats("one", "INBOX")["remote_missing"], 1)
+        self.assertIsNone(index.get_cached_body("one", "INBOX", 10, 22))
+
+    async def test_remote_detail_is_cached_on_demand(self):
+        index = self._enable_test_index()
+        timestamp = datetime(2026, 7, 16, 10, 0).timestamp()
+        header = ParsedMail(
+            25, "正文缓存", "", "sender@example.com", "sender@example.com",
+            "2026-07-16 10:00:00", timestamp, "", False, "", ""
+        )
+        detail = ParsedMail(
+            25, "正文缓存", "", "sender@example.com", "sender@example.com",
+            "2026-07-16 10:00:00", timestamp, "完整正文", False, "", ""
+        )
+        index.apply_sync("one", "INBOX", 10, 25, [header])
+        with patch(
+            "astrbot_plugin_email_assistant.main.fetch_detail_checked",
+            return_value=(10, detail),
+        ):
+            result = await self.plugin._fetch_remote_detail(self.account, 25)
+        self.assertEqual(result.body, "完整正文")
+        cached = index.get_cached_body("one", "INBOX", 10, 25)
+        self.assertEqual(cached.body_text, "完整正文")
 
     async def test_transient_detail_error_does_not_mark_mail_missing(self):
         index = self._enable_test_index()
@@ -752,9 +778,15 @@ class MainRuntimeTests(unittest.IsolatedAsyncioTestCase):
         result = HeaderSyncResult(10, 9, 8, [existing], None, False)
         with patch(
             "astrbot_plugin_email_assistant.main.sync_headers", return_value=result
-        ), patch("astrbot_plugin_email_assistant.main.logger.info") as info:
+        ), patch(
+            "astrbot_plugin_email_assistant.main.logger.info"
+        ) as info, patch(
+            "astrbot_plugin_email_assistant.main.logger.debug"
+        ) as debug:
             await self.plugin._sync_account_index(self.account)
         info.assert_not_called()
+        debug.assert_called_once()
+        self.assertIn("同步无变化", debug.call_args.args[0])
 
     async def test_llm_read_tools_reject_cron_events(self):
         event = FakeEvent(
