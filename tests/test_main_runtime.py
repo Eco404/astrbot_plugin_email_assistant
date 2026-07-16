@@ -1,5 +1,4 @@
 import asyncio
-import inspect
 import sys
 import types
 import unittest
@@ -118,12 +117,76 @@ class FakeContext:
     def __init__(self):
         self.sent = []
         self.fail = False
+        self.provider = None
+        self.providers = {}
+        self.persona_manager = None
+        self.conversation_manager = None
+        self.cron_manager = None
 
     async def send_message(self, umo, chain):
         if self.fail:
             raise RuntimeError("platform unavailable")
         self.sent.append((umo, chain[0].text))
         return True
+
+    def get_using_provider(self, umo):
+        return self.provider
+
+    def get_provider_by_id(self, provider_id):
+        return self.providers.get(provider_id)
+
+    def get_config(self, umo=None):
+        return {"provider_settings": {"default_personality": "default"}}
+
+
+class FakeResponse:
+    def __init__(self, text, *, tools_call_name=None, tools_call_args=None):
+        self.completion_text = text
+        self.tools_call_name = tools_call_name or []
+        self.tools_call_args = tools_call_args or []
+
+
+class FakeProvider:
+    def __init__(self, text="人格化转述"):
+        self.text = text
+        self.calls = []
+
+    async def text_chat(self, **kwargs):
+        self.calls.append(kwargs)
+        return FakeResponse(self.text)
+
+
+class FakePersonaManager:
+    async def resolve_selected_persona(self, **kwargs):
+        return "current", {"prompt": "当前人格提示"}, None, False
+
+
+class FakeConversationManager:
+    def __init__(self):
+        self.cid = "cid-1"
+        self.pairs = []
+
+    async def get_curr_conversation_id(self, umo):
+        return self.cid
+
+    async def get_conversation(self, umo, cid):
+        return types.SimpleNamespace(persona_id="current")
+
+    async def new_conversation(self, umo, title=None):
+        self.cid = "new-cid"
+        return self.cid
+
+    async def add_message_pair(self, **kwargs):
+        self.pairs.append(kwargs)
+
+
+class FakeCronManager:
+    def __init__(self):
+        self.jobs = []
+
+    async def add_active_job(self, **kwargs):
+        self.jobs.append(kwargs)
+        return types.SimpleNamespace(job_id="job-1")
 
 
 class FakePlatform:
@@ -253,10 +316,138 @@ class MainRuntimeTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(ValueError, "不唯一"):
             await self.plugin._check_account(self.account)
 
-    def test_no_llm_or_conversation_history_write_path(self):
-        source = inspect.getsource(sys.modules["astrbot_plugin_email_assistant.main"])
-        self.assertNotIn("llm_generate", source)
-        self.assertNotIn("add_message_pair", source)
+    async def test_llm_notification_uses_persona_and_optionally_archives(self):
+        self.plugin.config.update(
+            {
+                "notification_mode": "llm",
+                "llm_write_official_history": True,
+                "narration_prompt": "{account_name}|{sender}|{subject}|{body}|{uid}",
+            }
+        )
+        self.context.provider = FakeProvider()
+        self.context.persona_manager = FakePersonaManager()
+        self.context.conversation_manager = FakeConversationManager()
+        mail = ParsedMail(
+            7,
+            "测试主题",
+            "张三",
+            "sender@example.com",
+            "sender@example.com",
+            "2026-07-16 10:00:00",
+            0,
+            "正文",
+            False,
+            "",
+            "",
+        )
+
+        await self.plugin._send_mail_notification(self.account, mail)
+
+        self.assertEqual(self.context.sent[-1][1], "人格化转述")
+        call = self.context.provider.calls[0]
+        self.assertEqual(call["system_prompt"], "当前人格提示")
+        self.assertIn("私人邮箱|张三 <sender@example.com>|测试主题|正文|7", call["prompt"])
+        pair = self.context.conversation_manager.pairs[0]
+        self.assertIn("邮件主动承接占位", pair["user_message"]["content"])
+        self.assertEqual(pair["assistant_message"]["content"], "人格化转述")
+
+    async def test_llm_notification_does_not_archive_when_disabled(self):
+        self.plugin.config["notification_mode"] = "llm"
+        self.plugin.config["llm_write_official_history"] = False
+        self.context.provider = FakeProvider()
+        self.context.persona_manager = FakePersonaManager()
+        self.context.conversation_manager = FakeConversationManager()
+
+        await self.plugin._send_mail_notification(self.account, parsed())
+
+        self.assertEqual(self.context.conversation_manager.pairs, [])
+
+    async def test_llm_notification_uses_configured_provider(self):
+        self.plugin.config.update(
+            {
+                "notification_mode": "llm",
+                "narration_provider_id": "mail-provider",
+            }
+        )
+        default_provider = FakeProvider("默认模型结果")
+        selected_provider = FakeProvider("指定模型结果")
+        self.context.provider = default_provider
+        self.context.providers["mail-provider"] = selected_provider
+        self.context.persona_manager = FakePersonaManager()
+
+        await self.plugin._send_mail_notification(self.account, parsed())
+
+        self.assertEqual(self.context.sent[-1][1], "指定模型结果")
+        self.assertEqual(len(selected_provider.calls), 1)
+        self.assertEqual(default_provider.calls, [])
+
+    async def test_blank_provider_falls_back_to_session_provider(self):
+        self.plugin.config.update(
+            {"notification_mode": "llm", "narration_provider_id": ""}
+        )
+        self.context.provider = FakeProvider("会话默认模型结果")
+        self.context.persona_manager = FakePersonaManager()
+
+        await self.plugin._send_mail_notification(self.account, parsed())
+
+        self.assertEqual(self.context.sent[-1][1], "会话默认模型结果")
+
+    async def test_missing_configured_provider_fails_explicitly(self):
+        self.plugin.config.update(
+            {
+                "notification_mode": "llm",
+                "narration_provider_id": "missing-provider",
+            }
+        )
+        with self.assertRaisesRegex(RuntimeError, "missing-provider"):
+            await self.plugin._send_mail_notification(self.account, parsed())
+
+    def test_narration_can_be_extracted_from_send_tool_arguments(self):
+        response = FakeResponse(
+            "",
+            tools_call_name=["send_message_to_user"],
+            tools_call_args=[
+                {
+                    "session": "untrusted:FriendMessage:other",
+                    "messages": [
+                        {"type": "plain", "text": "工具参数中的转述"},
+                        {"type": "image", "path": "/tmp/ignored.png"},
+                    ],
+                }
+            ],
+        )
+        self.assertEqual(
+            self.plugin._narration_from_response(response), "工具参数中的转述"
+        )
+
+    async def test_llm_request_includes_output_tool_when_available(self):
+        self.plugin.config["notification_mode"] = "llm"
+        self.context.provider = FakeProvider("正文转述")
+        self.context.persona_manager = FakePersonaManager()
+        output_tools = object()
+
+        with patch.object(
+            self.plugin, "_narration_output_tool_set", return_value=output_tools
+        ):
+            await self.plugin._send_mail_notification(self.account, parsed())
+
+        call = self.context.provider.calls[0]
+        self.assertIs(call["func_tool"], output_tools)
+        self.assertIn("send_message_to_user", call["prompt"])
+
+    async def test_cron_notification_creates_one_shot_job_without_direct_send(self):
+        self.plugin.config["notification_mode"] = "cron"
+        self.context.cron_manager = FakeCronManager()
+
+        await self.plugin._send_mail_notification(self.account, parsed(9))
+
+        self.assertEqual(self.context.sent, [])
+        self.assertEqual(len(self.context.cron_manager.jobs), 1)
+        job = self.context.cron_manager.jobs[0]
+        self.assertTrue(job["run_once"])
+        self.assertTrue(job["persistent"])
+        self.assertEqual(job["payload"]["email_assistant"]["uid"], 9)
+        self.assertIn("send_message_to_user", job["payload"]["note"])
 
 
 if __name__ == "__main__":
