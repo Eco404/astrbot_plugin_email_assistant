@@ -17,8 +17,20 @@ class MailboxState:
     folder: str
     uidvalidity: int
     last_synced_uid: int
+    history_before_uid: int
+    history_complete: bool
     last_sync_at: float
     last_reconcile_at: float
+
+
+@dataclass(frozen=True, slots=True)
+class IndexApplyResult:
+    uidvalidity_changed: bool
+    header_changes: int = 0
+    remote_state_changes: int = 0
+
+    def __bool__(self) -> bool:
+        return self.uidvalidity_changed
 
 
 class MailHeaderIndex:
@@ -52,6 +64,8 @@ class MailHeaderIndex:
                     folder TEXT NOT NULL,
                     uidvalidity INTEGER NOT NULL,
                     last_synced_uid INTEGER NOT NULL DEFAULT 0,
+                    history_before_uid INTEGER NOT NULL DEFAULT 0,
+                    history_complete INTEGER NOT NULL DEFAULT 0,
                     last_sync_at REAL NOT NULL DEFAULT 0,
                     last_reconcile_at REAL NOT NULL DEFAULT 0,
                     PRIMARY KEY (account_id, folder)
@@ -82,6 +96,36 @@ class MailHeaderIndex:
                 );
                 """
             )
+            mailbox_columns = {
+                str(row["name"])
+                for row in connection.execute("PRAGMA table_info(mailboxes)")
+            }
+            if "history_before_uid" not in mailbox_columns:
+                connection.execute(
+                    "ALTER TABLE mailboxes ADD COLUMN history_before_uid "
+                    "INTEGER NOT NULL DEFAULT 0"
+                )
+            if "history_complete" not in mailbox_columns:
+                connection.execute(
+                    "ALTER TABLE mailboxes ADD COLUMN history_complete "
+                    "INTEGER NOT NULL DEFAULT 0"
+                )
+            connection.execute(
+                """
+                UPDATE mailboxes
+                SET history_before_uid = COALESCE(
+                    (
+                        SELECT MIN(headers.uid) FROM mail_headers AS headers
+                        WHERE headers.account_id = mailboxes.account_id
+                          AND headers.folder = mailboxes.folder
+                          AND headers.uidvalidity = mailboxes.uidvalidity
+                          AND headers.remote_state = 'active'
+                    ),
+                    last_synced_uid + 1
+                )
+                WHERE history_before_uid <= 0 AND history_complete = 0
+                """
+            )
         try:
             os.chmod(self.path, 0o600)
         except OSError:
@@ -92,6 +136,7 @@ class MailHeaderIndex:
             row = connection.execute(
                 """
                 SELECT account_id, folder, uidvalidity, last_synced_uid,
+                       history_before_uid, history_complete,
                        last_sync_at, last_reconcile_at
                 FROM mailboxes WHERE account_id = ? AND folder = ?
                 """,
@@ -104,6 +149,8 @@ class MailHeaderIndex:
             folder=str(row["folder"]),
             uidvalidity=int(row["uidvalidity"]),
             last_synced_uid=int(row["last_synced_uid"]),
+            history_before_uid=int(row["history_before_uid"]),
+            history_complete=bool(row["history_complete"]),
             last_sync_at=float(row["last_sync_at"]),
             last_reconcile_at=float(row["last_reconcile_at"]),
         )
@@ -142,8 +189,12 @@ class MailHeaderIndex:
         scanned_through_uid: int,
         headers: list[ParsedMail],
         remote_uids: set[int] | None = None,
-    ) -> bool:
+        history_before_uid: int | None = None,
+        history_complete: bool | None = None,
+    ) -> IndexApplyResult:
         now = time.time()
+        header_changes = 0
+        remote_state_changes = 0
         with self._connection() as connection:
             previous = connection.execute(
                 "SELECT uidvalidity FROM mailboxes WHERE account_id = ? AND folder = ?",
@@ -162,28 +213,47 @@ class MailHeaderIndex:
                 )
 
             previous_synced = 0
+            previous_history_before = 0
+            previous_history_complete = False
             previous_reconcile = 0.0
             if previous is not None and not changed:
                 state = connection.execute(
                     """
-                    SELECT last_synced_uid, last_reconcile_at FROM mailboxes
+                    SELECT last_synced_uid, history_before_uid,
+                           history_complete, last_reconcile_at FROM mailboxes
                     WHERE account_id = ? AND folder = ?
                     """,
                     (account_id, folder),
                 ).fetchone()
                 if state is not None:
                     previous_synced = int(state["last_synced_uid"])
+                    previous_history_before = int(state["history_before_uid"])
+                    previous_history_complete = bool(state["history_complete"])
                     previous_reconcile = float(state["last_reconcile_at"])
+
+            next_history_before = (
+                max(0, int(history_before_uid))
+                if history_before_uid is not None
+                else previous_history_before
+            )
+            next_history_complete = (
+                bool(history_complete)
+                if history_complete is not None
+                else previous_history_complete
+            )
 
             connection.execute(
                 """
                 INSERT INTO mailboxes (
                     account_id, folder, uidvalidity, last_synced_uid,
+                    history_before_uid, history_complete,
                     last_sync_at, last_reconcile_at
-                ) VALUES (?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(account_id, folder) DO UPDATE SET
                     uidvalidity = excluded.uidvalidity,
                     last_synced_uid = excluded.last_synced_uid,
+                    history_before_uid = excluded.history_before_uid,
+                    history_complete = excluded.history_complete,
                     last_sync_at = excluded.last_sync_at,
                     last_reconcile_at = excluded.last_reconcile_at
                 """,
@@ -192,12 +262,33 @@ class MailHeaderIndex:
                     folder,
                     int(uidvalidity),
                     max(previous_synced, int(scanned_through_uid)),
+                    next_history_before,
+                    1 if next_history_complete else 0,
                     now,
                     now if remote_uids is not None else previous_reconcile,
                 ),
             )
 
             if headers:
+                header_values = [
+                    self._header_values(account_id, folder, uidvalidity, mail, now)
+                    for mail in headers
+                ]
+                for values in header_values:
+                    existing = connection.execute(
+                        """
+                        SELECT subject, from_name, from_addr, reply_to, date_text,
+                               date_ts, has_attachments, message_id,
+                               references_text, remote_state
+                        FROM mail_headers
+                        WHERE account_id = ? AND folder = ?
+                          AND uidvalidity = ? AND uid = ?
+                        """,
+                        values[:4],
+                    ).fetchone()
+                    expected = values[4:14]
+                    if existing is None or tuple(existing) != expected:
+                        header_changes += 1
                 connection.executemany(
                     """
                     INSERT INTO mail_headers (
@@ -219,33 +310,37 @@ class MailHeaderIndex:
                         remote_state = 'active',
                         last_seen_at = excluded.last_seen_at
                     """,
-                    [
-                        self._header_values(
-                            account_id, folder, uidvalidity, mail, now
-                        )
-                        for mail in headers
-                    ],
+                    header_values,
                 )
 
             if remote_uids is not None:
                 rows = connection.execute(
                     """
-                    SELECT uid FROM mail_headers
+                    SELECT uid, remote_state FROM mail_headers
                     WHERE account_id = ? AND folder = ? AND uidvalidity = ?
                     """,
                     (account_id, folder, int(uidvalidity)),
                 ).fetchall()
-                states = [
-                    (
-                        "active" if int(row["uid"]) in remote_uids else "remote_missing",
-                        now,
-                        account_id,
-                        folder,
-                        int(uidvalidity),
-                        int(row["uid"]),
+                states = []
+                for row in rows:
+                    target_state = (
+                        "active"
+                        if int(row["uid"]) in remote_uids
+                        else "remote_missing"
                     )
-                    for row in rows
-                ]
+                    if str(row["remote_state"]) == target_state:
+                        continue
+                    states.append(
+                        (
+                            target_state,
+                            now,
+                            account_id,
+                            folder,
+                            int(uidvalidity),
+                            int(row["uid"]),
+                        )
+                    )
+                remote_state_changes = len(states)
                 if states:
                     connection.executemany(
                         """
@@ -254,7 +349,7 @@ class MailHeaderIndex:
                         """,
                         states,
                     )
-        return changed
+        return IndexApplyResult(changed, header_changes, remote_state_changes)
 
     def upsert_header(
         self,
@@ -356,7 +451,13 @@ class MailHeaderIndex:
     def stats(self, account_id: str, folder: str) -> dict[str, int | float]:
         state = self.get_state(account_id, folder)
         if state is None:
-            return {"active": 0, "remote_missing": 0, "last_sync_at": 0.0}
+            return {
+                "active": 0,
+                "remote_missing": 0,
+                "history_complete": False,
+                "history_before_uid": 0,
+                "last_sync_at": 0.0,
+            }
         with self._connection() as connection:
             rows = connection.execute(
                 """
@@ -370,5 +471,7 @@ class MailHeaderIndex:
         return {
             "active": counts.get("active", 0),
             "remote_missing": counts.get("remote_missing", 0),
+            "history_complete": state.history_complete,
+            "history_before_uid": state.history_before_uid,
             "last_sync_at": state.last_sync_at,
         }

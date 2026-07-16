@@ -252,19 +252,19 @@
   "local_index_initial_days": {
     "type": "int",
     "description": "首次索引最近天数",
-    "hint": "首次同步默认只拉取该时间范围内的邮件头，不下载正文。运行时限制为 1 到 3650 天。",
+    "hint": "首次同步先拉取该时间范围内的邮件头，之后后台会分批向更早邮件回填，直到覆盖整个文件夹；始终不下载历史邮件正文。运行时限制为 1 到 3650 天。",
     "default": 90
   },
   "local_index_initial_max_messages": {
     "type": "int",
     "description": "首次索引最多邮件数",
-    "hint": "每个账户首次建立索引时最多保存的邮件头数量；运行时限制为 20 到 10000。",
+    "hint": "每个账户首次建立索引时最多保存的近期邮件头数量；较早邮件会在后续轮询中继续回填。运行时限制为 20 到 10000。",
     "default": 500
   },
   "local_index_sync_batch_size": {
     "type": "int",
-    "description": "增量索引单批邮件数",
-    "hint": "后台每轮为每个账户最多拉取的新增邮件头数量；积压较多时会在后续轮次继续。",
+    "description": "索引每轮邮件数",
+    "hint": "后台每轮为每个账户最多拉取的邮件头总数；优先同步新增邮件，剩余额度用于向更早历史邮件回填。",
     "default": 100
   },
   "local_index_reconcile_interval_hours": {

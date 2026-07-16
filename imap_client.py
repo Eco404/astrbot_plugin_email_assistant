@@ -25,6 +25,8 @@ class HeaderSyncResult:
     headers: list[ParsedMail]
     remote_uids: set[int] | None
     uidvalidity_changed: bool
+    history_before_uid: int | None = None
+    history_complete: bool | None = None
 
 
 class MailNotFoundError(RuntimeError):
@@ -242,6 +244,8 @@ def sync_headers(
     timeout: int = 20,
     reconcile_all: bool = False,
     force_initial: bool = False,
+    known_history_before_uid: int = 0,
+    known_history_complete: bool = False,
 ) -> HeaderSyncResult:
     with ImapMailbox(account, timeout) as mailbox:
         current_uidvalidity = mailbox.uidvalidity
@@ -250,13 +254,19 @@ def sync_headers(
             known_uidvalidity is not None
             and int(known_uidvalidity) != current_uidvalidity
         )
-        initial = force_initial or known_uidvalidity is None or changed
-        if initial:
+        new_generation = known_uidvalidity is None or changed
+        date_scan = force_initial or new_generation
+        history_before_uid: int | None = None
+        history_complete: bool | None = None
+        if date_scan:
             candidates = mailbox.search_uids(
                 f'SINCE "{initial_since.strftime("%d-%b-%Y")}"'
             )
             selected = candidates[-_positive_int(initial_limit, 200) :]
             scanned_through = selected[-1] if selected else max(0, uidnext - 1)
+            if new_generation:
+                history_before_uid = selected[0] if selected else max(1, uidnext)
+                history_complete = history_before_uid <= 1
         else:
             candidates = [
                 uid
@@ -265,6 +275,24 @@ def sync_headers(
             ]
             selected = candidates[: _positive_int(batch_limit, 100)]
             scanned_through = selected[-1] if selected else int(after_uid)
+
+            history_before_uid = max(0, int(known_history_before_uid or 0))
+            history_complete = bool(known_history_complete)
+            remaining = max(0, _positive_int(batch_limit, 100) - len(selected))
+            if not history_complete and remaining:
+                if history_before_uid <= 0:
+                    history_before_uid = max(1, min(int(after_uid) + 1, uidnext))
+                if history_before_uid <= 1:
+                    history_complete = True
+                else:
+                    older_candidates = mailbox.search_uids(
+                        f"UID 1:{history_before_uid - 1}"
+                    )
+                    older_selected = older_candidates[-remaining:]
+                    selected.extend(older_selected)
+                    if older_selected:
+                        history_before_uid = older_selected[0]
+                    history_complete = len(older_candidates) <= remaining
 
         headers: list[ParsedMail] = []
         for uid in selected:
@@ -280,6 +308,8 @@ def sync_headers(
             headers=headers,
             remote_uids=remote_uids,
             uidvalidity_changed=changed,
+            history_before_uid=history_before_uid,
+            history_complete=history_complete,
         )
 
 

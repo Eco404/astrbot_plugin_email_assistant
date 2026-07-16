@@ -70,7 +70,7 @@ def _one_line(value: Any, limit: int = 160) -> str:
     PLUGIN_NAME,
     "econeco",
     "支持多账户 IMAP 收信通知、LLM 只读查询以及 SMTP 发送和回复的邮件助手",
-    "1.6.0",
+    "1.7.0",
 )
 class EmailAssistantPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig) -> None:
@@ -255,8 +255,10 @@ class EmailAssistantPlugin(Star):
             self._timeout(),
             reconcile,
             backfill_since is not None,
+            state.history_before_uid if state else 0,
+            state.history_complete if state else False,
         )
-        changed = await asyncio.to_thread(
+        apply_result = await asyncio.to_thread(
             index.apply_sync,
             account_id,
             folder,
@@ -264,7 +266,10 @@ class EmailAssistantPlugin(Star):
             result.scanned_through_uid,
             result.headers,
             result.remote_uids,
+            result.history_before_uid,
+            result.history_complete,
         )
+        changed = apply_result.uidvalidity_changed
         if changed or result.uidvalidity_changed:
             baseline = max(0, int(result.uidnext) - 1)
             await self.put_kv_data(self._cursor_key(account), baseline)
@@ -274,13 +279,16 @@ class EmailAssistantPlugin(Star):
                 _one_line(folder, 100),
                 baseline,
             )
-        logger.info(
-            "[EmailAssistant] 邮件头索引同步 account=%s folder=%s headers=%s reconcile=%s",
-            account_id,
-            _one_line(folder, 100),
-            len(result.headers),
-            bool(result.remote_uids is not None),
-        )
+        if apply_result.header_changes or apply_result.remote_state_changes:
+            logger.info(
+                "[EmailAssistant] 邮件头索引已更新 account=%s folder=%s headers=%s remote_changes=%s reconcile=%s history_complete=%s",
+                account_id,
+                _one_line(folder, 100),
+                apply_result.header_changes,
+                apply_result.remote_state_changes,
+                bool(result.remote_uids is not None),
+                bool(result.history_complete),
+            )
         self._index_warnings.pop(account_id, None)
         return result
 
@@ -312,7 +320,14 @@ class EmailAssistantPlugin(Star):
             default_boundary = datetime.now() - timedelta(
                 days=self._initial_index_days()
             )
-            if since < default_boundary:
+            state = await asyncio.to_thread(
+                index.get_state,
+                self._account_key(account),
+                self._folder(account),
+            )
+            if since < default_boundary and not (
+                state and state.history_complete
+            ):
                 await self._sync_account_index(account, backfill_since=since)
             self._index_warnings.pop(self._account_key(account), None)
         except Exception as exc:
@@ -1265,9 +1280,15 @@ class EmailAssistantPlugin(Star):
                     if last_sync
                     else "尚未同步"
                 )
+                history_text = (
+                    "历史已完整"
+                    if index_stats.get("history_complete")
+                    else f"历史回填至 UID {index_stats.get('history_before_uid', 0)}"
+                )
                 lines.append(
                     f"   索引：有效 {index_stats.get('active', 0)}，"
-                    f"云端失效 {index_stats.get('remote_missing', 0)}，{sync_text}"
+                    f"云端失效 {index_stats.get('remote_missing', 0)}，"
+                    f"{history_text}，{sync_text}"
                 )
                 warning = self._index_warnings.get(self._account_key(item), "")
                 if warning:
@@ -1365,7 +1386,8 @@ class EmailAssistantPlugin(Star):
                 )
                 lines.append(
                     f"✅ {self._display_name(item)}：有效 {stats.get('active', 0)}，"
-                    f"云端失效 {stats.get('remote_missing', 0)}"
+                    f"云端失效 {stats.get('remote_missing', 0)}，"
+                    f"{'历史已完整' if stats.get('history_complete') else '历史继续回填中'}"
                 )
             except Exception as exc:
                 lines.append(f"❌ {self._display_name(item)}：{_one_line(exc)}")

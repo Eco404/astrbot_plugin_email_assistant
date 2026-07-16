@@ -727,7 +727,10 @@ class MainRuntimeTests(unittest.IsolatedAsyncioTestCase):
         ])
         await self.plugin.put_kv_data(self.plugin._cursor_key(self.account), 8)
         fresh = ParsedMail(1, "新代", "", "a@example.com", "a@example.com", "2026-07-16", timestamp, "", False, "", "")
-        result = HeaderSyncResult(11, 6, 1, [fresh], {1}, True)
+        result = HeaderSyncResult(
+            11, 6, 1, [fresh], {1}, True,
+            history_before_uid=1, history_complete=True
+        )
         with patch(
             "astrbot_plugin_email_assistant.main.sync_headers", return_value=result
         ):
@@ -738,6 +741,20 @@ class MainRuntimeTests(unittest.IsolatedAsyncioTestCase):
             await self.plugin.get_kv_data(self.plugin._cursor_key(self.account)), 5
         )
         self.assertEqual(index.get_state("one", "INBOX").uidvalidity, 11)
+
+    async def test_unchanged_index_sync_does_not_log_success(self):
+        index = self._enable_test_index()
+        existing = ParsedMail(
+            8, "已有邮件", "", "a@example.com", "a@example.com", "", 0,
+            "", False, "", ""
+        )
+        index.apply_sync("one", "INBOX", 10, 8, [existing])
+        result = HeaderSyncResult(10, 9, 8, [existing], None, False)
+        with patch(
+            "astrbot_plugin_email_assistant.main.sync_headers", return_value=result
+        ), patch("astrbot_plugin_email_assistant.main.logger.info") as info:
+            await self.plugin._sync_account_index(self.account)
+        info.assert_not_called()
 
     async def test_llm_read_tools_reject_cron_events(self):
         event = FakeEvent(
