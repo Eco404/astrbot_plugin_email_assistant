@@ -94,6 +94,8 @@ def build_message(
     if not to_addr or "@" not in to_addr:
         raise ValueError("收件人邮箱地址无效。")
     subject = _validate_header(subject, "主题")
+    if not subject.strip():
+        raise ValueError("主题不能为空。")
     body = str(body or "").strip()
     if not body:
         raise ValueError("正文不能为空。")
@@ -139,6 +141,8 @@ def build_draft_message(
     if not to_values:
         raise ValueError("至少需要一个收件人。")
     subject = _validate_header(subject, "主题")
+    if not subject.strip():
+        raise ValueError("主题不能为空。")
     body = str(body or "").strip()
     if not body:
         raise ValueError("正文不能为空。")

@@ -184,6 +184,24 @@
     "hint": "管理员仍只能在私聊中执行命令，但可以操作全部邮箱。",
     "default": []
   },
+  "llm_mail_write_enabled": {
+    "type": "bool",
+    "description": "允许 LLM 创建并确认发送邮件草稿",
+    "hint": "默认关闭。开启后 LLM 只能先创建本地待确认草稿；实际发送必须由用户在下一条真实私聊消息中输入一次性确认指令。定时任务、群聊和合成事件不能使用。",
+    "default": false
+  },
+  "llm_send_confirmation_ttl_minutes": {
+    "type": "int",
+    "description": "LLM 草稿确认码有效期（分钟）",
+    "hint": "默认 10 分钟，运行时限制为 1 到 60 分钟。确认码只能使用一次，草稿被编辑后也会失效。",
+    "default": 10
+  },
+  "llm_draft_body_max_chars": {
+    "type": "int",
+    "description": "LLM 创建草稿正文最大字符数",
+    "hint": "限制 LLM 写入本地草稿和提交 SMTP 的正文长度，运行时限制为 200 到 100000 字符。",
+    "default": 20000
+  },
   "notification_mode": {
     "type": "string",
     "description": "新邮件通知模式",

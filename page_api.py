@@ -19,7 +19,7 @@ from .imap_client import (
     transfer_message,
 )
 from .mail_index import IndexedMailHeader, MailDraft, mail_content_hash
-from .smtp_client import build_draft_message, send_draft_message
+from .smtp_client import build_draft_message
 
 try:  # AstrBot's current Plugin Pages request facade.
     from astrbot.api.web import request
@@ -32,7 +32,10 @@ except ImportError:  # Compatibility with AstrBot 4.26 deployments and tests.
 
 PLUGIN_NAME = "astrbot_plugin_email_assistant"
 PAGE_API_PREFIX = f"/{PLUGIN_NAME}"
-_DRAFT_STATUSES = {"editing", "pending_review", "approved", "sent", "failed"}
+_DRAFT_STATUSES = {
+    "editing", "pending_review", "approved", "sending",
+    "sent", "failed", "cancelled",
+}
 
 
 def _one_line(value: Any, limit: int = 180) -> str:
@@ -44,7 +47,7 @@ class EmailAssistantPageApi:
 
     def __init__(self, plugin: Any) -> None:
         self.plugin = plugin
-        self._draft_send_locks: dict[str, asyncio.Lock] = {}
+        self._draft_send_locks = plugin._draft_service.locks
         self._ai_locks: dict[str, asyncio.Lock] = {}
 
     def register_routes(self) -> None:
@@ -874,8 +877,8 @@ class EmailAssistantPageApi:
                 if current is None:
                     raise KeyError("草稿不存在。")
                 self._resolve_account(current.account_id)
-                if current.status == "sent":
-                    raise PermissionError("已发送草稿不能继续编辑。")
+                if current.status in {"sending", "sent", "cancelled"}:
+                    raise PermissionError("发送中、已发送或已取消的草稿不能继续编辑。")
                 changes: dict[str, Any] = {}
                 for key in ("to_addrs", "cc_addrs", "bcc_addrs"):
                     if key in payload:
@@ -908,8 +911,8 @@ class EmailAssistantPageApi:
                 draft = await asyncio.to_thread(index.get_draft, draft_id)
                 if draft is None:
                     raise KeyError("草稿不存在。")
-                if draft.status == "sent":
-                    raise PermissionError("已发送草稿不能重新审核或发送。")
+                if draft.status in {"sending", "sent", "cancelled"}:
+                    raise PermissionError("发送中、已发送或已取消的草稿不能重新审核。")
                 account = self._resolve_account(
                     draft.account_id, capability="send_enabled"
                 )
@@ -945,6 +948,8 @@ class EmailAssistantPageApi:
                 if draft is None:
                     raise KeyError("草稿不存在。")
                 self._resolve_account(draft.account_id)
+                if draft.status == "sending":
+                    raise PermissionError("发送中的草稿不能删除。")
                 deleted = await asyncio.to_thread(
                     index.delete_draft,
                     draft_id,
@@ -964,82 +969,19 @@ class EmailAssistantPageApi:
         )
         if not draft_id:
             return self._error("缺少草稿 ID。")
-        lock = self._draft_send_locks.setdefault(draft_id, asyncio.Lock())
-        async with lock:
-            index = None
-            draft = None
-            send_attempted = False
-            try:
-                index = self._require_index()
-                draft = await asyncio.to_thread(index.get_draft, draft_id)
-                if draft is None:
-                    raise KeyError("草稿不存在。")
-                if draft.revision != expected_revision:
-                    raise RuntimeError("草稿已被其他操作修改，请刷新后重试。")
-                if draft.status != "approved":
-                    raise PermissionError("草稿必须先审核通过才能发送。")
-                account = self._resolve_account(
-                    draft.account_id, capability="send_enabled"
-                )
-                original = None
-                if draft.reply_uid is not None:
-                    if not account.get("query_enabled", True):
-                        raise PermissionError("回复草稿发送前需要启用邮件查询功能。")
-                    original = await self.plugin._fetch_remote_detail(
-                        account, draft.reply_uid, draft.reply_folder or None
-                    )
-                self.plugin._log_mail_operation(
-                    "web_send_draft",
-                    account,
-                    uid=draft.reply_uid,
-                    detail=f"draft={draft_id[:12]}",
-                )
-                send_attempted = True
-                await asyncio.to_thread(
-                    send_draft_message,
-                    account,
-                    draft.to_addrs,
-                    draft.cc_addrs,
-                    draft.bcc_addrs,
-                    draft.subject,
-                    draft.body_text,
-                    self.plugin._timeout(),
-                    original=original,
-                )
-                sent = await asyncio.to_thread(
-                    index.update_draft,
-                    draft_id,
-                    draft.revision,
-                    status="sent",
-                    last_error="",
-                )
-                self.plugin._log_mail_operation(
-                    "web_send_draft_success",
-                    account,
-                    uid=draft.reply_uid,
-                    detail=f"draft={draft_id[:12]}",
-                )
-                return self._ok(self._draft_payload(sent))
-            except Exception as exc:
-                if (
-                    send_attempted
-                    and index is not None
-                    and draft is not None
-                    and draft.status == "approved"
-                ):
-                    try:
-                        await asyncio.to_thread(
-                            index.update_draft,
-                            draft_id,
-                            draft.revision,
-                            status="failed",
-                            last_error=_one_line(exc, 300),
-                        )
-                    except Exception:
-                        pass
-                logger.warning(
-                    "[EmailAssistantPage] 草稿发送失败 draft=%s error=%s",
-                    draft_id[:12],
-                    _one_line(exc, 220),
-                )
-                return self._error(f"发送失败：{_one_line(exc, 240)}")
+        try:
+            sent = await self.plugin._draft_service.send_approved_draft(
+                draft_id,
+                expected_revision,
+                lambda account_id: self._resolve_account(
+                    account_id, capability="send_enabled"
+                ),
+            )
+            return self._ok(self._draft_payload(sent))
+        except Exception as exc:
+            logger.warning(
+                "[EmailAssistantPage] 草稿发送失败 draft=%s error=%s",
+                draft_id[:12],
+                _one_line(exc, 220),
+            )
+            return self._error(f"发送失败：{_one_line(exc, 240)}")

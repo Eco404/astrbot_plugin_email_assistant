@@ -236,11 +236,19 @@ class FakePlatformManager:
 
 
 class FakeEvent:
-    def __init__(self, sender_id, umo, platform_name="aiocqhttp", extras=None):
+    def __init__(
+        self,
+        sender_id,
+        umo,
+        platform_name="aiocqhttp",
+        extras=None,
+        message_str="",
+    ):
         self.sender_id = sender_id
         self.unified_msg_origin = umo
         self.platform_name = platform_name
         self.extras = extras or {}
+        self.message_str = message_str
 
     def get_sender_id(self):
         return self.sender_id
@@ -250,6 +258,9 @@ class FakeEvent:
 
     def get_extra(self, key):
         return self.extras.get(key)
+
+    def get_message_str(self):
+        return self.message_str
 
 
 class FakePageRequest:
@@ -671,6 +682,230 @@ class MainRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result["success"])
         self.assertIsNone(result["message"])
 
+    def _enable_llm_draft_workflow(self):
+        index = self._enable_test_index()
+        self.plugin.config["llm_mail_write_enabled"] = True
+        self.account.update(
+            {
+                "email": "bot@example.com",
+                "password": "secret",
+                "smtp_host": "smtp.example.com",
+                "smtp_port": 465,
+                "smtp_security": "ssl",
+            }
+        )
+        return index
+
+    async def test_llm_draft_requires_confirmation_in_new_user_message(self):
+        index = self._enable_llm_draft_workflow()
+        creation_event = FakeEvent(
+            "1", "p:FriendMessage:1", message_str="给 reader@example.com 写一封邮件"
+        )
+        created = json.loads(
+            await self.plugin.tool_create_draft(
+                creation_event,
+                "reader@example.com",
+                "测试主题",
+                "测试正文",
+                account="one",
+            )
+        )
+        self.assertTrue(created["success"])
+        draft = created["draft"]
+        self.assertEqual(draft["status"], "pending_review")
+        self.assertTrue(created["requires_new_user_confirmation"])
+        code = draft["confirmation_code"]
+
+        same_turn = json.loads(
+            await self.plugin.tool_confirm_send(
+                creation_event, draft["draft_id"], code
+            )
+        )
+        self.assertFalse(same_turn["success"])
+        self.assertEqual(index.get_draft(draft["draft_id"]).status, "pending_review")
+
+        confirmation_event = FakeEvent(
+            "1", "p:FriendMessage:1", message_str=f"确认发送 {code}"
+        )
+        with patch(
+            "astrbot_plugin_email_assistant.draft_service.send_draft_message"
+        ) as send:
+            sent = json.loads(
+                await self.plugin.tool_confirm_send(
+                    confirmation_event, draft["draft_id"], code
+                )
+            )
+            duplicate = json.loads(
+                await self.plugin.tool_confirm_send(
+                    confirmation_event, draft["draft_id"], code
+                )
+            )
+        self.assertTrue(sent["success"])
+        self.assertEqual(sent["draft"]["status"], "sent")
+        self.assertFalse(duplicate["success"])
+        send.assert_called_once()
+
+    async def test_llm_draft_confirmation_requires_exact_message_and_owner(self):
+        index = self._enable_llm_draft_workflow()
+        owner = FakeEvent("1", "p:FriendMessage:1", message_str="写邮件")
+        created = json.loads(
+            await self.plugin.tool_create_draft(
+                owner, "reader@example.com", "主题", "正文", "one"
+            )
+        )["draft"]
+        code = created["confirmation_code"]
+        ambiguous = FakeEvent(
+            "1", "p:FriendMessage:1", message_str=f"不要确认发送 {code}"
+        )
+        denied = json.loads(
+            await self.plugin.tool_confirm_send(
+                ambiguous, created["draft_id"], code
+            )
+        )
+        self.assertFalse(denied["success"])
+
+        other = FakeEvent("2", "p:FriendMessage:2", message_str=f"确认发送 {code}")
+        denied = json.loads(
+            await self.plugin.tool_confirm_send(other, created["draft_id"], code)
+        )
+        self.assertFalse(denied["success"])
+        self.assertEqual(index.get_draft(created["draft_id"]).status, "pending_review")
+
+    async def test_llm_reply_draft_refetches_original_before_send(self):
+        self._enable_llm_draft_workflow()
+        original = ParsedMail(
+            77,
+            "原主题",
+            "Sender",
+            "sender@example.com",
+            "reply@example.com",
+            "2026-07-16",
+            0,
+            "不可信正文",
+            False,
+            "<message@example.com>",
+            "<root@example.com>",
+        )
+        event = FakeEvent("1", "p:FriendMessage:1", message_str="回复 UID 77")
+        with patch.object(
+            self.plugin, "_fetch_remote_detail", new=AsyncMock(return_value=original)
+        ) as fetch:
+            created_result = json.loads(
+                await self.plugin.tool_create_reply_draft(
+                    event, 77, "已经收到，谢谢。", "one", "INBOX"
+                )
+            )
+            created = created_result["draft"]
+            confirm_event = FakeEvent(
+                "1",
+                "p:FriendMessage:1",
+                message_str=f"确认发送 {created['confirmation_code']}",
+            )
+            with patch(
+                "astrbot_plugin_email_assistant.draft_service.send_draft_message"
+            ) as send:
+                sent = json.loads(
+                    await self.plugin.tool_confirm_send(
+                        confirm_event,
+                        created["draft_id"],
+                        created["confirmation_code"],
+                    )
+                )
+        self.assertTrue(sent["success"])
+        self.assertEqual(fetch.await_count, 2)
+        self.assertEqual(created["to"], ["reply@example.com"])
+        self.assertEqual(created["subject"], "Re: 原主题")
+        self.assertIs(send.call_args.kwargs["original"], original)
+
+    async def test_llm_cancel_draft_is_owner_scoped_and_invalidates_send(self):
+        index = self._enable_llm_draft_workflow()
+        event = FakeEvent("1", "p:FriendMessage:1", message_str="写邮件")
+        created = json.loads(
+            await self.plugin.tool_create_draft(
+                event, "reader@example.com", "主题", "正文", "one"
+            )
+        )["draft"]
+        other = FakeEvent("2", "p:FriendMessage:2", message_str="取消")
+        denied = json.loads(
+            await self.plugin.tool_cancel_draft(other, created["draft_id"])
+        )
+        self.assertFalse(denied["success"])
+        cancelled = json.loads(
+            await self.plugin.tool_cancel_draft(event, created["draft_id"])
+        )
+        self.assertTrue(cancelled["success"])
+        self.assertEqual(index.get_draft(created["draft_id"]).status, "cancelled")
+        confirm_event = FakeEvent(
+            "1",
+            "p:FriendMessage:1",
+            message_str=f"确认发送 {created['confirmation_code']}",
+        )
+        send = json.loads(
+            await self.plugin.tool_confirm_send(
+                confirm_event, created["draft_id"], created["confirmation_code"]
+            )
+        )
+        self.assertFalse(send["success"])
+
+    async def test_llm_smtp_failure_consumes_confirmation_without_retry(self):
+        index = self._enable_llm_draft_workflow()
+        event = FakeEvent("1", "p:FriendMessage:1", message_str="写邮件")
+        created = json.loads(
+            await self.plugin.tool_create_draft(
+                event, "reader@example.com", "主题", "正文", "one"
+            )
+        )["draft"]
+        confirm_event = FakeEvent(
+            "1",
+            "p:FriendMessage:1",
+            message_str=f"确认发送 {created['confirmation_code']}",
+        )
+        with patch(
+            "astrbot_plugin_email_assistant.draft_service.send_draft_message",
+            side_effect=RuntimeError("connection lost"),
+        ) as send:
+            failed = json.loads(
+                await self.plugin.tool_confirm_send(
+                    confirm_event, created["draft_id"], created["confirmation_code"]
+                )
+            )
+            retried = json.loads(
+                await self.plugin.tool_confirm_send(
+                    confirm_event, created["draft_id"], created["confirmation_code"]
+                )
+            )
+        self.assertFalse(failed["success"])
+        self.assertIn("不会自动重试", failed["error"])
+        self.assertFalse(retried["success"])
+        self.assertEqual(index.get_draft(created["draft_id"]).status, "failed")
+        send.assert_called_once()
+
+    async def test_llm_write_tools_are_disabled_by_default_and_reject_cron(self):
+        self._enable_test_index()
+        self.account.update({"email": "bot@example.com", "password": "secret"})
+        normal = FakeEvent("1", "p:FriendMessage:1", message_str="写邮件")
+        disabled = json.loads(
+            await self.plugin.tool_create_draft(
+                normal, "reader@example.com", "主题", "正文", "one"
+            )
+        )
+        self.assertFalse(disabled["success"])
+
+        self.plugin.config["llm_mail_write_enabled"] = True
+        cron = FakeEvent(
+            "1",
+            "p:FriendMessage:1",
+            platform_name="cron",
+            extras={"cron_job": {"id": "job"}},
+            message_str="写邮件",
+        )
+        denied = json.loads(
+            await self.plugin.tool_create_draft(
+                cron, "reader@example.com", "主题", "正文", "one"
+            )
+        )
+        self.assertFalse(denied["success"])
+
     async def test_local_index_sync_drives_header_query(self):
         index = self._enable_test_index()
         timestamp = datetime(2026, 7, 16, 10, 0).timestamp()
@@ -987,7 +1222,8 @@ class MainRuntimeTests(unittest.IsolatedAsyncioTestCase):
             "revision": approved["revision"],
         }
         with patch.object(page_api_module, "request", fake_request), patch.object(
-            page_api_module, "send_draft_message"
+            sys.modules["astrbot_plugin_email_assistant.draft_service"],
+            "send_draft_message",
         ) as send:
             sent_response = await api.send_draft()
             duplicate_response = await api.send_draft()

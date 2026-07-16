@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import inspect
 import json
 import re
 from datetime import datetime, timedelta
@@ -13,6 +14,11 @@ from astrbot.api.platform import MessageType
 from astrbot.api.star import Context, Star, StarTools, register
 from astrbot.core.message.components import Plain
 
+from .draft_service import (
+    EmailDraftService,
+    confirmation_present_in_user_message,
+    normalize_confirmation_code,
+)
 from .account_utils import (
     account_owner_user_id,
     account_target_platform,
@@ -44,7 +50,7 @@ from .smtp_client import send_mail, send_reply, test_smtp
 
 PLUGIN_NAME = "astrbot_plugin_email_assistant"
 
-EMAIL_TOOL_PROMPT_MARKER = "<!-- email_assistant_tool_conversation_v1 -->"
+EMAIL_TOOL_PROMPT_MARKER = "<!-- email_assistant_tool_conversation_v2 -->"
 
 
 def _email_llm_tool(name: str, description_prompt: str):
@@ -82,8 +88,8 @@ def _one_line(value: Any, limit: int = 160) -> str:
 @register(
     PLUGIN_NAME,
     "econeco",
-    "支持多账户 IMAP 收信通知、LLM 只读查询、SMTP 收发和邮件中心 WebUI 的邮件助手",
-    "2.0.0",
+    "支持多账户 IMAP 收信通知、LLM 安全草稿与查询、SMTP 收发和邮件中心 WebUI 的邮件助手",
+    "2.1.0",
 )
 class EmailAssistantPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig) -> None:
@@ -97,6 +103,7 @@ class EmailAssistantPlugin(Star):
         self._index_warnings: dict[str, str] = {}
         self.data_dir = None
         self._mail_index: MailHeaderIndex | None = None
+        self._draft_service = EmailDraftService(self)
         self.page_api = None
 
     async def initialize(self) -> None:
@@ -106,6 +113,15 @@ class EmailAssistantPlugin(Star):
                 self.data_dir = StarTools.get_data_dir(PLUGIN_NAME)
                 self._mail_index = MailHeaderIndex(self.data_dir / "mail_headers.db")
                 await asyncio.to_thread(self._mail_index.initialize)
+                interrupted_sends = await asyncio.to_thread(
+                    self._mail_index.recover_interrupted_draft_sends
+                )
+                if interrupted_sends:
+                    logger.warning(
+                        "[EmailAssistant] 检测到 %s 个中断的草稿发送，"
+                        "已标记为结果不确定且不会自动重试。",
+                        interrupted_sends,
+                    )
                 if self._body_cache_enabled():
                     await asyncio.to_thread(
                         self._mail_index.prune_body_cache,
@@ -1339,6 +1355,76 @@ class EmailAssistantPlugin(Star):
             return "无法识别当前私聊用户。"
         return ""
 
+    def _guard_write_tool(self, event: AstrMessageEvent) -> str:
+        guard_error = self._guard_read_tool(event)
+        if guard_error:
+            return guard_error
+        if not self.config.get("llm_mail_write_enabled", False):
+            return "LLM 邮件草稿和发送工具已在插件设置中关闭。"
+        if self._mail_index is None:
+            return "本地邮件索引未启用，无法使用安全草稿工作流。"
+        return ""
+
+    def _resolve_send_tool_account(
+        self,
+        event: AstrMessageEvent,
+        selector: str,
+        *,
+        require_query: bool = False,
+    ) -> tuple[dict[str, Any] | None, str]:
+        guard_error = self._guard_write_tool(event)
+        if guard_error:
+            return None, guard_error
+        account, error = self._resolve_for_event(event, selector)
+        if account is None:
+            return None, error
+        if not account.get("send_enabled", True):
+            return None, "该邮箱的发送功能已关闭。"
+        if require_query and not account.get("query_enabled", True):
+            return None, "创建回复草稿需要启用该邮箱的查询功能。"
+        return account, ""
+
+    @staticmethod
+    async def _event_message_text(event: AstrMessageEvent) -> str:
+        try:
+            value = event.get_message_str()
+            if inspect.isawaitable(value):
+                value = await value
+            return str(value or "").strip()
+        except Exception:
+            return str(getattr(event, "message_str", "") or "").strip()
+
+    def _llm_draft_body_limit(self) -> int:
+        return _safe_int(
+            self.config.get("llm_draft_body_max_chars", 20000),
+            20000,
+            200,
+            100000,
+        )
+
+    @staticmethod
+    def _draft_tool_payload(draft: Any, code: str = "", expires_at: float = 0) -> dict[str, Any]:
+        payload = {
+            "draft_id": draft.draft_id,
+            "account_id": draft.account_id,
+            "to": list(draft.to_addrs),
+            "cc": list(draft.cc_addrs),
+            "bcc": list(draft.bcc_addrs),
+            "subject": draft.subject,
+            "body": draft.body_text,
+            "reply_folder": draft.reply_folder,
+            "reply_uid": draft.reply_uid,
+            "status": draft.status,
+            "revision": draft.revision,
+        }
+        if code:
+            payload.update(
+                confirmation_code=code,
+                confirmation_expires_at=int(expires_at),
+                confirmation_instruction=f"确认发送 {code}",
+            )
+        return payload
+
     def _resolve_query_tool_account(
         self, event: AstrMessageEvent, selector: str
     ) -> tuple[dict[str, Any] | None, str]:
@@ -1360,13 +1446,17 @@ class EmailAssistantPlugin(Star):
         if req is None or not self._is_private(event):
             return
         try:
-            has_query_account = any(
+            has_email_capability = any(
                 account.get("query_enabled", True)
+                or (
+                    self.config.get("llm_mail_write_enabled", False)
+                    and account.get("send_enabled", True)
+                )
                 for account in self._visible_accounts(event)
             )
         except Exception:
             return
-        if not has_query_account:
+        if not has_email_capability:
             return
         current_prompt = str(getattr(req, "system_prompt", "") or "")
         if EMAIL_TOOL_PROMPT_MARKER in current_prompt:
@@ -1409,14 +1499,20 @@ class EmailAssistantPlugin(Star):
         accounts = self._visible_accounts(event)
         results = []
         for account in accounts:
-            if not account.get("query_enabled", True):
+            if not (
+                account.get("query_enabled", True)
+                or (
+                    self.config.get("llm_mail_write_enabled", False)
+                    and account.get("send_enabled", True)
+                )
+            ):
                 continue
             results.append(
                 {
                     "account_id": self._account_key(account),
                     "name": self._display_name(account),
                     "email": _one_line(account.get("email"), 160),
-                    "query_enabled": True,
+                    "query_enabled": bool(account.get("query_enabled", True)),
                     "receive_enabled": bool(account.get("receive_enabled", True)),
                     "send_enabled": bool(account.get("send_enabled", True)),
                 }
@@ -1575,6 +1671,181 @@ class EmailAssistantPlugin(Star):
             self._mail_detail_result(selected, mail),
             ensure_ascii=False,
             separators=(",", ":"),
+        )
+
+    @_email_llm_tool(
+        "email_assistant_create_draft", "tool_create_draft_description"
+    )
+    async def tool_create_draft(
+        self,
+        event: AstrMessageEvent,
+        recipient: str,
+        subject: str,
+        body: str,
+        account: str = "",
+    ) -> str:
+        selected, error = self._resolve_send_tool_account(event, account)
+        if selected is None:
+            return self._tool_result(False, error=error)
+        body_text = str(body or "").strip()
+        if len(body_text) > self._llm_draft_body_limit():
+            return self._tool_result(False, error="草稿正文超过插件配置的最大字符数。")
+        owner_umo = str(getattr(event, "unified_msg_origin", "") or "").strip()
+        owner_sender_id = self._sender_id(event)
+        try:
+            draft, code, expires_at = await self._draft_service.create_bot_draft(
+                selected,
+                recipient=str(recipient or "").strip(),
+                subject=str(subject or "").strip()[:998],
+                body=body_text,
+                owner_umo=owner_umo,
+                owner_sender_id=owner_sender_id,
+            )
+        except Exception as exc:
+            return self._tool_result(False, error=f"创建草稿失败：{_one_line(exc, 240)}")
+        self._log_mail_operation(
+            "llm_create_draft",
+            selected,
+            detail=f"draft={draft.draft_id[:12]} recipients={len(draft.to_addrs)}",
+        )
+        return self._tool_result(
+            True,
+            draft=self._draft_tool_payload(draft, code, expires_at),
+            requires_new_user_confirmation=True,
+            message="草稿已保存但尚未发送。必须等待用户在下一条消息中原样输入确认指令。",
+        )
+
+    @_email_llm_tool(
+        "email_assistant_create_reply_draft",
+        "tool_create_reply_draft_description",
+    )
+    async def tool_create_reply_draft(
+        self,
+        event: AstrMessageEvent,
+        uid: int,
+        body: str,
+        account: str = "",
+        folder: str = "",
+    ) -> str:
+        selected, error = self._resolve_send_tool_account(
+            event, account, require_query=True
+        )
+        if selected is None:
+            return self._tool_result(False, error=error)
+        try:
+            normalized_uid = int(uid)
+        except (TypeError, ValueError):
+            normalized_uid = 0
+        if normalized_uid <= 0:
+            return self._tool_result(False, error="uid 必须是正整数。")
+        body_text = str(body or "").strip()
+        if len(body_text) > self._llm_draft_body_limit():
+            return self._tool_result(False, error="草稿正文超过插件配置的最大字符数。")
+        owner_umo = str(getattr(event, "unified_msg_origin", "") or "").strip()
+        owner_sender_id = self._sender_id(event)
+        target_folder = _one_line(folder, 180) or self._folder(selected)
+        try:
+            draft, code, expires_at = (
+                await self._draft_service.create_bot_reply_draft(
+                    selected,
+                    folder=target_folder,
+                    uid=normalized_uid,
+                    body=body_text,
+                    owner_umo=owner_umo,
+                    owner_sender_id=owner_sender_id,
+                )
+            )
+        except Exception as exc:
+            return self._tool_result(False, error=f"创建回复草稿失败：{_one_line(exc, 240)}")
+        self._log_mail_operation(
+            "llm_create_reply_draft",
+            selected,
+            uid=normalized_uid,
+            detail=f"draft={draft.draft_id[:12]}",
+        )
+        return self._tool_result(
+            True,
+            draft=self._draft_tool_payload(draft, code, expires_at),
+            requires_new_user_confirmation=True,
+            message="回复草稿已保存但尚未发送。必须等待用户在下一条消息中原样输入确认指令。",
+        )
+
+    @_email_llm_tool(
+        "email_assistant_confirm_send", "tool_confirm_send_description"
+    )
+    async def tool_confirm_send(
+        self,
+        event: AstrMessageEvent,
+        draft_id: str,
+        confirmation_code: str,
+    ) -> str:
+        guard_error = self._guard_write_tool(event)
+        if guard_error:
+            return self._tool_result(False, error=guard_error)
+        normalized_code = normalize_confirmation_code(confirmation_code)
+        if not confirmation_present_in_user_message(
+            await self._event_message_text(event), normalized_code
+        ):
+            return self._tool_result(
+                False,
+                error="当前真实用户消息没有严格匹配“确认发送 <确认码>”，禁止发送。",
+            )
+        owner_umo = str(getattr(event, "unified_msg_origin", "") or "").strip()
+        owner_sender_id = self._sender_id(event)
+
+        def resolve_owned_account(account_id: str) -> dict[str, Any]:
+            account, error = self._resolve_send_tool_account(event, account_id)
+            if account is None:
+                raise PermissionError(error)
+            return account
+
+        try:
+            sent = await self._draft_service.send_confirmed_draft(
+                _one_line(draft_id, 64),
+                normalized_code,
+                owner_umo,
+                owner_sender_id,
+                resolve_owned_account,
+            )
+        except Exception as exc:
+            logger.warning(
+                "[EmailAssistant] LLM 草稿确认发送失败 draft=%s error=%s",
+                _one_line(draft_id, 12),
+                _one_line(exc, 220),
+            )
+            return self._tool_result(False, error=f"发送失败：{_one_line(exc, 260)}")
+        return self._tool_result(
+            True,
+            draft=self._draft_tool_payload(sent),
+            message="邮件已发送。",
+        )
+
+    @_email_llm_tool(
+        "email_assistant_cancel_draft", "tool_cancel_draft_description"
+    )
+    async def tool_cancel_draft(
+        self, event: AstrMessageEvent, draft_id: str
+    ) -> str:
+        guard_error = self._guard_write_tool(event)
+        if guard_error:
+            return self._tool_result(False, error=guard_error)
+        owner_umo = str(getattr(event, "unified_msg_origin", "") or "").strip()
+        owner_sender_id = self._sender_id(event)
+        try:
+            cancelled = await self._draft_service.cancel_owned_draft(
+                _one_line(draft_id, 64), owner_umo, owner_sender_id
+            )
+        except Exception as exc:
+            return self._tool_result(False, error=f"取消草稿失败：{_one_line(exc, 240)}")
+        self._log_mail_operation(
+            "llm_cancel_draft",
+            {"account_id": cancelled.account_id},
+            detail=f"draft={cancelled.draft_id[:12]}",
+        )
+        return self._tool_result(
+            True,
+            draft=self._draft_tool_payload(cancelled),
+            message="草稿已取消，不会发送。",
         )
 
     @filter.command_group("email", alias={"邮箱"})

@@ -10,6 +10,7 @@
 - 通过 AstrBot Plugin Pages 邮件中心浏览邮件、同步索引并审核和发送本地草稿；
 - 在邮件中心浏览 IMAP 文件夹，并按账户权限创建文件夹、复制或移动邮件；
 - 在邮件详情中使用不带人格的 LLM 总结或翻译，按正文内容和目标语言缓存结果；
+- 可选启用 LLM 安全写信工具，通过本地草稿、下一轮一次性确认和原子发送状态防止误发或重复发送；
 - 每个邮箱独立开关接收、查询和发送权限；
 - 每个邮箱可独立设置 HTTP CONNECT、SOCKS4 或 SOCKS5 网络代理。
 
@@ -145,7 +146,7 @@ account_id: 账户 ID | uid: 邮件 UID
 
 “最新一封邮件说了什么”应优先使用 `email_assistant_get_latest_message`，在一次工具调用内完成定位和正文读取；“最近有哪些邮件”仍使用不读取正文的 `email_assistant_list_messages`。这些提示能显著减少模型产生中间过程消息，但最终遵循程度仍取决于所用模型；插件不会修改 AstrBot 全局 Agent Runner 的消息发送行为。
 
-若当前 AstrBot 人格配置了显式工具白名单，需要在该人格中允许上述四个工具；未限制人格工具时会按 AstrBot 默认规则自动提供。
+若当前 AstrBot 人格配置了显式工具白名单，需要在该人格中允许上述四个只读工具；启用 LLM 写信后还需允许后文列出的四个草稿工具。未限制人格工具时会按 AstrBot 默认规则自动提供。
 
 ## 本地邮件头索引与 `plugin_data`
 
@@ -199,9 +200,20 @@ data/plugin_data/astrbot_plugin_email_assistant/mail_headers.db
 
 ### Bot 草稿数据层
 
-SQLite 中包含独立的 `mail_drafts` 表，不把草稿混入邮件头或正文缓存。草稿支持多个 To/CC/BCC 地址、纯文本/HTML 编辑内容、回复来源、`user`/`bot` 来源、`editing`/`pending_review`/`approved`/`sent`/`failed` 状态以及乐观版本号。版本号可防止未来 WebUI 与 Bot 同时编辑时互相覆盖。
+SQLite 中包含独立的 `mail_drafts` 表，不把草稿混入邮件头或正文缓存。草稿支持多个 To/CC/BCC 地址、纯文本/HTML 编辑内容、回复来源、`user`/`bot` 来源、聊天用户归属、`editing`/`pending_review`/`approved`/`sending`/`sent`/`failed`/`cancelled` 状态以及乐观版本号。版本号可防止 WebUI 与 Bot 同时编辑时互相覆盖。
 
-当前不注册 LLM 写信工具，也不会让 Bot 自动发送草稿。邮件中心允许管理员编辑草稿；只有先人工审核为 `approved`，再通过页面内二次确认和服务端乐观版本校验后才会调用 SMTP。草稿仍只保存在本地，不同步到邮箱服务商的 Drafts 文件夹。
+插件可以注册 LLM 写信工具，但默认由 `llm_mail_write_enabled=false` 关闭。开启后提供以下安全草稿流程：
+
+- `email_assistant_create_draft`：创建单一收件人的纯文本新邮件草稿；
+- `email_assistant_create_reply_draft`：实时读取原邮件后创建带线程信息的回复草稿；
+- `email_assistant_confirm_send`：验证下一条真实私聊消息中的一次性确认码后发送；
+- `email_assistant_cancel_draft`：取消当前私聊用户拥有且尚未发送的 Bot 草稿。
+
+创建工具只写入本地 `pending_review` 草稿，不连接 SMTP。Bot 会显示账户、收件人、主题、正文和类似 `确认发送 ABCD-2345` 的指令；用户必须在**下一条独立私聊消息**中原样输入该指令。服务端会直接检查当前用户消息，而不只相信 LLM 提交的工具参数，所以模型不能在创建草稿的同一轮自行确认。确认码默认十分钟有效、只能使用一次，并与草稿版本和创建用户绑定；草稿被编辑、取消或发送后旧确认码失效。
+
+确认发送时会再次检查用户归属、账户 `send_enabled`、草稿版本及回复邮件的云端状态，并以原子方式把草稿切换为 `sending`，防止 WebUI 和 LLM 并发重复发送。SMTP 一旦开始尝试就不会自动重试，因为连接中断时无法绝对判断服务器是否已经接收邮件；这种情况会提示先检查“已发送”文件夹。
+
+邮件中心仍允许管理员编辑草稿；只有先人工审核为 `approved`，再通过页面内二次确认和同一个共享发送服务后才会调用 SMTP。WebUI 编辑 Bot 草稿会使原确认码失效。草稿只保存在本地，不同步到邮箱服务商的 Drafts 文件夹。
 
 ### 邮件中心 Plugin Page
 

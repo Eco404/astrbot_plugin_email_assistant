@@ -69,8 +69,10 @@ button { cursor: pointer; }
 .status-chip.error { color: #a12e3b; background: #fdebed; }
 .status-chip.neutral { color: var(--muted); background: var(--panel-soft); border: 1px solid var(--line); }
 .status-chip.approved { color: #21744c; background: #e5f7ee; }
+.status-chip.sending { color: var(--warning); background: color-mix(in srgb, var(--warning) 12%, var(--panel)); }
 .status-chip.failed { color: #a12e3b; background: #fdebed; }
 .status-chip.sent { color: #315ea8; background: #e8efff; }
+.status-chip.cancelled { color: var(--muted); background: var(--panel-soft); border: 1px solid var(--line); }
 
 .button { min-height: 38px; border: 1px solid transparent; border-radius: 9px; padding: 8px 14px; color: var(--text); background: var(--panel); }
 .button:disabled { cursor: not-allowed; opacity: .45; }

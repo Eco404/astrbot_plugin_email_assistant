@@ -9,6 +9,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from astrbot_plugin_email_assistant.mail_index import MailHeaderIndex
 from astrbot_plugin_email_assistant.mail_parser import ParsedMail
+from astrbot_plugin_email_assistant.draft_service import confirmation_token_hash
 
 
 def mail(uid: int, timestamp: float, subject: str = "主题") -> ParsedMail:
@@ -261,6 +262,164 @@ class MailHeaderIndexTests(unittest.TestCase):
             self.index.delete_draft(draft.draft_id, expected_revision=2)
         )
         self.assertIsNone(self.index.get_draft(draft.draft_id))
+
+    def test_confirmation_claim_is_single_use_and_finishes_send(self):
+        draft = self.index.create_draft(
+            "one",
+            to_addrs=["reader@example.com"],
+            subject="主题",
+            body_text="正文",
+            source="bot",
+            owner_umo="p:FriendMessage:1",
+            owner_sender_id="1",
+            status="pending_review",
+        )
+        token_hash = confirmation_token_hash("ABCD-2345")
+        self.index.create_draft_confirmation(
+            draft.draft_id,
+            draft.revision,
+            token_hash,
+            draft.owner_umo,
+            draft.owner_sender_id,
+            200,
+        )
+        claimed = self.index.claim_confirmed_draft_send(
+            draft.draft_id,
+            token_hash,
+            draft.owner_umo,
+            draft.owner_sender_id,
+            now=100,
+        )
+        self.assertEqual(claimed.status, "sending")
+        sent = self.index.finish_draft_send(
+            claimed.draft_id, claimed.revision, success=True
+        )
+        self.assertEqual(sent.status, "sent")
+        with self.assertRaisesRegex(PermissionError, "已经使用"):
+            self.index.claim_confirmed_draft_send(
+                draft.draft_id,
+                token_hash,
+                draft.owner_umo,
+                draft.owner_sender_id,
+                now=101,
+            )
+
+    def test_confirmation_expires_and_draft_edit_invalidates_code(self):
+        draft = self.index.create_draft(
+            "one",
+            to_addrs=["reader@example.com"],
+            subject="主题",
+            body_text="正文",
+            source="bot",
+            owner_umo="p:FriendMessage:1",
+            owner_sender_id="1",
+            status="pending_review",
+        )
+        first_hash = confirmation_token_hash("AAAA-2345")
+        self.index.create_draft_confirmation(
+            draft.draft_id,
+            draft.revision,
+            first_hash,
+            draft.owner_umo,
+            draft.owner_sender_id,
+            50,
+        )
+        with self.assertRaisesRegex(PermissionError, "已经过期"):
+            self.index.claim_confirmed_draft_send(
+                draft.draft_id,
+                first_hash,
+                draft.owner_umo,
+                draft.owner_sender_id,
+                now=51,
+            )
+        second_hash = confirmation_token_hash("BBBB-2345")
+        self.index.create_draft_confirmation(
+            draft.draft_id,
+            draft.revision,
+            second_hash,
+            draft.owner_umo,
+            draft.owner_sender_id,
+            100,
+        )
+        changed = self.index.update_draft(
+            draft.draft_id, draft.revision, subject="修改后的主题"
+        )
+        with self.assertRaisesRegex(RuntimeError, "旧确认码"):
+            self.index.claim_confirmed_draft_send(
+                changed.draft_id,
+                second_hash,
+                changed.owner_umo,
+                changed.owner_sender_id,
+                now=60,
+            )
+
+    def test_cancel_owned_draft_checks_owner_and_preserves_audit_record(self):
+        draft = self.index.create_draft(
+            "one",
+            source="bot",
+            owner_umo="p:FriendMessage:1",
+            owner_sender_id="1",
+            status="pending_review",
+        )
+        with self.assertRaisesRegex(PermissionError, "其他用户"):
+            self.index.cancel_owned_draft(
+                draft.draft_id, "p:FriendMessage:2", "2"
+            )
+        cancelled = self.index.cancel_owned_draft(
+            draft.draft_id, draft.owner_umo, draft.owner_sender_id
+        )
+        self.assertEqual(cancelled.status, "cancelled")
+        self.assertIsNotNone(self.index.get_draft(draft.draft_id))
+
+    def test_interrupted_sending_draft_is_failed_without_retry(self):
+        draft = self.index.create_draft(
+            "one", source="user", status="approved"
+        )
+        sending = self.index.claim_approved_draft_send(
+            draft.draft_id, draft.revision
+        )
+        self.assertEqual(sending.status, "sending")
+        self.assertEqual(self.index.recover_interrupted_draft_sends(), 1)
+        recovered = self.index.get_draft(draft.draft_id)
+        self.assertEqual(recovered.status, "failed")
+        self.assertIn("不会自动重试", recovered.last_error)
+        self.assertEqual(self.index.recover_interrupted_draft_sends(), 0)
+
+    def test_initialize_migrates_legacy_draft_schema_without_data_loss(self):
+        path = Path(self.temp_dir.name) / "legacy-drafts.db"
+        connection = sqlite3.connect(path)
+        try:
+            with connection:
+                connection.executescript(
+                    """
+                    CREATE TABLE mail_drafts (
+                        draft_id TEXT PRIMARY KEY, account_id TEXT NOT NULL,
+                        to_json TEXT NOT NULL DEFAULT '[]', cc_json TEXT NOT NULL DEFAULT '[]',
+                        bcc_json TEXT NOT NULL DEFAULT '[]', subject TEXT NOT NULL DEFAULT '',
+                        body_text TEXT NOT NULL DEFAULT '', body_html TEXT NOT NULL DEFAULT '',
+                        reply_folder TEXT NOT NULL DEFAULT '', reply_uid INTEGER,
+                        reply_message_id TEXT NOT NULL DEFAULT '', source TEXT NOT NULL DEFAULT 'user',
+                        status TEXT NOT NULL DEFAULT 'editing', revision INTEGER NOT NULL DEFAULT 1,
+                        created_at REAL NOT NULL, updated_at REAL NOT NULL, sent_at REAL,
+                        last_error TEXT NOT NULL DEFAULT ''
+                    );
+                    INSERT INTO mail_drafts (
+                        draft_id, account_id, to_json, subject, body_text, source,
+                        status, revision, created_at, updated_at
+                    ) VALUES ('legacy', 'one', '["reader@example.com"]', '旧主题',
+                              '旧正文', 'bot', 'pending_review', 3, 1, 2);
+                    """
+                )
+        finally:
+            connection.close()
+        migrated = MailHeaderIndex(path)
+        migrated.initialize()
+        draft = migrated.get_draft("legacy")
+        self.assertEqual(draft.subject, "旧主题")
+        self.assertEqual(draft.body_text, "旧正文")
+        self.assertEqual(draft.owner_umo, "")
+        self.assertEqual(draft.owner_sender_id, "")
+        self.assertEqual(draft.revision, 3)
 
     def test_header_page_uses_keyset_cursor_and_searches_sender_or_subject(self):
         timestamp = datetime(2026, 7, 1).timestamp()

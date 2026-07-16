@@ -105,6 +105,8 @@ class MailDraft:
     reply_uid: int | None
     reply_message_id: str
     source: str
+    owner_umo: str
+    owner_sender_id: str
     status: str
     revision: int
     created_at: float
@@ -270,9 +272,12 @@ class MailHeaderIndex:
                     reply_message_id TEXT NOT NULL DEFAULT '',
                     source TEXT NOT NULL DEFAULT 'user'
                         CHECK (source IN ('user', 'bot')),
+                    owner_umo TEXT NOT NULL DEFAULT '',
+                    owner_sender_id TEXT NOT NULL DEFAULT '',
                     status TEXT NOT NULL DEFAULT 'editing'
                         CHECK (status IN (
-                            'editing', 'pending_review', 'approved', 'sent', 'failed'
+                            'editing', 'pending_review', 'approved', 'sending',
+                            'sent', 'failed', 'cancelled'
                         )),
                     revision INTEGER NOT NULL DEFAULT 1,
                     created_at REAL NOT NULL,
@@ -283,6 +288,27 @@ class MailHeaderIndex:
 
                 CREATE INDEX IF NOT EXISTS idx_mail_drafts_list
                 ON mail_drafts (account_id, status, updated_at DESC);
+                """
+            )
+            self._migrate_mail_drafts(connection)
+            connection.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS mail_send_confirmations (
+                    confirmation_id TEXT PRIMARY KEY,
+                    token_hash TEXT NOT NULL UNIQUE,
+                    draft_id TEXT NOT NULL,
+                    draft_revision INTEGER NOT NULL,
+                    owner_umo TEXT NOT NULL,
+                    owner_sender_id TEXT NOT NULL,
+                    expires_at REAL NOT NULL,
+                    consumed_at REAL,
+                    created_at REAL NOT NULL,
+                    FOREIGN KEY (draft_id) REFERENCES mail_drafts (draft_id)
+                        ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_mail_send_confirmations_draft
+                ON mail_send_confirmations (draft_id, consumed_at, expires_at);
                 """
             )
             mailbox_columns = {
@@ -319,6 +345,88 @@ class MailHeaderIndex:
             os.chmod(self.path, 0o600)
         except OSError:
             pass
+
+    @staticmethod
+    def _migrate_mail_drafts(connection: sqlite3.Connection) -> None:
+        """Rebuild the draft table when upgrading the constrained status schema."""
+        row = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'mail_drafts'"
+        ).fetchone()
+        table_sql = str(row["sql"] or "") if row is not None else ""
+        columns = {
+            str(item["name"])
+            for item in connection.execute("PRAGMA table_info(mail_drafts)")
+        }
+        if {
+            "owner_umo",
+            "owner_sender_id",
+        }.issubset(columns) and "'sending'" in table_sql and "'cancelled'" in table_sql:
+            return
+
+        connection.execute("DROP INDEX IF EXISTS idx_mail_drafts_list")
+        connection.execute("ALTER TABLE mail_drafts RENAME TO mail_drafts_legacy")
+        connection.execute(
+            """
+            CREATE TABLE mail_drafts (
+                draft_id TEXT PRIMARY KEY,
+                account_id TEXT NOT NULL,
+                to_json TEXT NOT NULL DEFAULT '[]',
+                cc_json TEXT NOT NULL DEFAULT '[]',
+                bcc_json TEXT NOT NULL DEFAULT '[]',
+                subject TEXT NOT NULL DEFAULT '',
+                body_text TEXT NOT NULL DEFAULT '',
+                body_html TEXT NOT NULL DEFAULT '',
+                reply_folder TEXT NOT NULL DEFAULT '',
+                reply_uid INTEGER,
+                reply_message_id TEXT NOT NULL DEFAULT '',
+                source TEXT NOT NULL DEFAULT 'user'
+                    CHECK (source IN ('user', 'bot')),
+                owner_umo TEXT NOT NULL DEFAULT '',
+                owner_sender_id TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'editing'
+                    CHECK (status IN (
+                        'editing', 'pending_review', 'approved', 'sending',
+                        'sent', 'failed', 'cancelled'
+                    )),
+                revision INTEGER NOT NULL DEFAULT 1,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                sent_at REAL,
+                last_error TEXT NOT NULL DEFAULT ''
+            )
+            """
+        )
+        owner_umo = "owner_umo" if "owner_umo" in columns else "''"
+        owner_sender_id = (
+            "owner_sender_id" if "owner_sender_id" in columns else "''"
+        )
+        connection.execute(
+            f"""
+            INSERT INTO mail_drafts (
+                draft_id, account_id, to_json, cc_json, bcc_json,
+                subject, body_text, body_html, reply_folder, reply_uid,
+                reply_message_id, source, owner_umo, owner_sender_id, status,
+                revision, created_at, updated_at, sent_at, last_error
+            )
+            SELECT
+                draft_id, account_id, to_json, cc_json, bcc_json,
+                subject, body_text, body_html, reply_folder, reply_uid,
+                reply_message_id, source, {owner_umo}, {owner_sender_id},
+                CASE
+                    WHEN status IN (
+                        'editing', 'pending_review', 'approved', 'sending',
+                        'sent', 'failed', 'cancelled'
+                    ) THEN status ELSE 'failed'
+                END,
+                revision, created_at, updated_at, sent_at, last_error
+            FROM mail_drafts_legacy
+            """
+        )
+        connection.execute("DROP TABLE mail_drafts_legacy")
+        connection.execute(
+            "CREATE INDEX idx_mail_drafts_list "
+            "ON mail_drafts (account_id, status, updated_at DESC)"
+        )
 
     @staticmethod
     def _row_to_folder(row: sqlite3.Row) -> IndexedMailFolder:
@@ -1111,6 +1219,8 @@ class MailHeaderIndex:
             reply_uid=(int(row["reply_uid"]) if row["reply_uid"] is not None else None),
             reply_message_id=str(row["reply_message_id"]),
             source=str(row["source"]),
+            owner_umo=str(row["owner_umo"]),
+            owner_sender_id=str(row["owner_sender_id"]),
             status=str(row["status"]),
             revision=int(row["revision"]),
             created_at=float(row["created_at"]),
@@ -1133,9 +1243,14 @@ class MailHeaderIndex:
         reply_uid: int | None = None,
         reply_message_id: str = "",
         source: str = "user",
+        owner_umo: str = "",
+        owner_sender_id: str = "",
         status: str = "editing",
     ) -> MailDraft:
-        allowed_statuses = {"editing", "pending_review", "approved", "sent", "failed"}
+        allowed_statuses = {
+            "editing", "pending_review", "approved", "sending",
+            "sent", "failed", "cancelled",
+        }
         if status not in allowed_statuses:
             raise ValueError("无效的草稿状态。")
         if source not in {"user", "bot"}:
@@ -1151,9 +1266,9 @@ class MailHeaderIndex:
                 INSERT INTO mail_drafts (
                     draft_id, account_id, to_json, cc_json, bcc_json,
                     subject, body_text, body_html, reply_folder, reply_uid,
-                    reply_message_id, source, status, revision,
-                    created_at, updated_at, sent_at, last_error
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, NULL, '')
+                    reply_message_id, source, owner_umo, owner_sender_id,
+                    status, revision, created_at, updated_at, sent_at, last_error
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, NULL, '')
                 """,
                 (
                     draft_id,
@@ -1168,6 +1283,8 @@ class MailHeaderIndex:
                     int(reply_uid) if reply_uid is not None else None,
                     str(reply_message_id or ""),
                     source,
+                    str(owner_umo or ""),
+                    str(owner_sender_id or ""),
                     status,
                     now,
                     now,
@@ -1225,6 +1342,8 @@ class MailHeaderIndex:
             "reply_folder",
             "reply_uid",
             "reply_message_id",
+            "owner_umo",
+            "owner_sender_id",
             "status",
             "last_error",
         }
@@ -1236,8 +1355,10 @@ class MailHeaderIndex:
             "editing",
             "pending_review",
             "approved",
+            "sending",
             "sent",
             "failed",
+            "cancelled",
         }:
             raise ValueError("无效的草稿状态。")
         column_map = {
@@ -1286,6 +1407,235 @@ class MailHeaderIndex:
         if updated is None:
             raise KeyError("草稿不存在。")
         return updated
+
+    def create_draft_confirmation(
+        self,
+        draft_id: str,
+        draft_revision: int,
+        token_hash: str,
+        owner_umo: str,
+        owner_sender_id: str,
+        expires_at: float,
+    ) -> None:
+        now = time.time()
+        with self._connection() as connection:
+            draft = connection.execute(
+                "SELECT revision, status, owner_umo, owner_sender_id "
+                "FROM mail_drafts WHERE draft_id = ?",
+                (str(draft_id),),
+            ).fetchone()
+            if draft is None:
+                raise KeyError("草稿不存在。")
+            if int(draft["revision"]) != int(draft_revision):
+                raise RuntimeError("草稿已被其他操作修改，请刷新后重试。")
+            if str(draft["status"]) != "pending_review":
+                raise PermissionError("只有待确认的 Bot 草稿可以生成确认码。")
+            if (
+                str(draft["owner_umo"]) != str(owner_umo)
+                or str(draft["owner_sender_id"]) != str(owner_sender_id)
+            ):
+                raise PermissionError("不能为其他用户的草稿生成确认码。")
+            connection.execute(
+                "DELETE FROM mail_send_confirmations "
+                "WHERE draft_id = ? AND consumed_at IS NULL",
+                (str(draft_id),),
+            )
+            connection.execute(
+                """
+                INSERT INTO mail_send_confirmations (
+                    confirmation_id, token_hash, draft_id, draft_revision,
+                    owner_umo, owner_sender_id, expires_at, consumed_at, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?)
+                """,
+                (
+                    uuid.uuid4().hex,
+                    str(token_hash),
+                    str(draft_id),
+                    int(draft_revision),
+                    str(owner_umo),
+                    str(owner_sender_id),
+                    float(expires_at),
+                    now,
+                ),
+            )
+
+    def claim_confirmed_draft_send(
+        self,
+        draft_id: str,
+        token_hash: str,
+        owner_umo: str,
+        owner_sender_id: str,
+        now: float | None = None,
+    ) -> MailDraft:
+        claimed_at = float(now if now is not None else time.time())
+        with self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT drafts.*, confirmations.confirmation_id,
+                       confirmations.draft_revision AS confirmation_revision,
+                       confirmations.expires_at, confirmations.consumed_at
+                FROM mail_drafts AS drafts
+                JOIN mail_send_confirmations AS confirmations
+                  ON confirmations.draft_id = drafts.draft_id
+                WHERE drafts.draft_id = ? AND confirmations.token_hash = ?
+                """,
+                (str(draft_id), str(token_hash)),
+            ).fetchone()
+            if row is None:
+                raise PermissionError("确认码无效。")
+            if (
+                str(row["owner_umo"]) != str(owner_umo)
+                or str(row["owner_sender_id"]) != str(owner_sender_id)
+            ):
+                raise PermissionError("确认码不属于当前私聊用户。")
+            if row["consumed_at"] is not None:
+                raise PermissionError("确认码已经使用。")
+            if float(row["expires_at"]) < claimed_at:
+                raise PermissionError("确认码已经过期，请重新创建草稿。")
+            if int(row["confirmation_revision"]) != int(row["revision"]):
+                raise RuntimeError("草稿已被修改，旧确认码已经失效。")
+            if str(row["status"]) != "pending_review":
+                raise PermissionError("草稿当前状态不允许确认发送。")
+            cursor = connection.execute(
+                """
+                UPDATE mail_drafts
+                SET status = 'sending', revision = revision + 1, updated_at = ?
+                WHERE draft_id = ? AND revision = ? AND status = 'pending_review'
+                """,
+                (claimed_at, str(draft_id), int(row["revision"])),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError("草稿正被其他操作处理，请勿重复发送。")
+            connection.execute(
+                "UPDATE mail_send_confirmations SET consumed_at = ? "
+                "WHERE draft_id = ? AND consumed_at IS NULL",
+                (claimed_at, str(draft_id)),
+            )
+        claimed = self.get_draft(draft_id)
+        if claimed is None:
+            raise KeyError("草稿不存在。")
+        return claimed
+
+    def claim_approved_draft_send(
+        self, draft_id: str, expected_revision: int
+    ) -> MailDraft:
+        now = time.time()
+        with self._connection() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE mail_drafts
+                SET status = 'sending', revision = revision + 1, updated_at = ?
+                WHERE draft_id = ? AND revision = ? AND status = 'approved'
+                """,
+                (now, str(draft_id), int(expected_revision)),
+            )
+            if cursor.rowcount != 1:
+                row = connection.execute(
+                    "SELECT status, revision FROM mail_drafts WHERE draft_id = ?",
+                    (str(draft_id),),
+                ).fetchone()
+                if row is None:
+                    raise KeyError("草稿不存在。")
+                if int(row["revision"]) != int(expected_revision):
+                    raise RuntimeError("草稿已被其他操作修改，请刷新后重试。")
+                raise PermissionError("草稿必须先审核通过且未被其他操作发送。")
+        claimed = self.get_draft(draft_id)
+        if claimed is None:
+            raise KeyError("草稿不存在。")
+        return claimed
+
+    def finish_draft_send(
+        self,
+        draft_id: str,
+        expected_revision: int,
+        *,
+        success: bool,
+        error: str = "",
+    ) -> MailDraft:
+        now = time.time()
+        status = "sent" if success else "failed"
+        with self._connection() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE mail_drafts
+                SET status = ?, revision = revision + 1, updated_at = ?,
+                    sent_at = CASE WHEN ? = 'sent' THEN ? ELSE sent_at END,
+                    last_error = ?
+                WHERE draft_id = ? AND revision = ? AND status = 'sending'
+                """,
+                (
+                    status,
+                    now,
+                    status,
+                    now,
+                    "" if success else str(error or "")[:300],
+                    str(draft_id),
+                    int(expected_revision),
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError("草稿发送状态已改变，无法更新发送结果。")
+        finished = self.get_draft(draft_id)
+        if finished is None:
+            raise KeyError("草稿不存在。")
+        return finished
+
+    def recover_interrupted_draft_sends(self) -> int:
+        """Never retry a send that was in progress when the plugin stopped."""
+        now = time.time()
+        with self._connection() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE mail_drafts
+                SET status = 'failed', revision = revision + 1, updated_at = ?,
+                    last_error = ?
+                WHERE status = 'sending'
+                """,
+                (
+                    now,
+                    "插件在发送状态落库前中断，投递结果不确定；"
+                    "系统不会自动重试，请检查已发送文件夹。",
+                ),
+            )
+            return max(0, int(cursor.rowcount))
+
+    def cancel_owned_draft(
+        self,
+        draft_id: str,
+        owner_umo: str,
+        owner_sender_id: str,
+    ) -> MailDraft:
+        now = time.time()
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM mail_drafts WHERE draft_id = ?",
+                (str(draft_id),),
+            ).fetchone()
+            if row is None:
+                raise KeyError("草稿不存在。")
+            if (
+                str(row["owner_umo"]) != str(owner_umo)
+                or str(row["owner_sender_id"]) != str(owner_sender_id)
+            ):
+                raise PermissionError("不能取消其他用户的草稿。")
+            if str(row["status"]) in {"sending", "sent", "cancelled"}:
+                raise PermissionError("草稿当前状态不能取消。")
+            connection.execute(
+                """
+                UPDATE mail_drafts
+                SET status = 'cancelled', revision = revision + 1, updated_at = ?
+                WHERE draft_id = ? AND revision = ?
+                """,
+                (now, str(draft_id), int(row["revision"])),
+            )
+            connection.execute(
+                "DELETE FROM mail_send_confirmations WHERE draft_id = ?",
+                (str(draft_id),),
+            )
+        cancelled = self.get_draft(draft_id)
+        if cancelled is None:
+            raise KeyError("草稿不存在。")
+        return cancelled
 
     def delete_draft(self, draft_id: str, expected_revision: int | None = None) -> bool:
         params: list[object] = [str(draft_id)]

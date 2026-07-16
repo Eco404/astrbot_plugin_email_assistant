@@ -112,7 +112,7 @@ function formatDate(timestamp, fallback = "") {
 function draftStatusLabel(status) {
   return ({
     editing: "编辑中", pending_review: "待审核", approved: "已审核",
-    sent: "已发送", failed: "发送失败",
+    sending: "发送中", sent: "已发送", failed: "发送失败", cancelled: "已取消",
   })[status] || status || "未保存";
 }
 
@@ -647,14 +647,15 @@ function newDraft(prefill = {}) {
 
 function renderDraftStatus() {
   const status = state.draft?.status || "editing";
+  const immutable = ["sending", "sent", "cancelled"].includes(status);
   elements.draftStatus.textContent = state.draftDirty ? "有未保存修改" : draftStatusLabel(status);
   elements.draftStatus.className = `status-chip ${state.draftDirty ? "neutral" : status}`;
-  $("#approve-draft-button").disabled = !state.draft || state.draftDirty || status === "sent";
+  $("#approve-draft-button").disabled = !state.draft || state.draftDirty || immutable;
   elements.sendDraft.disabled = !state.draft || state.draftDirty || status !== "approved";
-  elements.deleteDraft.disabled = !state.draft;
-  elements.saveDraft.disabled = status === "sent";
+  elements.deleteDraft.disabled = !state.draft || status === "sending";
+  elements.saveDraft.disabled = immutable;
   for (const input of [elements.draftTo, elements.draftCc, elements.draftBcc, elements.draftSubject, elements.draftBody]) {
-    input.disabled = status === "sent";
+    input.disabled = immutable;
   }
 }
 
