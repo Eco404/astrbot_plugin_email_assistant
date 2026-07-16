@@ -15,6 +15,9 @@ REQUIRED_PROMPTS = {
     "tool_list_messages_description",
     "tool_get_latest_message_description",
     "tool_show_message_description",
+    "mail_content_system",
+    "mail_summary",
+    "mail_translate",
 }
 
 

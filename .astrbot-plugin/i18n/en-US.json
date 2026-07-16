@@ -1,0 +1,12 @@
+{
+  "metadata": {
+    "display_name": "Email Assistant",
+    "short_desc": "Multi-account IMAP and SMTP email assistant"
+  },
+  "pages": {
+    "mailbox": {
+      "title": "Mailbox",
+      "description": "Browse folders, organize messages, summarize or translate mail, and manage Bot drafts"
+    }
+  }
+}

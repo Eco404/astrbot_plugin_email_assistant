@@ -7,12 +7,17 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from astrbot_plugin_email_assistant.imap_client import (
+    ImapMailbox,
     MailboxChangedError,
+    decode_mailbox_name,
+    encode_mailbox_name,
     fetch_after_uid,
     fetch_detail_checked,
     fetch_latest,
     query_since,
+    parse_folder_list_item,
     sync_headers,
+    transfer_message,
 )
 from astrbot_plugin_email_assistant.mail_parser import ParsedMail
 
@@ -78,7 +83,85 @@ class FakeHistoryMailbox(FakeMailbox):
         return mail(uid)
 
 
+class FakeTransferConnection:
+    def __init__(self, capabilities):
+        self.capabilities = capabilities
+        self.calls = []
+
+    def uid(self, *args):
+        self.calls.append(args)
+        return "OK", [b""]
+
+
+class FakeTransferMailbox:
+    capabilities = (b"MOVE", b"UIDPLUS")
+    last_instance = None
+
+    def __init__(self, account, timeout, **kwargs):
+        self.conn = FakeTransferConnection(self.capabilities)
+        self.uidvalidity = 55
+        type(self).last_instance = self
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return None
+
+    def ensure_uidvalidity(self, expected):
+        if expected != self.uidvalidity:
+            raise MailboxChangedError(expected, self.uidvalidity)
+
+    def fetch_uid(self, uid, *, headers_only=False):
+        return mail(uid)
+
+
 class IMAPClientTests(unittest.TestCase):
+    def test_folder_list_uses_rfc_compatible_default_arguments(self):
+        class Connection:
+            def __init__(self):
+                self.calls = []
+
+            def list(self, *args):
+                self.calls.append(args)
+                return "OK", [b'(\\HasNoChildren) "/" "INBOX"']
+
+        mailbox = object.__new__(ImapMailbox)
+        mailbox.connection = Connection()
+        folders = mailbox.list_folders()
+        self.assertEqual(mailbox.connection.calls, [()])
+        self.assertEqual([item.name for item in folders], ["INBOX"])
+
+    def test_modified_utf7_folder_round_trip_and_list_parsing(self):
+        encoded = encode_mailbox_name("项目/归档 & 2026")
+        self.assertEqual(decode_mailbox_name(encoded), "项目/归档 & 2026")
+        list_item = (
+            f'(\\HasNoChildren \\Sent) "/" "{encode_mailbox_name("项目/Sent")}"'
+        ).encode("ascii")
+        parsed = parse_folder_list_item(list_item)
+        self.assertIsNotNone(parsed)
+        self.assertEqual(parsed.name, "项目/Sent")
+        self.assertEqual(parsed.special_use, "sent")
+        self.assertTrue(parsed.selectable)
+
+    def test_move_uses_uid_move_and_refuses_unsafe_fallback(self):
+        with patch(
+            "astrbot_plugin_email_assistant.imap_client.ImapMailbox",
+            FakeTransferMailbox,
+        ):
+            result = transfer_message({}, "INBOX", "Archive", 7, 55, move=True)
+        self.assertTrue(result.used_uid_move)
+        self.assertEqual(FakeTransferMailbox.last_instance.conn.calls[0][0], "MOVE")
+
+        class UnsafeMailbox(FakeTransferMailbox):
+            capabilities = ()
+
+        with patch(
+            "astrbot_plugin_email_assistant.imap_client.ImapMailbox", UnsafeMailbox
+        ):
+            with self.assertRaisesRegex(RuntimeError, "安全"):
+                transfer_message({}, "INBOX", "Archive", 7, 55, move=True)
+
     def test_incremental_fetch_keeps_parse_failure_as_item(self):
         with patch("astrbot_plugin_email_assistant.imap_client.ImapMailbox", FakeMailbox):
             items = fetch_after_uid({}, 1, limit=3)

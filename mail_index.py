@@ -14,6 +14,20 @@ from pathlib import Path
 from .mail_parser import ParsedMail
 
 
+def mail_content_hash(mail: ParsedMail) -> str:
+    normalized = "\n".join(
+        [
+            str(mail.subject or ""),
+            str(mail.from_name or ""),
+            str(mail.from_addr or ""),
+            str(mail.reply_to or ""),
+            str(mail.date or ""),
+            str(mail.body or ""),
+        ]
+    )
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
 @dataclass(slots=True)
 class MailboxState:
     account_id: str
@@ -51,6 +65,33 @@ class CachedMailBody:
 
 
 @dataclass(frozen=True, slots=True)
+class IndexedMailFolder:
+    account_id: str
+    name: str
+    display_name: str
+    delimiter: str
+    attributes: tuple[str, ...]
+    selectable: bool
+    special_use: str
+    remote_state: str
+    last_seen_at: float
+
+
+@dataclass(frozen=True, slots=True)
+class CachedMailAIResult:
+    account_id: str
+    folder: str
+    uidvalidity: int
+    uid: int
+    content_hash: str
+    task: str
+    target_language: str
+    result_text: str
+    provider_id: str
+    created_at: float
+
+
+@dataclass(frozen=True, slots=True)
 class MailDraft:
     draft_id: str
     account_id: str
@@ -70,6 +111,27 @@ class MailDraft:
     updated_at: float
     sent_at: float | None
     last_error: str
+
+
+@dataclass(frozen=True, slots=True)
+class IndexedMailHeader:
+    account_id: str
+    folder: str
+    uidvalidity: int
+    uid: int
+    subject: str
+    from_name: str
+    from_addr: str
+    reply_to: str
+    date_text: str
+    date_ts: float
+    has_attachments: bool
+    message_id: str
+    references: str
+    remote_state: str
+    body_cached: bool
+    body_truncated: bool
+    body_fetched_at: float
 
 
 class MailHeaderIndex:
@@ -154,6 +216,46 @@ class MailHeaderIndex:
                 CREATE INDEX IF NOT EXISTS idx_mail_bodies_eviction
                 ON mail_bodies (last_accessed_at, fetched_at);
 
+                CREATE TABLE IF NOT EXISTS mail_folders (
+                    account_id TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    display_name TEXT NOT NULL DEFAULT '',
+                    delimiter TEXT NOT NULL DEFAULT '',
+                    attributes_json TEXT NOT NULL DEFAULT '[]',
+                    selectable INTEGER NOT NULL DEFAULT 1,
+                    special_use TEXT NOT NULL DEFAULT '',
+                    remote_state TEXT NOT NULL DEFAULT 'active',
+                    last_seen_at REAL NOT NULL DEFAULT 0,
+                    PRIMARY KEY (account_id, name)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_mail_folders_list
+                ON mail_folders (account_id, remote_state, special_use, name);
+
+                CREATE TABLE IF NOT EXISTS mail_ai_cache (
+                    account_id TEXT NOT NULL,
+                    folder TEXT NOT NULL,
+                    uidvalidity INTEGER NOT NULL,
+                    uid INTEGER NOT NULL,
+                    content_hash TEXT NOT NULL,
+                    task TEXT NOT NULL,
+                    target_language TEXT NOT NULL DEFAULT '',
+                    result_text TEXT NOT NULL,
+                    provider_id TEXT NOT NULL DEFAULT '',
+                    created_at REAL NOT NULL,
+                    last_accessed_at REAL NOT NULL,
+                    PRIMARY KEY (
+                        account_id, folder, uidvalidity, uid,
+                        content_hash, task, target_language
+                    ),
+                    FOREIGN KEY (account_id, folder, uidvalidity, uid)
+                        REFERENCES mail_headers (account_id, folder, uidvalidity, uid)
+                        ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_mail_ai_cache_access
+                ON mail_ai_cache (last_accessed_at);
+
                 CREATE TABLE IF NOT EXISTS mail_drafts (
                     draft_id TEXT PRIMARY KEY,
                     account_id TEXT NOT NULL,
@@ -217,6 +319,86 @@ class MailHeaderIndex:
             os.chmod(self.path, 0o600)
         except OSError:
             pass
+
+    @staticmethod
+    def _row_to_folder(row: sqlite3.Row) -> IndexedMailFolder:
+        try:
+            attributes = json.loads(str(row["attributes_json"] or "[]"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            attributes = []
+        return IndexedMailFolder(
+            account_id=str(row["account_id"]),
+            name=str(row["name"]),
+            display_name=str(row["display_name"]),
+            delimiter=str(row["delimiter"]),
+            attributes=tuple(str(item) for item in attributes),
+            selectable=bool(row["selectable"]),
+            special_use=str(row["special_use"]),
+            remote_state=str(row["remote_state"]),
+            last_seen_at=float(row["last_seen_at"]),
+        )
+
+    def replace_folders(self, account_id: str, folders) -> int:
+        now = time.time()
+        rows = []
+        for folder in folders:
+            getter = folder.get if isinstance(folder, dict) else lambda key, default=None: getattr(folder, key, default)
+            name = str(getter("name", "") or "").strip()
+            if not name:
+                continue
+            rows.append(
+                (
+                    account_id,
+                    name,
+                    str(getter("display_name", name) or name),
+                    str(getter("delimiter", "") or ""),
+                    json.dumps(list(getter("attributes", ()) or ()), ensure_ascii=False),
+                    1 if getter("selectable", True) else 0,
+                    str(getter("special_use", "") or ""),
+                    "active",
+                    now,
+                )
+            )
+        with self._connection() as connection:
+            connection.execute(
+                "UPDATE mail_folders SET remote_state = 'remote_missing' WHERE account_id = ?",
+                (account_id,),
+            )
+            if rows:
+                connection.executemany(
+                    """
+                    INSERT INTO mail_folders (
+                        account_id, name, display_name, delimiter, attributes_json,
+                        selectable, special_use, remote_state, last_seen_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(account_id, name) DO UPDATE SET
+                        display_name = excluded.display_name,
+                        delimiter = excluded.delimiter,
+                        attributes_json = excluded.attributes_json,
+                        selectable = excluded.selectable,
+                        special_use = excluded.special_use,
+                        remote_state = 'active',
+                        last_seen_at = excluded.last_seen_at
+                    """,
+                    rows,
+                )
+        return len(rows)
+
+    def list_folders(
+        self, account_id: str, *, active_only: bool = True
+    ) -> list[IndexedMailFolder]:
+        where = " AND remote_state = 'active'" if active_only else ""
+        with self._connection() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT * FROM mail_folders
+                WHERE account_id = ?{where}
+                ORDER BY CASE special_use WHEN 'inbox' THEN 0 ELSE 1 END,
+                         name COLLATE NOCASE
+                """,
+                (account_id,),
+            ).fetchall()
+        return [self._row_to_folder(row) for row in rows]
 
     def get_state(self, account_id: str, folder: str) -> MailboxState | None:
         with self._connection() as connection:
@@ -305,6 +487,13 @@ class MailHeaderIndex:
                     """,
                     (account_id, folder, int(uidvalidity)),
                 )
+                connection.execute(
+                    """
+                    DELETE FROM mail_ai_cache
+                    WHERE account_id = ? AND folder = ? AND uidvalidity != ?
+                    """,
+                    (account_id, folder, int(uidvalidity)),
+                )
 
             previous_synced = 0
             previous_history_before = 0
@@ -374,6 +563,7 @@ class MailHeaderIndex:
                     self._header_values(account_id, folder, uidvalidity, mail, now)
                     for mail in headers
                 ]
+                changed_header_uids: list[int] = []
                 for values in header_values:
                     existing = connection.execute(
                         """
@@ -389,6 +579,8 @@ class MailHeaderIndex:
                     expected = values[4:14]
                     if existing is None or tuple(existing) != expected:
                         header_changes += 1
+                        if existing is not None:
+                            changed_header_uids.append(int(values[3]))
                 connection.executemany(
                     """
                     INSERT INTO mail_headers (
@@ -412,6 +604,21 @@ class MailHeaderIndex:
                     """,
                     header_values,
                 )
+                if changed_header_uids:
+                    placeholders = ",".join("?" for _ in changed_header_uids)
+                    connection.execute(
+                        f"""
+                        DELETE FROM mail_ai_cache
+                        WHERE account_id = ? AND folder = ? AND uidvalidity = ?
+                          AND uid IN ({placeholders})
+                        """,
+                        (
+                            account_id,
+                            folder,
+                            int(uidvalidity),
+                            *changed_header_uids,
+                        ),
+                    )
 
             if remote_uids is not None:
                 rows = connection.execute(
@@ -585,6 +792,38 @@ class MailHeaderIndex:
             fetched_at=float(row["fetched_at"]),
         )
 
+    def get_header(
+        self,
+        account_id: str,
+        folder: str,
+        uid: int,
+        *,
+        active_only: bool = True,
+    ) -> IndexedMailHeader | None:
+        state = self.get_state(account_id, folder)
+        if state is None:
+            return None
+        active_clause = " AND headers.remote_state = 'active'" if active_only else ""
+        with self._connection() as connection:
+            row = connection.execute(
+                f"""
+                SELECT headers.*,
+                       CASE WHEN bodies.uid IS NULL THEN 0 ELSE 1 END AS body_cached,
+                       COALESCE(bodies.truncated, 0) AS body_truncated,
+                       COALESCE(bodies.fetched_at, 0) AS body_fetched_at
+                FROM mail_headers AS headers
+                LEFT JOIN mail_bodies AS bodies
+                  ON bodies.account_id = headers.account_id
+                 AND bodies.folder = headers.folder
+                 AND bodies.uidvalidity = headers.uidvalidity
+                 AND bodies.uid = headers.uid
+                WHERE headers.account_id = ? AND headers.folder = ?
+                  AND headers.uidvalidity = ? AND headers.uid = ?{active_clause}
+                """,
+                (account_id, folder, state.uidvalidity, int(uid)),
+            ).fetchone()
+        return self._row_to_indexed_header(row) if row is not None else None
+
     def delete_cached_body(
         self, account_id: str, folder: str, uidvalidity: int, uid: int
     ) -> None:
@@ -596,6 +835,162 @@ class MailHeaderIndex:
                 """,
                 (account_id, folder, int(uidvalidity), int(uid)),
             )
+
+    def get_ai_result(
+        self,
+        account_id: str,
+        folder: str,
+        uidvalidity: int,
+        uid: int,
+        content_hash: str,
+        task: str,
+        target_language: str,
+    ) -> CachedMailAIResult | None:
+        now = time.time()
+        key = (
+            account_id,
+            folder,
+            int(uidvalidity),
+            int(uid),
+            str(content_hash),
+            str(task),
+            str(target_language),
+        )
+        with self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM mail_ai_cache
+                WHERE account_id = ? AND folder = ? AND uidvalidity = ? AND uid = ?
+                  AND content_hash = ? AND task = ? AND target_language = ?
+                """,
+                key,
+            ).fetchone()
+            if row is not None:
+                connection.execute(
+                    """
+                    UPDATE mail_ai_cache SET last_accessed_at = ?
+                    WHERE account_id = ? AND folder = ? AND uidvalidity = ? AND uid = ?
+                      AND content_hash = ? AND task = ? AND target_language = ?
+                    """,
+                    (now, *key),
+                )
+        if row is None:
+            return None
+        return CachedMailAIResult(
+            account_id=str(row["account_id"]),
+            folder=str(row["folder"]),
+            uidvalidity=int(row["uidvalidity"]),
+            uid=int(row["uid"]),
+            content_hash=str(row["content_hash"]),
+            task=str(row["task"]),
+            target_language=str(row["target_language"]),
+            result_text=str(row["result_text"]),
+            provider_id=str(row["provider_id"]),
+            created_at=float(row["created_at"]),
+        )
+
+    def cache_ai_result(
+        self,
+        account_id: str,
+        folder: str,
+        uidvalidity: int,
+        uid: int,
+        content_hash: str,
+        task: str,
+        target_language: str,
+        result_text: str,
+        provider_id: str,
+    ) -> CachedMailAIResult:
+        now = time.time()
+        values = (
+            account_id,
+            folder,
+            int(uidvalidity),
+            int(uid),
+            str(content_hash),
+            str(task),
+            str(target_language),
+            str(result_text),
+            str(provider_id),
+            now,
+            now,
+        )
+        with self._connection() as connection:
+            connection.execute(
+                """
+                DELETE FROM mail_ai_cache
+                WHERE account_id = ? AND folder = ? AND uidvalidity = ? AND uid = ?
+                  AND task LIKE ? AND target_language = ?
+                  AND (task != ? OR content_hash != ?)
+                """,
+                (
+                    account_id,
+                    folder,
+                    int(uidvalidity),
+                    int(uid),
+                    str(task).split(":", 1)[0] + ":%",
+                    str(target_language),
+                    str(task),
+                    str(content_hash),
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO mail_ai_cache (
+                    account_id, folder, uidvalidity, uid, content_hash,
+                    task, target_language, result_text, provider_id,
+                    created_at, last_accessed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(
+                    account_id, folder, uidvalidity, uid,
+                    content_hash, task, target_language
+                ) DO UPDATE SET
+                    result_text = excluded.result_text,
+                    provider_id = excluded.provider_id,
+                    created_at = excluded.created_at,
+                    last_accessed_at = excluded.last_accessed_at
+                """,
+                values,
+            )
+        return CachedMailAIResult(*values[:-1])
+
+    def delete_ai_results(
+        self, account_id: str, folder: str, uidvalidity: int, uid: int
+    ) -> int:
+        with self._connection() as connection:
+            cursor = connection.execute(
+                """
+                DELETE FROM mail_ai_cache
+                WHERE account_id = ? AND folder = ? AND uidvalidity = ? AND uid = ?
+                """,
+                (account_id, folder, int(uidvalidity), int(uid)),
+            )
+            return max(0, int(cursor.rowcount))
+
+    def purge_stale_ai_results(
+        self,
+        account_id: str,
+        folder: str,
+        uidvalidity: int,
+        uid: int,
+        current_content_hash: str,
+    ) -> int:
+        with self._connection() as connection:
+            cursor = connection.execute(
+                """
+                DELETE FROM mail_ai_cache
+                WHERE account_id = ? AND folder = ? AND uidvalidity = ? AND uid = ?
+                  AND content_hash != ?
+                """,
+                (
+                    account_id,
+                    folder,
+                    int(uidvalidity),
+                    int(uid),
+                    str(current_content_hash),
+                ),
+            )
+            return max(0, int(cursor.rowcount))
 
     def clear_body_cache(self) -> int:
         with self._connection() as connection:
@@ -613,6 +1008,24 @@ class MailHeaderIndex:
                       AND headers.folder = mail_bodies.folder
                       AND headers.uidvalidity = mail_bodies.uidvalidity
                       AND headers.uid = mail_bodies.uid
+                      AND headers.remote_state != 'active'
+                )
+                """,
+                (account_id, folder),
+            )
+            return max(0, int(cursor.rowcount))
+
+    def purge_remote_missing_ai_results(self, account_id: str, folder: str) -> int:
+        with self._connection() as connection:
+            cursor = connection.execute(
+                """
+                DELETE FROM mail_ai_cache
+                WHERE account_id = ? AND folder = ? AND EXISTS (
+                    SELECT 1 FROM mail_headers AS headers
+                    WHERE headers.account_id = mail_ai_cache.account_id
+                      AND headers.folder = mail_ai_cache.folder
+                      AND headers.uidvalidity = mail_ai_cache.uidvalidity
+                      AND headers.uid = mail_ai_cache.uid
                       AND headers.remote_state != 'active'
                 )
                 """,
@@ -953,6 +1366,97 @@ class MailHeaderIndex:
                 params,
             ).fetchone()
         return self._row_to_mail(row) if row is not None else None
+
+    @staticmethod
+    def _row_to_indexed_header(row: sqlite3.Row) -> IndexedMailHeader:
+        return IndexedMailHeader(
+            account_id=str(row["account_id"]),
+            folder=str(row["folder"]),
+            uidvalidity=int(row["uidvalidity"]),
+            uid=int(row["uid"]),
+            subject=str(row["subject"]),
+            from_name=str(row["from_name"]),
+            from_addr=str(row["from_addr"]),
+            reply_to=str(row["reply_to"]),
+            date_text=str(row["date_text"]),
+            date_ts=float(row["date_ts"]),
+            has_attachments=bool(row["has_attachments"]),
+            message_id=str(row["message_id"]),
+            references=str(row["references_text"]),
+            remote_state=str(row["remote_state"]),
+            body_cached=bool(row["body_cached"]),
+            body_truncated=bool(row["body_truncated"]),
+            body_fetched_at=float(row["body_fetched_at"]),
+        )
+
+    def list_headers_page(
+        self,
+        account_id: str,
+        folder: str,
+        *,
+        limit: int = 50,
+        keyword: str = "",
+        since_ts: float | None = None,
+        before_date_ts: float | None = None,
+        before_uid: int | None = None,
+    ) -> tuple[list[IndexedMailHeader], bool]:
+        """Return one keyset-paginated page from the current mailbox generation."""
+        state = self.get_state(account_id, folder)
+        if state is None:
+            return [], False
+        page_limit = max(1, min(int(limit), 100))
+        clauses = [
+            "headers.account_id = ?",
+            "headers.folder = ?",
+            "headers.uidvalidity = ?",
+            "headers.remote_state = 'active'",
+        ]
+        params: list[object] = [account_id, folder, state.uidvalidity]
+        normalized_keyword = str(keyword or "").strip()
+        if normalized_keyword:
+            escaped = (
+                normalized_keyword.replace("\\", "\\\\")
+                .replace("%", "\\%")
+                .replace("_", "\\_")
+            )
+            pattern = f"%{escaped}%"
+            clauses.append(
+                "(headers.subject LIKE ? ESCAPE '\\' "
+                "OR headers.from_name LIKE ? ESCAPE '\\' "
+                "OR headers.from_addr LIKE ? ESCAPE '\\')"
+            )
+            params.extend([pattern, pattern, pattern])
+        if since_ts is not None:
+            clauses.append("headers.date_ts >= ?")
+            params.append(float(since_ts))
+        if before_date_ts is not None and before_uid is not None:
+            clauses.append(
+                "(headers.date_ts < ? OR "
+                "(headers.date_ts = ? AND headers.uid < ?))"
+            )
+            params.extend([float(before_date_ts), float(before_date_ts), int(before_uid)])
+        params.append(page_limit + 1)
+        with self._connection() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT headers.*,
+                       CASE WHEN bodies.uid IS NULL THEN 0 ELSE 1 END AS body_cached,
+                       COALESCE(bodies.truncated, 0) AS body_truncated,
+                       COALESCE(bodies.fetched_at, 0) AS body_fetched_at
+                FROM mail_headers AS headers
+                LEFT JOIN mail_bodies AS bodies
+                  ON bodies.account_id = headers.account_id
+                 AND bodies.folder = headers.folder
+                 AND bodies.uidvalidity = headers.uidvalidity
+                 AND bodies.uid = headers.uid
+                WHERE {' AND '.join(clauses)}
+                ORDER BY headers.date_ts DESC, headers.uid DESC
+                LIMIT ?
+                """,
+                params,
+            ).fetchall()
+        has_more = len(rows) > page_limit
+        return [self._row_to_indexed_header(row) for row in rows[:page_limit]], has_more
 
     def stats(self, account_id: str, folder: str) -> dict[str, int | float]:
         state = self.get_state(account_id, folder)

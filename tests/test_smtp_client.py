@@ -6,7 +6,11 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from astrbot_plugin_email_assistant.mail_parser import ParsedMail
-from astrbot_plugin_email_assistant.smtp_client import build_message, send_mail
+from astrbot_plugin_email_assistant.smtp_client import (
+    build_draft_message,
+    build_message,
+    send_mail,
+)
 
 
 ACCOUNT = {
@@ -67,6 +71,25 @@ class SMTPClientTests(unittest.TestCase):
     def test_rejects_header_injection(self):
         with self.assertRaises(ValueError):
             build_message(ACCOUNT, "user@example.com", "ok\nBcc: evil@example.com", "正文")
+
+    def test_builds_multi_recipient_draft_and_thread_headers(self):
+        original = ParsedMail(
+            3, "问题", "User", "user@example.com", "reply@example.com", "", 0,
+            "", False, "<child@example.com>", "<root@example.com>"
+        )
+        message = build_draft_message(
+            ACCOUNT,
+            ["one@example.com", "two@example.com"],
+            ["copy@example.com"],
+            ["hidden@example.com"],
+            "Re: 问题",
+            "正文",
+            original=original,
+        )
+        self.assertEqual(message["To"], "one@example.com, two@example.com")
+        self.assertEqual(message["Cc"], "copy@example.com")
+        self.assertEqual(message["Bcc"], "hidden@example.com")
+        self.assertEqual(message["In-Reply-To"], "<child@example.com>")
 
 
 if __name__ == "__main__":

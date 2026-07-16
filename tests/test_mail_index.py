@@ -60,6 +60,56 @@ class MailHeaderIndexTests(unittest.TestCase):
         )
         self.assertEqual(unchanged.header_changes, 0)
 
+    def test_folder_catalog_marks_removed_folder_missing(self):
+        self.index.replace_folders(
+            "one",
+            [
+                {"name": "INBOX", "display_name": "INBOX", "special_use": "inbox"},
+                {"name": "Archive", "display_name": "Archive", "special_use": ""},
+            ],
+        )
+        self.assertEqual([item.name for item in self.index.list_folders("one")], ["INBOX", "Archive"])
+        self.index.replace_folders(
+            "one",
+            [{"name": "INBOX", "display_name": "INBOX", "special_use": "inbox"}],
+        )
+        self.assertEqual([item.name for item in self.index.list_folders("one")], ["INBOX"])
+        all_items = self.index.list_folders("one", active_only=False)
+        self.assertEqual(
+            next(item.remote_state for item in all_items if item.name == "Archive"),
+            "remote_missing",
+        )
+
+    def test_ai_cache_isolated_by_content_and_language(self):
+        timestamp = datetime(2026, 7, 1).timestamp()
+        self.index.apply_sync("one", "INBOX", 10, 1, [mail(1, timestamp)])
+        self.index.cache_ai_result(
+            "one", "INBOX", 10, 1, "hash-a", "translate:v1", "简体中文", "译文", "provider"
+        )
+        hit = self.index.get_ai_result(
+            "one", "INBOX", 10, 1, "hash-a", "translate:v1", "简体中文"
+        )
+        self.assertEqual(hit.result_text, "译文")
+        self.assertIsNone(
+            self.index.get_ai_result(
+                "one", "INBOX", 10, 1, "hash-b", "translate:v1", "简体中文"
+            )
+        )
+        self.assertIsNone(
+            self.index.get_ai_result(
+                "one", "INBOX", 10, 1, "hash-a", "translate:v1", "English"
+            )
+        )
+
+        self.index.apply_sync(
+            "one", "INBOX", 10, 1, [mail(1, timestamp, "变更后的主题")]
+        )
+        self.assertIsNone(
+            self.index.get_ai_result(
+                "one", "INBOX", 10, 1, "hash-a", "translate:v1", "简体中文"
+            )
+        )
+
     def test_initialize_migrates_existing_index_history_cursor(self):
         path = Path(self.temp_dir.name) / "legacy.db"
         connection = sqlite3.connect(path)
@@ -211,6 +261,41 @@ class MailHeaderIndexTests(unittest.TestCase):
             self.index.delete_draft(draft.draft_id, expected_revision=2)
         )
         self.assertIsNone(self.index.get_draft(draft.draft_id))
+
+    def test_header_page_uses_keyset_cursor_and_searches_sender_or_subject(self):
+        timestamp = datetime(2026, 7, 1).timestamp()
+        self.index.apply_sync(
+            "one",
+            "INBOX",
+            10,
+            4,
+            [
+                mail(1, timestamp, "较早邮件"),
+                mail(2, timestamp + 60, "项目通知"),
+                mail(3, timestamp + 120, "项目进展"),
+                mail(4, timestamp + 180, "最新邮件"),
+            ],
+        )
+        self.index.cache_body("one", "INBOX", 10, 3, "缓存正文", 1024)
+        first, has_more = self.index.list_headers_page(
+            "one", "INBOX", limit=2
+        )
+        self.assertEqual([item.uid for item in first], [4, 3])
+        self.assertTrue(has_more)
+        self.assertTrue(first[1].body_cached)
+        second, has_more = self.index.list_headers_page(
+            "one",
+            "INBOX",
+            limit=2,
+            before_date_ts=first[-1].date_ts,
+            before_uid=first[-1].uid,
+        )
+        self.assertEqual([item.uid for item in second], [2, 1])
+        self.assertFalse(has_more)
+        searched, _ = self.index.list_headers_page(
+            "one", "INBOX", keyword="项目", limit=10
+        )
+        self.assertEqual([item.uid for item in searched], [3, 2])
 
 
 if __name__ == "__main__":

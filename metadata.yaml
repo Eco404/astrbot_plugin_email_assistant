@@ -1,7 +1,7 @@
 name: astrbot_plugin_email_assistant
 display_name: 邮件助手
-desc: 多账户 IMAP 收信通知、LLM 只读邮件查询以及 SMTP 发送和回复
-version: v1.8.0
+desc: 多账户 IMAP 收信通知、LLM 只读查询、SMTP 收发和邮件中心 WebUI
+version: v2.0.0
 author: econeco
 astrbot_version: ">=4.26.0"
 repo: ""

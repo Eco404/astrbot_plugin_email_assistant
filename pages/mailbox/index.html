@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="light dark" />
+    <title>邮件中心</title>
+    <link rel="stylesheet" href="./app.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar">
+        <div class="brand">
+          <span class="brand-mark">✉</span>
+          <div><strong>邮件中心</strong><small>Email Assistant</small></div>
+        </div>
+        <nav class="primary-nav" aria-label="邮件中心导航">
+          <button class="nav-button active" data-tab="mailbox">收件箱</button>
+          <button class="nav-button" data-tab="drafts">Bot 草稿箱</button>
+        </nav>
+        <div class="sidebar-label">邮箱账户</div>
+        <div id="account-list" class="account-list"></div>
+        <div class="sidebar-label folder-heading">
+          <span>文件夹</span><button id="new-folder-button" class="icon-button" title="新建文件夹">＋</button>
+        </div>
+        <div id="folder-list" class="account-list folder-list"></div>
+        <div class="sidebar-foot">
+          <span id="bridge-user">AstrBot WebUI</span>
+          <small>邮箱密钥不会发送到本页面</small>
+        </div>
+      </aside>
+
+      <main class="workspace">
+        <header class="topbar">
+          <div>
+            <h1 id="page-title">收件箱</h1>
+            <p id="page-subtitle">从本地索引快速浏览，打开正文时实时验证云端。</p>
+          </div>
+          <div class="top-actions">
+            <select id="mobile-account" class="mobile-account" aria-label="选择邮箱账户"></select>
+            <select id="mobile-folder" class="mobile-account" aria-label="选择邮件文件夹"></select>
+            <span id="runtime-state" class="status-chip">正在连接</span>
+            <button id="sync-button" class="button secondary">同步云端</button>
+          </div>
+        </header>
+
+        <section id="mailbox-view" class="view active">
+          <div class="mail-layout">
+            <section class="mail-list-panel">
+              <div class="toolbar">
+                <label class="search-field">
+                  <span>⌕</span>
+                  <input id="mail-search" type="search" placeholder="搜索主题或发件人" />
+                </label>
+                <input id="mail-since" class="date-input" type="date" title="开始日期" />
+                <button id="search-button" class="button secondary compact">查询</button>
+              </div>
+              <div id="sync-warning" class="notice warning hidden"></div>
+              <div id="message-list" class="message-list" aria-live="polite"></div>
+              <div class="list-footer">
+                <button id="load-more-button" class="button ghost hidden">加载更早邮件</button>
+              </div>
+            </section>
+
+            <article id="message-detail" class="detail-panel empty-state">
+              <div class="empty-icon">✉</div>
+              <h2>选择一封邮件</h2>
+              <p>正文会从 IMAP 云端重新读取并验证 UIDVALIDITY。</p>
+            </article>
+          </div>
+        </section>
+
+        <section id="drafts-view" class="view">
+          <div class="draft-layout">
+            <section class="draft-list-panel">
+              <div class="draft-list-head">
+                <div><strong>草稿</strong><small>发送前必须审核</small></div>
+                <button id="new-draft-button" class="button primary compact">新建</button>
+              </div>
+              <div id="draft-list" class="draft-list"></div>
+            </section>
+
+            <section class="composer">
+              <div class="composer-head">
+                <div>
+                  <h2 id="draft-heading">新草稿</h2>
+                  <span id="draft-status" class="status-chip neutral">未保存</span>
+                </div>
+                <div class="composer-actions">
+                  <button id="delete-draft-button" class="button danger ghost hidden">删除</button>
+                  <button id="save-draft-button" class="button secondary">保存</button>
+                  <button id="approve-draft-button" class="button secondary">审核通过</button>
+                  <button id="send-draft-button" class="button primary" disabled>发送</button>
+                </div>
+              </div>
+              <div class="composer-fields">
+                <label>发件账户<select id="draft-account"></select></label>
+                <label>收件人<input id="draft-to" type="text" placeholder="多个地址用逗号分隔" /></label>
+                <div class="field-row">
+                  <label>抄送<input id="draft-cc" type="text" placeholder="可选" /></label>
+                  <label>密送<input id="draft-bcc" type="text" placeholder="可选" /></label>
+                </div>
+                <label>主题<input id="draft-subject" type="text" maxlength="998" placeholder="邮件主题" /></label>
+                <label class="body-field">正文<textarea id="draft-body" placeholder="输入纯文本邮件正文"></textarea></label>
+              </div>
+              <div class="composer-note">当前版本只发送纯文本；页面不会渲染邮件 HTML，也不支持附件。</div>
+            </section>
+          </div>
+        </section>
+      </main>
+    </div>
+
+    <div id="modal" class="modal hidden" role="dialog" aria-modal="true">
+      <div class="modal-card">
+        <h2 id="modal-title">确认操作</h2>
+        <p id="modal-message"></p>
+        <div class="modal-actions">
+          <button id="modal-cancel" class="button secondary">取消</button>
+          <button id="modal-confirm" class="button primary">确认</button>
+        </div>
+      </div>
+    </div>
+    <div id="input-modal" class="modal hidden" role="dialog" aria-modal="true">
+      <div class="modal-card">
+        <h2>新建文件夹</h2>
+        <label class="modal-input-label">文件夹名称<input id="folder-name-input" maxlength="512" /></label>
+        <div class="modal-actions">
+          <button id="folder-modal-cancel" class="button secondary">取消</button>
+          <button id="folder-modal-confirm" class="button primary">创建</button>
+        </div>
+      </div>
+    </div>
+    <div id="toast" class="toast hidden" role="status"></div>
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>

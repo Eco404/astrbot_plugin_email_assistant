@@ -31,11 +31,12 @@ from .imap_client import (
     fetch_detail_checked,
     fetch_latest,
     get_max_uid,
+    list_folders as list_imap_folders,
     query_since,
     sync_headers,
     test_imap,
 )
-from .mail_index import MailHeaderIndex
+from .mail_index import MailHeaderIndex, mail_content_hash
 from .mail_parser import ParsedMail
 from .prompt_loader import get_prompt, render_prompt
 from .smtp_client import send_mail, send_reply, test_smtp
@@ -62,6 +63,18 @@ def _safe_int(value: Any, default: int, minimum: int = 1, maximum: int = 86400) 
     return max(minimum, min(maximum, parsed))
 
 
+def _optional_max_tokens(
+    value: Any, default: int, minimum: int, maximum: int
+) -> int | None:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = default
+    if parsed == 0:
+        return None
+    return max(minimum, min(maximum, parsed))
+
+
 def _one_line(value: Any, limit: int = 160) -> str:
     return re.sub(r"\s+", " ", str(value or "")).strip()[:limit]
 
@@ -69,8 +82,8 @@ def _one_line(value: Any, limit: int = 160) -> str:
 @register(
     PLUGIN_NAME,
     "econeco",
-    "支持多账户 IMAP 收信通知、LLM 只读查询以及 SMTP 发送和回复的邮件助手",
-    "1.8.0",
+    "支持多账户 IMAP 收信通知、LLM 只读查询、SMTP 收发和邮件中心 WebUI 的邮件助手",
+    "2.0.0",
 )
 class EmailAssistantPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig) -> None:
@@ -84,6 +97,7 @@ class EmailAssistantPlugin(Star):
         self._index_warnings: dict[str, str] = {}
         self.data_dir = None
         self._mail_index: MailHeaderIndex | None = None
+        self.page_api = None
 
     async def initialize(self) -> None:
         self._stop_event.clear()
@@ -110,6 +124,7 @@ class EmailAssistantPlugin(Star):
                     "[EmailAssistant] 本地邮件头索引初始化失败，将回退实时 IMAP 查询: %s",
                     _one_line(exc, 180),
                 )
+        self._register_page_api_if_available()
         self._poll_task = asyncio.create_task(self._poll_loop(), name="email_assistant_poll")
         logger.info("[EmailAssistant] 后台邮件轮询已启动。")
 
@@ -122,6 +137,22 @@ class EmailAssistantPlugin(Star):
             except asyncio.CancelledError:
                 pass
         logger.info("[EmailAssistant] 插件已停止。")
+
+    def _register_page_api_if_available(self) -> None:
+        if self.page_api is not None or not hasattr(self.context, "register_web_api"):
+            return
+        try:
+            from .page_api import EmailAssistantPageApi
+
+            self.page_api = EmailAssistantPageApi(self)
+            self.page_api.register_routes()
+            logger.info("[EmailAssistant] 邮件中心 Plugin Page API 已注册。")
+        except Exception as exc:
+            self.page_api = None
+            logger.warning(
+                "[EmailAssistant] 邮件中心 Plugin Page API 注册失败: %s",
+                _one_line(exc, 180),
+            )
 
     def _accounts(self) -> list[dict[str, Any]]:
         raw = self.config.get("mail_accounts", [])
@@ -187,6 +218,22 @@ class EmailAssistantPlugin(Star):
         )
         return hours * 3600
 
+    def _folder_catalog_refresh_seconds(self) -> int:
+        hours = _safe_int(
+            self.config.get("folder_list_refresh_interval_hours", 6),
+            6,
+            1,
+            720,
+        )
+        return hours * 3600
+
+    def _secondary_folders_per_poll(self) -> int:
+        try:
+            value = int(self.config.get("secondary_folders_per_poll", 1))
+        except (TypeError, ValueError):
+            value = 1
+        return max(0, min(10, value))
+
     def _body_cache_enabled(self) -> bool:
         return str(self.config.get("body_cache_mode") or "on_demand").lower() == "on_demand"
 
@@ -215,6 +262,7 @@ class EmailAssistantPlugin(Star):
         account: dict[str, Any],
         uidvalidity: int,
         mail: ParsedMail,
+        folder: str | None = None,
     ) -> None:
         index = self._mail_index
         if index is None or not self._body_cache_enabled():
@@ -222,7 +270,7 @@ class EmailAssistantPlugin(Star):
         await asyncio.to_thread(
             index.cache_body,
             self._account_key(account),
-            self._folder(account),
+            str(folder or self._folder(account)),
             int(uidvalidity),
             int(mail.uid),
             str(mail.body or ""),
@@ -282,12 +330,13 @@ class EmailAssistantPlugin(Star):
         *,
         force_reconcile: bool = False,
         backfill_since: datetime | None = None,
+        folder: str | None = None,
     ) -> Any | None:
         index = self._mail_index
         if index is None:
             return None
         account_id = self._account_key(account)
-        folder = self._folder(account)
+        folder = str(folder or self._folder(account))
         state = await asyncio.to_thread(index.get_state, account_id, folder)
         now = datetime.now().timestamp()
         reconcile = force_reconcile or bool(
@@ -297,8 +346,7 @@ class EmailAssistantPlugin(Star):
         initial_since = backfill_since or (
             datetime.now() - timedelta(days=self._initial_index_days())
         )
-        result = await asyncio.to_thread(
-            sync_headers,
+        sync_args = (
             account,
             state.uidvalidity if state else None,
             state.last_synced_uid if state else 0,
@@ -313,6 +361,10 @@ class EmailAssistantPlugin(Star):
             state.history_before_uid if state else 0,
             state.history_complete if state else False,
         )
+        if folder == self._folder(account):
+            result = await asyncio.to_thread(sync_headers, *sync_args)
+        else:
+            result = await asyncio.to_thread(sync_headers, *sync_args, folder=folder)
         apply_result = await asyncio.to_thread(
             index.apply_sync,
             account_id,
@@ -324,12 +376,13 @@ class EmailAssistantPlugin(Star):
             result.history_before_uid,
             result.history_complete,
         )
-        if (
-            apply_result.remote_state_changes
-            and self._purge_cached_body_on_remote_delete()
-        ):
+        if apply_result.remote_state_changes:
+            if self._purge_cached_body_on_remote_delete():
+                await asyncio.to_thread(
+                    index.purge_remote_missing_bodies, account_id, folder
+                )
             await asyncio.to_thread(
-                index.purge_remote_missing_bodies, account_id, folder
+                index.purge_remote_missing_ai_results, account_id, folder
             )
         if result.remote_uids is not None and self._body_cache_enabled():
             await asyncio.to_thread(
@@ -338,7 +391,7 @@ class EmailAssistantPlugin(Star):
                 self._body_cache_max_total_bytes(),
             )
         changed = apply_result.uidvalidity_changed
-        if changed or result.uidvalidity_changed:
+        if (changed or result.uidvalidity_changed) and folder == self._folder(account):
             baseline = max(0, int(result.uidnext) - 1)
             await self.put_kv_data(self._cursor_key(account), baseline)
             logger.warning(
@@ -378,12 +431,96 @@ class EmailAssistantPlugin(Star):
         *,
         force_reconcile: bool = False,
         backfill_since: datetime | None = None,
+        folder: str | None = None,
     ) -> Any | None:
         async with self._lock_for(account):
             return await self._sync_index_locked(
                 account,
                 force_reconcile=force_reconcile,
                 backfill_since=backfill_since,
+                folder=folder,
+            )
+
+    async def _refresh_folder_catalog(
+        self, account: dict[str, Any], *, force: bool = False
+    ):
+        index = self._mail_index
+        if index is None:
+            return []
+        account_id = self._account_key(account)
+        cached = await asyncio.to_thread(index.list_folders, account_id)
+        newest_seen = max((item.last_seen_at for item in cached), default=0.0)
+        if (
+            not force
+            and cached
+            and datetime.now().timestamp() - newest_seen
+            < self._folder_catalog_refresh_seconds()
+        ):
+            return cached
+        try:
+            folders = await asyncio.to_thread(
+                list_imap_folders, account, self._timeout()
+            )
+        except Exception as exc:
+            logger.warning(
+                "[EmailAssistant] IMAP 文件夹清单刷新失败 "
+                "account=%s host=%s port=%s security=%s proxy=%s "
+                "error_type=%s error=%s",
+                account_id,
+                _one_line(account.get("imap_host"), 160) or "(empty)",
+                account.get("imap_port", ""),
+                _one_line(account.get("imap_security"), 20) or "(empty)",
+                _one_line(account.get("proxy_type"), 20) or "none",
+                type(exc).__name__,
+                _one_line(exc, 500),
+            )
+            raise
+        await asyncio.to_thread(index.replace_folders, account_id, folders)
+        logger.info(
+            "[EmailAssistant] IMAP 文件夹清单已刷新 account=%s folders=%s",
+            account_id,
+            len(folders),
+        )
+        return await asyncio.to_thread(index.list_folders, account_id)
+
+    async def _sync_secondary_folder_step(self, account: dict[str, Any]) -> None:
+        if (
+            self._mail_index is None
+            or not self.config.get("local_index_all_folders", True)
+            or not account.get("query_enabled", True)
+        ):
+            return
+        batch = self._secondary_folders_per_poll()
+        if batch <= 0:
+            return
+        try:
+            folders = await self._refresh_folder_catalog(account)
+            account_id = self._account_key(account)
+            candidates = []
+            for folder in folders:
+                if not folder.selectable or folder.name == self._folder(account):
+                    continue
+                state = await asyncio.to_thread(
+                    self._mail_index.get_state, account_id, folder.name
+                )
+                candidates.append((folder, state))
+            candidates.sort(
+                key=lambda item: (
+                    item[1] is not None,
+                    bool(item[1] and item[1].history_complete),
+                    item[1].last_sync_at if item[1] else 0.0,
+                    item[0].name.casefold(),
+                )
+            )
+            for folder, _state in candidates[:batch]:
+                await self._sync_account_index(account, folder=folder.name)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "[EmailAssistant] 次要文件夹渐进索引失败 account=%s error=%s",
+                self._account_key(account),
+                _one_line(exc, 220),
             )
 
     async def _query_mail_headers(
@@ -430,29 +567,39 @@ class EmailAssistantPlugin(Star):
         raise RuntimeError(f"云端同步失败且本地没有可用索引：{_one_line(sync_error)}")
 
     async def _fetch_remote_detail(
-        self, account: dict[str, Any], uid: int
+        self, account: dict[str, Any], uid: int, folder: str | None = None
     ) -> ParsedMail:
+        effective_folder = str(folder or self._folder(account))
         index = self._mail_index
         if index is None:
+            if effective_folder != self._folder(account):
+                account = dict(account, folder=effective_folder)
             return await asyncio.to_thread(
                 fetch_detail, account, int(uid), self._timeout()
             )
         account_id = self._account_key(account)
-        folder = self._folder(account)
+        folder = effective_folder
         async with self._lock_for(account):
             state = await asyncio.to_thread(index.get_state, account_id, folder)
             if state is None:
-                await self._sync_index_locked(account)
+                await self._sync_index_locked(account, folder=folder)
                 state = await asyncio.to_thread(index.get_state, account_id, folder)
             expected_uidvalidity = state.uidvalidity if state else None
             try:
-                uidvalidity, mail = await asyncio.to_thread(
-                    fetch_detail_checked,
+                detail_args = (
                     account,
                     int(uid),
                     expected_uidvalidity,
                     self._timeout(),
                 )
+                if folder == self._folder(account):
+                    uidvalidity, mail = await asyncio.to_thread(
+                        fetch_detail_checked, *detail_args
+                    )
+                else:
+                    uidvalidity, mail = await asyncio.to_thread(
+                        fetch_detail_checked, *detail_args, folder=folder
+                    )
             except MailNotFoundError as exc:
                 if expected_uidvalidity is not None:
                     await asyncio.to_thread(
@@ -470,11 +617,20 @@ class EmailAssistantPlugin(Star):
                             expected_uidvalidity,
                             int(uid),
                         )
+                    await asyncio.to_thread(
+                        index.delete_ai_results,
+                        account_id,
+                        folder,
+                        expected_uidvalidity,
+                        int(uid),
+                    )
                 raise MailNotFoundError(
                     f"UID {uid} 已在云端删除、移动，或不再属于当前文件夹；本地索引已标记失效。"
                 ) from exc
             except MailboxChangedError as exc:
-                await self._sync_index_locked(account, force_reconcile=True)
+                await self._sync_index_locked(
+                    account, force_reconcile=True, folder=folder
+                )
                 raise MailboxChangedError(
                     exc.expected_uidvalidity, exc.actual_uidvalidity
                 ) from exc
@@ -485,7 +641,15 @@ class EmailAssistantPlugin(Star):
                 uidvalidity,
                 mail,
             )
-            await self._cache_mail_body(account, uidvalidity, mail)
+            await asyncio.to_thread(
+                index.purge_stale_ai_results,
+                account_id,
+                folder,
+                uidvalidity,
+                int(mail.uid),
+                mail_content_hash(mail),
+            )
+            await self._cache_mail_body(account, uidvalidity, mail, folder)
             return mail
 
     async def _fetch_latest_detail(
@@ -550,6 +714,7 @@ class EmailAssistantPlugin(Star):
                         self._display_name(account),
                         _one_line(exc, 180),
                     )
+                await self._sync_secondary_folder_step(account)
             interval = _safe_int(self.config.get("poll_interval_seconds", 60), 60, 30, 86400)
             try:
                 await asyncio.wait_for(self._stop_event.wait(), timeout=interval)
@@ -669,6 +834,27 @@ class EmailAssistantPlugin(Star):
         for key, value in values.items():
             rendered = rendered.replace("{" + key + "}", str(value))
         return rendered.strip()
+
+    def _mail_processing_prompt_template(self, task: str) -> str:
+        if task == "summary":
+            configured = str(self.config.get("mail_summary_prompt") or "").strip()
+            return configured or get_prompt("mail_summary")
+        if task == "translate":
+            configured = str(self.config.get("mail_translation_prompt") or "").strip()
+            return configured or get_prompt("mail_translate")
+        raise ValueError("不支持的邮件处理任务。")
+
+    def _mail_processing_cache_key(self, task: str) -> str:
+        seed = "\n".join(
+            [
+                task,
+                self._mail_processing_prompt_template(task),
+                get_prompt("mail_content_system"),
+                _one_line(self.config.get("mail_processing_provider_id"), 160),
+            ]
+        )
+        digest = hashlib.sha256(seed.encode("utf-8")).hexdigest()[:16]
+        return f"{task}:v2:{digest}"
 
     async def _current_persona_prompt(self, owner_umo: str) -> str:
         persona_manager = getattr(self.context, "persona_manager", None)
@@ -801,10 +987,12 @@ class EmailAssistantPlugin(Star):
         kwargs: dict[str, Any] = {
             "prompt": request_prompt,
             "system_prompt": persona_prompt,
-            "max_tokens": _safe_int(
-                self.config.get("narration_max_tokens", 500), 500, 64, 2000
-            ),
         }
+        max_tokens = _optional_max_tokens(
+            self.config.get("narration_max_tokens", 500), 500, 64, 2000
+        )
+        if max_tokens is not None:
+            kwargs["max_tokens"] = max_tokens
         if output_tools is not None:
             kwargs["func_tool"] = output_tools
         response = await provider.text_chat(**kwargs)
@@ -817,6 +1005,91 @@ class EmailAssistantPlugin(Star):
             len(text),
         )
         return text
+
+    async def _process_mail_content(
+        self,
+        account: dict[str, Any],
+        mail: ParsedMail,
+        *,
+        task: str,
+        target_language: str,
+    ) -> tuple[str, str]:
+        """Summarize or translate mail without loading the active persona."""
+        if task not in {"summary", "translate"}:
+            raise ValueError("不支持的邮件处理任务。")
+        configured_provider_id = _one_line(
+            self.config.get("mail_processing_provider_id"), 160
+        )
+        if configured_provider_id:
+            getter = getattr(self.context, "get_provider_by_id", None)
+            provider = getter(configured_provider_id) if callable(getter) else None
+        else:
+            owner_umo = self._resolve_notification_umo(account)
+            getter = getattr(self.context, "get_using_provider", None)
+            provider = getter(owner_umo) if callable(getter) else None
+        if provider is None or not callable(getattr(provider, "text_chat", None)):
+            raise RuntimeError("邮件总结/翻译没有可用的 LLM Provider。")
+        provider_label = configured_provider_id
+        if not provider_label:
+            try:
+                meta = provider.meta()
+                provider_label = _one_line(
+                    meta.get("id") if isinstance(meta, dict) else getattr(meta, "id", ""),
+                    120,
+                )
+            except Exception:
+                provider_label = ""
+        sender = mail.from_name.strip()
+        if mail.from_addr:
+            sender = f"{sender} <{mail.from_addr}>" if sender else mail.from_addr
+        body_limit = _safe_int(
+            self.config.get("mail_processing_body_max_chars", 12000),
+            12000,
+            500,
+            50000,
+        )
+        values = {
+            "target_language": target_language or "与 AstrBot 界面相同的语言",
+            "sender": sender or "未知发件人",
+            "date": mail.date or "未知时间",
+            "subject": mail.subject or "(无主题)",
+            "body": mail.body_preview(body_limit) or "（无可显示正文）",
+        }
+        prompt = self._mail_processing_prompt_template(task)
+        for key, value in values.items():
+            prompt = prompt.replace("{" + key + "}", str(value))
+        prompt = prompt.strip()
+        logger.info(
+            "[EmailAssistant] 调用 LLM 处理邮件 task=%s account=%s uid=%s provider=%s",
+            task,
+            self._account_key(account),
+            mail.uid,
+            provider_label or "AstrBot当前模型",
+        )
+        kwargs: dict[str, Any] = {
+            "prompt": prompt,
+            "system_prompt": get_prompt("mail_content_system"),
+        }
+        max_tokens = _optional_max_tokens(
+            self.config.get("mail_processing_max_tokens", 1200),
+            1200,
+            128,
+            4000,
+        )
+        if max_tokens is not None:
+            kwargs["max_tokens"] = max_tokens
+        response = await provider.text_chat(**kwargs)
+        text = str(getattr(response, "completion_text", "") or "").strip()
+        if not text:
+            raise RuntimeError("LLM 没有返回可用的邮件处理结果。")
+        logger.info(
+            "[EmailAssistant] LLM 邮件处理完成 task=%s account=%s uid=%s chars=%s",
+            task,
+            self._account_key(account),
+            mail.uid,
+            len(text),
+        )
+        return text, provider_label
 
     async def _archive_narration(self, owner_umo: str, narration: str) -> None:
         conv_manager = getattr(self.context, "conversation_manager", None)

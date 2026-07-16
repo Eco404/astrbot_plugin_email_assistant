@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import base64
 import imaplib
+import re
 import ssl
 from dataclasses import dataclass
 from datetime import datetime
@@ -29,6 +31,25 @@ class HeaderSyncResult:
     history_complete: bool | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class MailFolder:
+    name: str
+    display_name: str
+    delimiter: str
+    attributes: tuple[str, ...]
+    selectable: bool
+    special_use: str
+
+
+@dataclass(frozen=True, slots=True)
+class MailTransferResult:
+    operation: str
+    source_folder: str
+    target_folder: str
+    source_uid: int
+    used_uid_move: bool
+
+
 class MailNotFoundError(RuntimeError):
     pass
 
@@ -48,6 +69,133 @@ def _positive_int(value: Any, default: int) -> int:
     except (TypeError, ValueError):
         return default
     return parsed if parsed > 0 else default
+
+
+def encode_mailbox_name(value: str) -> str:
+    """Encode a Unicode mailbox name using IMAP modified UTF-7."""
+    text = str(value or "")
+    result: list[str] = []
+    buffered: list[str] = []
+
+    def flush() -> None:
+        if not buffered:
+            return
+        raw = "".join(buffered).encode("utf-16-be")
+        encoded = base64.b64encode(raw).decode("ascii").rstrip("=").replace("/", ",")
+        result.append(f"&{encoded}-")
+        buffered.clear()
+
+    for char in text:
+        codepoint = ord(char)
+        if 0x20 <= codepoint <= 0x7E:
+            flush()
+            result.append("&-" if char == "&" else char)
+        else:
+            buffered.append(char)
+    flush()
+    return "".join(result)
+
+
+def decode_mailbox_name(value: str | bytes) -> str:
+    """Decode an IMAP modified UTF-7 mailbox name."""
+    text = value.decode("ascii", errors="replace") if isinstance(value, bytes) else str(value or "")
+    result: list[str] = []
+    position = 0
+    while position < len(text):
+        marker = text.find("&", position)
+        if marker < 0:
+            result.append(text[position:])
+            break
+        result.append(text[position:marker])
+        end = text.find("-", marker)
+        if end < 0:
+            result.append(text[marker:])
+            break
+        token = text[marker + 1 : end]
+        if not token:
+            result.append("&")
+        else:
+            try:
+                raw = base64.b64decode(
+                    token.replace(",", "/") + "=" * (-len(token) % 4)
+                )
+                result.append(raw.decode("utf-16-be"))
+            except (ValueError, UnicodeDecodeError):
+                result.append(text[marker : end + 1])
+        position = end + 1
+    return "".join(result)
+
+
+def _validate_folder_name(value: Any, label: str = "文件夹") -> str:
+    folder = str(value or "").strip()
+    if not folder:
+        raise ValueError(f"{label}不能为空。")
+    if len(folder) > 512 or any(char in folder for char in ("\x00", "\r", "\n")):
+        raise ValueError(f"{label}名称无效。")
+    return folder
+
+
+def _mailbox_arg(value: str) -> str:
+    encoded = encode_mailbox_name(_validate_folder_name(value))
+    return '"' + encoded.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+_LIST_PATTERN = re.compile(
+    r"^\((?P<attrs>[^)]*)\)\s+(?P<delimiter>NIL|\"(?:\\.|[^\"])*\")\s+(?P<name>.+)$"
+)
+
+
+def _unquote_list_token(value: str) -> str:
+    token = value.strip()
+    if len(token) >= 2 and token[0] == token[-1] == '"':
+        token = token[1:-1]
+        token = re.sub(r"\\(.)", r"\1", token)
+    return token
+
+
+def parse_folder_list_item(value: Any) -> MailFolder | None:
+    if isinstance(value, tuple):
+        value = value[-1] if value else b""
+    text = value.decode("ascii", errors="replace") if isinstance(value, bytes) else str(value or "")
+    match = _LIST_PATTERN.match(text.strip())
+    if not match:
+        return None
+    attributes = tuple(
+        item.strip() for item in match.group("attrs").split() if item.strip()
+    )
+    delimiter_token = match.group("delimiter")
+    delimiter = "" if delimiter_token.upper() == "NIL" else _unquote_list_token(delimiter_token)
+    encoded_name = _unquote_list_token(match.group("name"))
+    name = decode_mailbox_name(encoded_name)
+    lowered = {item.lower() for item in attributes}
+    special = next(
+        (
+            item[1:].lower()
+            for item in attributes
+            if item.lower()
+            in {
+                "\\inbox",
+                "\\sent",
+                "\\drafts",
+                "\\trash",
+                "\\junk",
+                "\\all",
+                "\\archive",
+                "\\flagged",
+                "\\important",
+            }
+        ),
+        "inbox" if name.upper() == "INBOX" else "",
+    )
+    display_name = name.rsplit(delimiter, 1)[-1] if delimiter and delimiter in name else name
+    return MailFolder(
+        name=name,
+        display_name=display_name,
+        delimiter=delimiter,
+        attributes=attributes,
+        selectable="\\noselect" not in lowered,
+        special_use=special,
+    )
 
 
 class _ProxyIMAP4(imaplib.IMAP4):
@@ -78,11 +226,21 @@ class _ProxyIMAP4SSL(imaplib.IMAP4_SSL):
 
 
 class ImapMailbox:
-    def __init__(self, account: dict[str, Any], timeout: int = 20) -> None:
+    def __init__(
+        self,
+        account: dict[str, Any],
+        timeout: int = 20,
+        *,
+        folder: str | None = None,
+        readonly: bool = True,
+        select_mailbox: bool = True,
+    ) -> None:
         self.account = account
         self.timeout = _positive_int(timeout, 20)
         self.connection: imaplib.IMAP4 | imaplib.IMAP4_SSL | None = None
-        self.folder = "INBOX"
+        self.folder = str(folder or account.get("folder") or "INBOX").strip() or "INBOX"
+        self.readonly = bool(readonly)
+        self.select_mailbox = bool(select_mailbox)
 
     def __enter__(self) -> "ImapMailbox":
         host = str(self.account.get("imap_host") or "").strip()
@@ -115,10 +273,12 @@ class ImapMailbox:
         else:
             raise ValueError("IMAP 安全模式仅支持 ssl 或 starttls。")
         self.connection.login(username, password)
-        self.folder = str(self.account.get("folder") or "INBOX").strip() or "INBOX"
-        status, _ = self.connection.select(self.folder, readonly=True)
-        if status != "OK":
-            raise RuntimeError("无法打开配置的 IMAP 文件夹。")
+        if self.select_mailbox:
+            status, _ = self.connection.select(
+                _mailbox_arg(self.folder), readonly=self.readonly
+            )
+            if status != "OK":
+                raise RuntimeError(f"无法打开 IMAP 文件夹：{self.folder}")
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
@@ -184,6 +344,28 @@ class ImapMailbox:
             raise MailNotFoundError(f"IMAP UID {uid} 不存在或已无法读取。")
         return parse_mail(raw, uid)
 
+    def list_folders(self) -> list[MailFolder]:
+        # imaplib does not quote an explicitly supplied empty string. Calling
+        # LIST with its defaults emits the required: LIST "" *
+        status, data = self.conn.list()
+        if status != "OK":
+            detail = repr(data[:3] if isinstance(data, list) else data)[:300]
+            raise RuntimeError(
+                f"IMAP 服务器拒绝列出文件夹，status={status}, response={detail}"
+            )
+        folders = [parse_folder_list_item(item) for item in (data or [])]
+        return sorted(
+            [item for item in folders if item is not None],
+            key=lambda item: (item.special_use != "inbox", item.name.casefold()),
+        )
+
+    def ensure_uidvalidity(self, expected_uidvalidity: int | None) -> None:
+        if expected_uidvalidity is None:
+            return
+        current = self.uidvalidity
+        if int(expected_uidvalidity) != current:
+            raise MailboxChangedError(expected_uidvalidity, current)
+
 
 def get_max_uid(account: dict[str, Any], timeout: int = 20) -> int:
     with ImapMailbox(account, timeout) as mailbox:
@@ -246,8 +428,14 @@ def sync_headers(
     force_initial: bool = False,
     known_history_before_uid: int = 0,
     known_history_complete: bool = False,
+    folder: str | None = None,
 ) -> HeaderSyncResult:
-    with ImapMailbox(account, timeout) as mailbox:
+    mailbox_context = (
+        ImapMailbox(account, timeout)
+        if folder is None
+        else ImapMailbox(account, timeout, folder=folder)
+    )
+    with mailbox_context as mailbox:
         current_uidvalidity = mailbox.uidvalidity
         uidnext = mailbox.uidnext
         changed = (
@@ -318,8 +506,14 @@ def fetch_detail_checked(
     uid: int,
     expected_uidvalidity: int | None,
     timeout: int = 20,
+    folder: str | None = None,
 ) -> tuple[int, ParsedMail]:
-    with ImapMailbox(account, timeout) as mailbox:
+    mailbox_context = (
+        ImapMailbox(account, timeout)
+        if folder is None
+        else ImapMailbox(account, timeout, folder=folder)
+    )
+    with mailbox_context as mailbox:
         current_uidvalidity = mailbox.uidvalidity
         if (
             expected_uidvalidity is not None
@@ -339,3 +533,88 @@ def test_imap(account: dict[str, Any], timeout: int = 20) -> None:
         status, _ = mailbox.conn.noop()
         if status != "OK":
             raise RuntimeError("IMAP NOOP 测试失败。")
+
+
+def list_folders(account: dict[str, Any], timeout: int = 20) -> list[MailFolder]:
+    with ImapMailbox(account, timeout, select_mailbox=False) as mailbox:
+        return mailbox.list_folders()
+
+
+def create_folder(
+    account: dict[str, Any], folder: str, timeout: int = 20
+) -> None:
+    folder = _validate_folder_name(folder, "新文件夹")
+    with ImapMailbox(account, timeout, select_mailbox=False) as mailbox:
+        status, _ = mailbox.conn.create(_mailbox_arg(folder))
+        if status != "OK":
+            raise RuntimeError(f"创建 IMAP 文件夹失败：{folder}")
+        try:
+            mailbox.conn.subscribe(_mailbox_arg(folder))
+        except Exception:
+            pass
+
+
+def transfer_message(
+    account: dict[str, Any],
+    source_folder: str,
+    target_folder: str,
+    uid: int,
+    expected_uidvalidity: int | None,
+    *,
+    move: bool,
+    timeout: int = 20,
+) -> MailTransferResult:
+    source = _validate_folder_name(source_folder, "源文件夹")
+    target = _validate_folder_name(target_folder, "目标文件夹")
+    if source == target:
+        raise ValueError("源文件夹和目标文件夹不能相同。")
+    normalized_uid = _positive_int(uid, 0)
+    if normalized_uid <= 0:
+        raise ValueError("邮件 UID 必须是正整数。")
+    with ImapMailbox(
+        account, timeout, folder=source, readonly=False
+    ) as mailbox:
+        mailbox.ensure_uidvalidity(expected_uidvalidity)
+        mailbox.fetch_uid(normalized_uid, headers_only=True)
+        capabilities = {
+            item.decode("ascii", errors="ignore").upper()
+            if isinstance(item, bytes)
+            else str(item).upper()
+            for item in getattr(mailbox.conn, "capabilities", ())
+        }
+        target_arg = _mailbox_arg(target)
+        used_uid_move = False
+        if move and "MOVE" in capabilities:
+            status, _ = mailbox.conn.uid("MOVE", str(normalized_uid), target_arg)
+            used_uid_move = True
+        else:
+            if move and "UIDPLUS" not in capabilities:
+                raise RuntimeError(
+                    "服务器不支持 UID MOVE 或安全的 UID EXPUNGE，已拒绝移动以避免误删其他邮件。"
+                )
+            status, _ = mailbox.conn.uid("COPY", str(normalized_uid), target_arg)
+            if status == "OK" and move:
+                status, _ = mailbox.conn.uid(
+                    "STORE", str(normalized_uid), "+FLAGS.SILENT", r"(\Deleted)"
+                )
+                if status == "OK":
+                    status, _ = mailbox.conn.uid("EXPUNGE", str(normalized_uid))
+                    if status != "OK":
+                        try:
+                            mailbox.conn.uid(
+                                "STORE",
+                                str(normalized_uid),
+                                "-FLAGS.SILENT",
+                                r"(\Deleted)",
+                            )
+                        except Exception:
+                            pass
+        if status != "OK":
+            raise RuntimeError("IMAP 移动邮件失败。" if move else "IMAP 复制邮件失败。")
+    return MailTransferResult(
+        operation="move" if move else "copy",
+        source_folder=source,
+        target_folder=target,
+        source_uid=normalized_uid,
+        used_uid_move=used_uid_move,
+    )

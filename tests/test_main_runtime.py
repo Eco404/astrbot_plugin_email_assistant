@@ -6,7 +6,7 @@ import types
 import unittest
 from datetime import datetime
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
@@ -117,11 +117,14 @@ _install_astrbot_stubs()
 from astrbot_plugin_email_assistant.imap_client import (
     FetchItem,
     HeaderSyncResult,
+    MailFolder,
     MailNotFoundError,
 )
 from astrbot_plugin_email_assistant.mail_index import MailHeaderIndex
 from astrbot_plugin_email_assistant.mail_parser import ParsedMail
 from astrbot_plugin_email_assistant.main import EmailAssistantPlugin
+from astrbot_plugin_email_assistant import page_api as page_api_module
+from astrbot_plugin_email_assistant.page_api import EmailAssistantPageApi
 
 
 ACCOUNT = {
@@ -247,6 +250,15 @@ class FakeEvent:
 
     def get_extra(self, key):
         return self.extras.get(key)
+
+
+class FakePageRequest:
+    def __init__(self):
+        self.query = {}
+        self.payload = {}
+
+    async def json(self, default=None):
+        return self.payload
 
 
 class MainRuntimeTests(unittest.IsolatedAsyncioTestCase):
@@ -392,6 +404,7 @@ class MainRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.context.sent[-1][1], "人格化转述")
         call = self.context.provider.calls[0]
         self.assertEqual(call["system_prompt"], "当前人格提示")
+        self.assertEqual(call["max_tokens"], 500)
         self.assertIn("私人邮箱|张三 <sender@example.com>|测试主题|正文|7", call["prompt"])
         pair = self.context.conversation_manager.pairs[0]
         self.assertIn("邮件主动承接占位", pair["user_message"]["content"])
@@ -429,7 +442,11 @@ class MainRuntimeTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_blank_provider_falls_back_to_session_provider(self):
         self.plugin.config.update(
-            {"notification_mode": "llm", "narration_provider_id": ""}
+            {
+                "notification_mode": "llm",
+                "narration_provider_id": "",
+                "narration_max_tokens": 0,
+            }
         )
         self.context.provider = FakeProvider("会话默认模型结果")
         self.context.persona_manager = FakePersonaManager()
@@ -437,6 +454,7 @@ class MainRuntimeTests(unittest.IsolatedAsyncioTestCase):
         await self.plugin._send_mail_notification(self.account, parsed())
 
         self.assertEqual(self.context.sent[-1][1], "会话默认模型结果")
+        self.assertNotIn("max_tokens", self.context.provider.calls[0])
 
     async def test_missing_configured_provider_fails_explicitly(self):
         self.plugin.config.update(
@@ -447,6 +465,43 @@ class MainRuntimeTests(unittest.IsolatedAsyncioTestCase):
         )
         with self.assertRaisesRegex(RuntimeError, "missing-provider"):
             await self.plugin._send_mail_notification(self.account, parsed())
+
+    async def test_mail_summary_does_not_load_persona(self):
+        self.plugin.config["mail_processing_max_tokens"] = 0
+        self.context.provider = FakeProvider("简短总结")
+        self.context.persona_manager = FakePersonaManager()
+        result, _ = await self.plugin._process_mail_content(
+            self.account,
+            ParsedMail(
+                9, "主题", "张三", "a@example.com", "a@example.com",
+                "2026-07-16", 0, "正文", False, "", ""
+            ),
+            task="summary",
+            target_language="简体中文",
+        )
+        self.assertEqual(result, "简短总结")
+        call = self.context.provider.calls[0]
+        self.assertNotEqual(call["system_prompt"], "当前人格提示")
+        self.assertIn("不使用或模仿任何聊天人格", call["system_prompt"])
+        self.assertIn("简明总结", call["prompt"])
+        self.assertNotIn("func_tool", call)
+        self.assertNotIn("max_tokens", call)
+
+        default_key = self.plugin._mail_processing_cache_key("summary")
+        self.plugin.config["mail_summary_prompt"] = "自定义总结 {subject}：{body}"
+        self.assertNotEqual(
+            default_key, self.plugin._mail_processing_cache_key("summary")
+        )
+        await self.plugin._process_mail_content(
+            self.account,
+            ParsedMail(
+                10, "自定义主题", "", "a@example.com", "a@example.com",
+                "", 0, "自定义正文", False, "", ""
+            ),
+            task="summary",
+            target_language="简体中文",
+        )
+        self.assertIn("自定义总结 自定义主题：自定义正文", self.context.provider.calls[1]["prompt"])
 
     def test_narration_can_be_extracted_from_send_tool_arguments(self):
         response = FakeResponse(
@@ -644,6 +699,31 @@ class MainRuntimeTests(unittest.IsolatedAsyncioTestCase):
         remote_query.assert_not_called()
         self.assertEqual(index.stats("one", "INBOX")["active"], 1)
 
+    async def test_background_discovers_and_progressively_indexes_folders(self):
+        index = self._enable_test_index()
+        folders = [
+            MailFolder("INBOX", "INBOX", "/", (), True, "inbox"),
+            MailFolder("Archive", "Archive", "/", (), True, "archive"),
+            MailFolder("Sent", "Sent", "/", (), True, "sent"),
+        ]
+        with patch(
+            "astrbot_plugin_email_assistant.main.list_imap_folders",
+            return_value=folders,
+        ):
+            discovered = await self.plugin._refresh_folder_catalog(
+                self.account, force=True
+            )
+        self.assertEqual([item.name for item in discovered], ["INBOX", "Archive", "Sent"])
+
+        sync = AsyncMock()
+        with patch.object(self.plugin, "_sync_account_index", sync):
+            await self.plugin._sync_secondary_folder_step(self.account)
+        sync.assert_awaited_once_with(self.account, folder="Archive")
+        self.assertEqual(
+            [item.name for item in index.list_folders("one")],
+            ["INBOX", "Archive", "Sent"],
+        )
+
     async def test_deleted_cloud_mail_is_marked_missing_on_detail(self):
         index = self._enable_test_index()
         timestamp = datetime(2026, 7, 16, 10, 0).timestamp()
@@ -662,6 +742,9 @@ class MainRuntimeTests(unittest.IsolatedAsyncioTestCase):
         )
         index.apply_sync("one", "INBOX", 10, 22, [header])
         index.cache_body("one", "INBOX", 10, 22, "旧缓存", 1024)
+        index.cache_ai_result(
+            "one", "INBOX", 10, 22, "old-hash", "summary:v2:test", "简体中文", "旧总结", "p"
+        )
         with patch(
             "astrbot_plugin_email_assistant.main.fetch_detail_checked",
             side_effect=MailNotFoundError("missing"),
@@ -670,6 +753,11 @@ class MainRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 await self.plugin._fetch_remote_detail(self.account, 22)
         self.assertEqual(index.stats("one", "INBOX")["remote_missing"], 1)
         self.assertIsNone(index.get_cached_body("one", "INBOX", 10, 22))
+        self.assertIsNone(
+            index.get_ai_result(
+                "one", "INBOX", 10, 22, "old-hash", "summary:v2:test", "简体中文"
+            )
+        )
 
     async def test_remote_detail_is_cached_on_demand(self):
         index = self._enable_test_index()
@@ -683,6 +771,9 @@ class MainRuntimeTests(unittest.IsolatedAsyncioTestCase):
             "2026-07-16 10:00:00", timestamp, "完整正文", False, "", ""
         )
         index.apply_sync("one", "INBOX", 10, 25, [header])
+        index.cache_ai_result(
+            "one", "INBOX", 10, 25, "old-content", "summary:v2:test", "简体中文", "旧总结", "p"
+        )
         with patch(
             "astrbot_plugin_email_assistant.main.fetch_detail_checked",
             return_value=(10, detail),
@@ -691,6 +782,11 @@ class MainRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.body, "完整正文")
         cached = index.get_cached_body("one", "INBOX", 10, 25)
         self.assertEqual(cached.body_text, "完整正文")
+        self.assertIsNone(
+            index.get_ai_result(
+                "one", "INBOX", 10, 25, "old-content", "summary:v2:test", "简体中文"
+            )
+        )
 
     async def test_transient_detail_error_does_not_mark_mail_missing(self):
         index = self._enable_test_index()
@@ -817,6 +913,147 @@ class MainRuntimeTests(unittest.IsolatedAsyncioTestCase):
             await self.plugin.tool_show_message(owner, 1, account="one")
         )
         self.assertFalse(disabled["success"])
+
+    async def test_page_api_registers_routes_and_lists_indexed_messages(self):
+        index = self._enable_test_index()
+        timestamp = datetime(2026, 7, 16, 10, 0).timestamp()
+        index.apply_sync(
+            "one", "INBOX", 10, 2,
+            [
+                ParsedMail(1, "第一封", "A", "a@example.com", "a@example.com", "", timestamp, "", False, "", ""),
+                ParsedMail(2, "第二封", "B", "b@example.com", "b@example.com", "", timestamp + 60, "", False, "", ""),
+            ],
+        )
+        routes = []
+        self.context.register_web_api = lambda *args: routes.append(args)
+        api = EmailAssistantPageApi(self.plugin)
+        api.register_routes()
+        self.assertIn("/astrbot_plugin_email_assistant/messages", [item[0] for item in routes])
+
+        fake_request = FakePageRequest()
+        fake_request.query = {"account_id": "one", "limit": "1"}
+        with patch.object(page_api_module, "request", fake_request):
+            response = await api.list_messages()
+        self.assertEqual(response["status"], "ok")
+        self.assertEqual([item["uid"] for item in response["data"]["items"]], [2])
+        self.assertTrue(response["data"]["has_more"])
+
+        with self.assertRaises(PermissionError):
+            api._resolve_account("one", capability="organize_enabled")
+
+    async def test_page_draft_requires_approval_and_sends_once(self):
+        index = self._enable_test_index()
+        self.account.update(
+            {
+                "email": "bot@example.com",
+                "password": "secret",
+                "smtp_host": "smtp.example.com",
+                "smtp_port": 465,
+                "smtp_security": "ssl",
+            }
+        )
+        api = EmailAssistantPageApi(self.plugin)
+        fake_request = FakePageRequest()
+        fake_request.payload = {
+            "account_id": "one",
+            "to_addrs": "reader@example.com",
+            "subject": "测试主题",
+            "body_text": "测试正文",
+        }
+        with patch.object(page_api_module, "request", fake_request):
+            created_response = await api.create_draft()
+        created = created_response["data"]
+
+        fake_request.query = {}
+        with patch.object(page_api_module, "request", fake_request):
+            list_response = await api.list_drafts()
+        self.assertNotIn("body_text", list_response["data"]["items"][0])
+        fake_request.query = {"draft_id": created["draft_id"]}
+        with patch.object(page_api_module, "request", fake_request):
+            detail_response = await api.get_draft()
+        self.assertEqual(detail_response["data"]["body_text"], "测试正文")
+
+        fake_request.payload = {
+            "draft_id": created["draft_id"],
+            "revision": created["revision"],
+        }
+        with patch.object(page_api_module, "request", fake_request):
+            approved_response = await api.approve_draft()
+        approved = approved_response["data"]
+        self.assertEqual(approved["status"], "approved")
+
+        fake_request.payload = {
+            "draft_id": approved["draft_id"],
+            "revision": approved["revision"],
+        }
+        with patch.object(page_api_module, "request", fake_request), patch.object(
+            page_api_module, "send_draft_message"
+        ) as send:
+            sent_response = await api.send_draft()
+            duplicate_response = await api.send_draft()
+        self.assertEqual(sent_response["data"]["status"], "sent")
+        self.assertEqual(duplicate_response["status"], "error")
+        send.assert_called_once()
+        self.assertEqual(index.get_draft(created["draft_id"]).status, "sent")
+
+    async def test_page_translation_reuses_content_cache(self):
+        index = self._enable_test_index()
+        timestamp = datetime(2026, 7, 16, 10, 0).timestamp()
+        message = ParsedMail(
+            8, "Subject", "Sender", "a@example.com", "a@example.com",
+            "2026-07-16", timestamp, "Mail body", False, "", ""
+        )
+        index.apply_sync("one", "INBOX", 10, 8, [message])
+        self.context.provider = FakeProvider("翻译结果")
+        api = EmailAssistantPageApi(self.plugin)
+        fake_request = FakePageRequest()
+        fake_request.payload = {
+            "account_id": "one",
+            "folder": "INBOX",
+            "uid": 8,
+            "locale": "zh-CN",
+        }
+        with patch.object(page_api_module, "request", fake_request), patch.object(
+            self.plugin, "_fetch_remote_detail", return_value=message
+        ):
+            first = await api.translate_message()
+            second = await api.translate_message()
+        self.assertEqual(first["status"], "ok")
+        self.assertFalse(first["data"]["cached"])
+        self.assertTrue(second["data"]["cached"])
+        self.assertEqual(second["data"]["content"], "翻译结果")
+        self.assertEqual(len(self.context.provider.calls), 1)
+
+    async def test_page_cached_detail_returns_before_separate_verification(self):
+        index = self._enable_test_index()
+        timestamp = datetime(2026, 7, 16, 10, 0).timestamp()
+        cached_mail = ParsedMail(
+            18, "缓存主题", "Sender", "a@example.com", "a@example.com",
+            "2026-07-16", timestamp, "缓存正文", False, "", ""
+        )
+        changed_mail = ParsedMail(
+            18, "更新主题", "Sender", "a@example.com", "a@example.com",
+            "2026-07-16", timestamp, "更新正文", False, "", ""
+        )
+        index.apply_sync("one", "INBOX", 10, 18, [cached_mail])
+        index.cache_body("one", "INBOX", 10, 18, cached_mail.body, 1024)
+        api = EmailAssistantPageApi(self.plugin)
+        fake_request = FakePageRequest()
+        fake_request.query = {"account_id": "one", "folder": "INBOX", "uid": 18}
+        with patch.object(page_api_module, "request", fake_request):
+            cached_response = await api.get_cached_message()
+        self.assertEqual(cached_response["status"], "ok")
+        self.assertTrue(cached_response["data"]["from_cache"])
+        self.assertEqual(cached_response["data"]["body"], "缓存正文")
+
+        fake_request.payload = {"account_id": "one", "folder": "INBOX", "uid": 18}
+        with patch.object(page_api_module, "request", fake_request), patch.object(
+            self.plugin, "_fetch_remote_detail", return_value=changed_mail
+        ):
+            verification = await api.verify_message()
+        self.assertEqual(
+            verification["data"]["verification_status"], "changed"
+        )
 
 
 if __name__ == "__main__":

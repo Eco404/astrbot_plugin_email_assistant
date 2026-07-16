@@ -27,14 +27,13 @@ class PromptLoaderTests(unittest.TestCase):
         self.assertIn("转述内容", rendered)
         self.assertNotIn("{narration_prompt}", rendered)
 
-    def test_schema_default_matches_canonical_narration_prompt(self):
+    def test_configurable_prompt_fields_default_to_blank(self):
         schema = json.loads(
             (PLUGIN_DIR / "_conf_schema.json").read_text(encoding="utf-8")
         )
-        self.assertEqual(
-            schema["narration_prompt"]["default"],
-            get_prompt("default_narration"),
-        )
+        self.assertEqual(schema["narration_prompt"]["default"], "")
+        self.assertEqual(schema["mail_summary_prompt"]["default"], "")
+        self.assertEqual(schema["mail_translation_prompt"]["default"], "")
 
 
 if __name__ == "__main__":

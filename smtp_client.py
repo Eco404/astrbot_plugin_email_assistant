@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import smtplib
 import ssl
+from collections.abc import Iterable
 from email.message import EmailMessage
 from email.utils import formataddr, parseaddr
 from typing import Any
@@ -110,6 +111,57 @@ def build_message(
     return message
 
 
+def _validated_addresses(values: Iterable[str], label: str) -> list[str]:
+    addresses: list[str] = []
+    for value in values:
+        _, address = parseaddr(_validate_header(str(value), label))
+        if not address or "@" not in address:
+            raise ValueError(f"{label}邮箱地址无效：{value}")
+        addresses.append(address)
+    return addresses
+
+
+def build_draft_message(
+    account: dict[str, Any],
+    to_addrs: Iterable[str],
+    cc_addrs: Iterable[str],
+    bcc_addrs: Iterable[str],
+    subject: str,
+    body: str,
+    *,
+    original: ParsedMail | None = None,
+) -> EmailMessage:
+    """Build a plain-text draft while preserving optional reply threading headers."""
+    from_addr, _, _ = _smtp_identity(account)
+    to_values = _validated_addresses(to_addrs, "收件人")
+    cc_values = _validated_addresses(cc_addrs, "抄送")
+    bcc_values = _validated_addresses(bcc_addrs, "密送")
+    if not to_values:
+        raise ValueError("至少需要一个收件人。")
+    subject = _validate_header(subject, "主题")
+    body = str(body or "").strip()
+    if not body:
+        raise ValueError("正文不能为空。")
+    message = EmailMessage()
+    sender_name = str(account.get("sender_name") or "AstrBot").strip()
+    message["From"] = formataddr((sender_name, from_addr))
+    message["To"] = ", ".join(to_values)
+    if cc_values:
+        message["Cc"] = ", ".join(cc_values)
+    if bcc_values:
+        message["Bcc"] = ", ".join(bcc_values)
+    message["Subject"] = subject
+    if original and original.message_id:
+        message["In-Reply-To"] = original.message_id
+        references = " ".join(
+            part for part in (original.references, original.message_id) if part
+        ).strip()
+        if references:
+            message["References"] = references
+    message.set_content(body)
+    return message
+
+
 def send_message(account: dict[str, Any], message: EmailMessage, timeout: int = 20) -> None:
     _, username, password = _smtp_identity(account)
     client = _connect(account, timeout)
@@ -130,6 +182,29 @@ def send_message(account: dict[str, Any], message: EmailMessage, timeout: int = 
 
 def send_mail(account: dict[str, Any], recipient: str, subject: str, body: str, timeout: int = 20) -> None:
     send_message(account, build_message(account, recipient, subject, body), timeout)
+
+
+def send_draft_message(
+    account: dict[str, Any],
+    to_addrs: Iterable[str],
+    cc_addrs: Iterable[str],
+    bcc_addrs: Iterable[str],
+    subject: str,
+    body: str,
+    timeout: int = 20,
+    *,
+    original: ParsedMail | None = None,
+) -> None:
+    message = build_draft_message(
+        account,
+        to_addrs,
+        cc_addrs,
+        bcc_addrs,
+        subject,
+        body,
+        original=original,
+    )
+    send_message(account, message, timeout)
 
 
 def send_reply(account: dict[str, Any], original: ParsedMail, body: str, timeout: int = 20) -> None:
