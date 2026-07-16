@@ -35,6 +35,8 @@
 
 邮件详情的“总结邮件”和“翻译邮件”不会加载当前聊天人格。可通过 `mail_processing_provider_id` 指定模型；留空时使用该邮箱绑定私聊当前生效的模型。`translation_language` 留空时跟随 AstrBot WebUI 的界面语言。处理结果按账户、文件夹、UIDVALIDITY、UID、正文内容哈希、任务和目标语言保存在 `plugin_data` SQLite 中；正文没有变化时再次点击直接返回缓存。
 
+总结和翻译结果使用插件内置的本地固定版本 `markdown-it` 渲染 Markdown，再由 DOMPurify 清理后作为 DOM Fragment 显示。原始 HTML 默认关闭，页面运行时不连接 CDN；具体版本、完整性和许可证见 `pages/mailbox/vendor/THIRD_PARTY_NOTICES.md`。
+
 首次启用接收时，插件只保存当前最大 IMAP UID 作为基线，不会推送历史邮件。关闭接收后游标会保留，重新开启会继续处理停用期间积累的新邮件，单次处理数量受 `max_fetch_per_check` 限制。
 
 ### 账户级网络代理

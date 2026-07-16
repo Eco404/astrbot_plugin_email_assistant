@@ -117,6 +117,7 @@ input:focus, select:focus, textarea:focus, .search-field:focus-within { border-c
 .mail-ai-result { margin: 12px 0 18px; padding: 14px; border: 1px solid var(--line); border-radius: 11px; background: var(--panel-soft); line-height: 1.65; }
 .mail-ai-heading { display: block; margin-bottom: 8px; }
 .markdown-body { min-width: 0; overflow-wrap: anywhere; }
+.markdown-fallback { white-space: pre-wrap; }
 .markdown-body > :first-child { margin-top: 0; }
 .markdown-body > :last-child { margin-bottom: 0; }
 .markdown-body p { margin: .65em 0; }
