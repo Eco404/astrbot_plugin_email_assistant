@@ -37,7 +37,6 @@ _DRAFT_STATUSES = {
     "editing", "pending_review", "approved", "sending",
     "sent", "failed", "cancelled",
 }
-_VERIFICATION_CACHE_SECONDS = 30.0
 _VERIFICATION_CACHE_MAX_ITEMS = 512
 
 
@@ -139,6 +138,19 @@ class EmailAssistantPageApi:
     ) -> str:
         return f"{self.plugin._account_key(account)}:{folder}:{int(uid)}"
 
+    def _verification_cooldown_seconds(self) -> float:
+        minutes = self._int(
+            config_get(
+                self.plugin.config,
+                "mail_verification_cooldown_minutes",
+                5,
+            ),
+            5,
+            1,
+            1440,
+        )
+        return float(minutes * 60)
+
     async def _fetch_detail_shared(
         self, account: dict[str, Any], folder: str, uid: int
     ):
@@ -171,18 +183,19 @@ class EmailAssistantPageApi:
         if cached is None:
             return None
         cached_at, result = cached
-        if time.monotonic() - cached_at >= _VERIFICATION_CACHE_SECONDS:
+        if time.monotonic() - cached_at >= self._verification_cooldown_seconds():
             self._verification_cache.pop(key, None)
             return None
         return dict(result, verification_cached=True)
 
     def _cache_verification(self, key: str, result: dict[str, Any]) -> None:
         now = time.monotonic()
+        cooldown = self._verification_cooldown_seconds()
         if len(self._verification_cache) >= _VERIFICATION_CACHE_MAX_ITEMS:
             expired = [
                 item_key
                 for item_key, (cached_at, _result) in self._verification_cache.items()
-                if now - cached_at >= _VERIFICATION_CACHE_SECONDS
+                if now - cached_at >= cooldown
             ]
             for item_key in expired:
                 self._verification_cache.pop(item_key, None)

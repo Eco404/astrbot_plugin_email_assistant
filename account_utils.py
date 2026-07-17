@@ -16,20 +16,12 @@ def private_user_id(value: Any) -> str:
 
 
 def account_owner_user_id(account: dict[str, Any]) -> str:
-    owner_id = private_user_id(account.get("owner_user_id"))
-    if owner_id:
-        return owner_id
-    return private_user_id(account.get("owner_umo"))
+    return private_user_id(account.get("owner_user_id"))
 
 
 def account_target_platform(account: dict[str, Any]) -> str:
     configured = str(account.get("target_platform") or "").strip()
-    if configured:
-        return configured
-    legacy_umo = str(account.get("owner_umo") or "").strip()
-    if ":FriendMessage:" in legacy_umo:
-        return legacy_umo.split(":", 1)[0].strip()
-    return "aiocqhttp"
+    return configured or "aiocqhttp"
 
 
 def enabled_accounts(config: dict[str, Any]) -> list[dict[str, Any]]:
@@ -43,7 +35,7 @@ def is_admin(sender_id: str, config: dict[str, Any]) -> bool:
 
 
 def visible_accounts(
-    config: dict[str, Any], *, umo: str, sender_id: str
+    config: dict[str, Any], *, sender_id: str
 ) -> list[dict[str, Any]]:
     accounts = enabled_accounts(config)
     if is_admin(sender_id, config):
@@ -52,10 +44,7 @@ def visible_accounts(
     visible: list[dict[str, Any]] = []
     for item in accounts:
         owner_id = account_owner_user_id(item)
-        if owner_id == sender_id or (
-            not owner_id
-            and str(item.get("owner_umo") or "").strip() == str(umo or "").strip()
-        ):
+        if owner_id == sender_id:
             visible.append(item)
     return visible
 

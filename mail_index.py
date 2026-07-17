@@ -291,7 +291,6 @@ class MailHeaderIndex:
                 """
             )
             self._prune_duplicate_ai_cache(connection)
-            self._migrate_mail_drafts(connection)
             connection.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS mail_send_confirmations (
@@ -310,36 +309,6 @@ class MailHeaderIndex:
 
                 CREATE INDEX IF NOT EXISTS idx_mail_send_confirmations_draft
                 ON mail_send_confirmations (draft_id, consumed_at, expires_at);
-                """
-            )
-            mailbox_columns = {
-                str(row["name"])
-                for row in connection.execute("PRAGMA table_info(mailboxes)")
-            }
-            if "history_before_uid" not in mailbox_columns:
-                connection.execute(
-                    "ALTER TABLE mailboxes ADD COLUMN history_before_uid "
-                    "INTEGER NOT NULL DEFAULT 0"
-                )
-            if "history_complete" not in mailbox_columns:
-                connection.execute(
-                    "ALTER TABLE mailboxes ADD COLUMN history_complete "
-                    "INTEGER NOT NULL DEFAULT 0"
-                )
-            connection.execute(
-                """
-                UPDATE mailboxes
-                SET history_before_uid = COALESCE(
-                    (
-                        SELECT MIN(headers.uid) FROM mail_headers AS headers
-                        WHERE headers.account_id = mailboxes.account_id
-                          AND headers.folder = mailboxes.folder
-                          AND headers.uidvalidity = mailboxes.uidvalidity
-                          AND headers.remote_state = 'active'
-                    ),
-                    last_synced_uid + 1
-                )
-                WHERE history_before_uid <= 0 AND history_complete = 0
                 """
             )
         try:
@@ -377,88 +346,6 @@ class MailHeaderIndex:
                 "DELETE FROM mail_ai_cache WHERE rowid = ?", stale_rowids
             )
         return len(stale_rowids)
-
-    @staticmethod
-    def _migrate_mail_drafts(connection: sqlite3.Connection) -> None:
-        """Rebuild the draft table when upgrading the constrained status schema."""
-        row = connection.execute(
-            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'mail_drafts'"
-        ).fetchone()
-        table_sql = str(row["sql"] or "") if row is not None else ""
-        columns = {
-            str(item["name"])
-            for item in connection.execute("PRAGMA table_info(mail_drafts)")
-        }
-        if {
-            "owner_umo",
-            "owner_sender_id",
-        }.issubset(columns) and "'sending'" in table_sql and "'cancelled'" in table_sql:
-            return
-
-        connection.execute("DROP INDEX IF EXISTS idx_mail_drafts_list")
-        connection.execute("ALTER TABLE mail_drafts RENAME TO mail_drafts_legacy")
-        connection.execute(
-            """
-            CREATE TABLE mail_drafts (
-                draft_id TEXT PRIMARY KEY,
-                account_id TEXT NOT NULL,
-                to_json TEXT NOT NULL DEFAULT '[]',
-                cc_json TEXT NOT NULL DEFAULT '[]',
-                bcc_json TEXT NOT NULL DEFAULT '[]',
-                subject TEXT NOT NULL DEFAULT '',
-                body_text TEXT NOT NULL DEFAULT '',
-                body_html TEXT NOT NULL DEFAULT '',
-                reply_folder TEXT NOT NULL DEFAULT '',
-                reply_uid INTEGER,
-                reply_message_id TEXT NOT NULL DEFAULT '',
-                source TEXT NOT NULL DEFAULT 'user'
-                    CHECK (source IN ('user', 'bot')),
-                owner_umo TEXT NOT NULL DEFAULT '',
-                owner_sender_id TEXT NOT NULL DEFAULT '',
-                status TEXT NOT NULL DEFAULT 'editing'
-                    CHECK (status IN (
-                        'editing', 'pending_review', 'approved', 'sending',
-                        'sent', 'failed', 'cancelled'
-                    )),
-                revision INTEGER NOT NULL DEFAULT 1,
-                created_at REAL NOT NULL,
-                updated_at REAL NOT NULL,
-                sent_at REAL,
-                last_error TEXT NOT NULL DEFAULT ''
-            )
-            """
-        )
-        owner_umo = "owner_umo" if "owner_umo" in columns else "''"
-        owner_sender_id = (
-            "owner_sender_id" if "owner_sender_id" in columns else "''"
-        )
-        connection.execute(
-            f"""
-            INSERT INTO mail_drafts (
-                draft_id, account_id, to_json, cc_json, bcc_json,
-                subject, body_text, body_html, reply_folder, reply_uid,
-                reply_message_id, source, owner_umo, owner_sender_id, status,
-                revision, created_at, updated_at, sent_at, last_error
-            )
-            SELECT
-                draft_id, account_id, to_json, cc_json, bcc_json,
-                subject, body_text, body_html, reply_folder, reply_uid,
-                reply_message_id, source, {owner_umo}, {owner_sender_id},
-                CASE
-                    WHEN status IN (
-                        'editing', 'pending_review', 'approved', 'sending',
-                        'sent', 'failed', 'cancelled'
-                    ) THEN status ELSE 'failed'
-                END,
-                revision, created_at, updated_at, sent_at, last_error
-            FROM mail_drafts_legacy
-            """
-        )
-        connection.execute("DROP TABLE mail_drafts_legacy")
-        connection.execute(
-            "CREATE INDEX idx_mail_drafts_list "
-            "ON mail_drafts (account_id, status, updated_at DESC)"
-        )
 
     @staticmethod
     def _row_to_folder(row: sqlite3.Row) -> IndexedMailFolder:

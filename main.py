@@ -90,7 +90,7 @@ def _one_line(value: Any, limit: int = 160) -> str:
     PLUGIN_NAME,
     "econeco",
     "支持多账户 IMAP 收信通知、LLM 安全草稿与查询、SMTP 收发和邮件中心 WebUI 的邮件助手",
-    "2.2.3",
+    "2.2.5",
 )
 class EmailAssistantPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig) -> None:
@@ -761,9 +761,6 @@ class EmailAssistantPlugin(Star):
         manager = getattr(self.context, "platform_manager", None)
         platforms = self._platform_instances()
         if manager is None:
-            legacy_umo = _one_line(account.get("owner_umo"), 240)
-            if legacy_umo:
-                return legacy_umo
             return f"{selector}:FriendMessage:{owner_id}"
         if not platforms:
             raise RuntimeError("当前没有已加载的消息平台，无法发送新邮件通知。")
@@ -814,8 +811,7 @@ class EmailAssistantPlugin(Star):
                 or selector.lower() == platform_name.lower()
             ):
                 return True
-        legacy_umo = str(account.get("owner_umo") or "").strip()
-        return bool(legacy_umo and legacy_umo == str(umo or "").strip())
+        return False
 
     async def _send_title_notification(
         self, account: dict[str, Any], subject: str, uid: int
@@ -1310,7 +1306,6 @@ class EmailAssistantPlugin(Star):
     def _visible_accounts(self, event: AstrMessageEvent) -> list[dict[str, Any]]:
         accounts = visible_accounts(
             self.config,
-            umo=str(getattr(event, "unified_msg_origin", "") or ""),
             sender_id=self._sender_id(event),
         )
         if is_admin(self._sender_id(event), self.config):

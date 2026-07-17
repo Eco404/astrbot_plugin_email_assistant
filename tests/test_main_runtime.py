@@ -286,7 +286,17 @@ class MainRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.context = FakeContext()
         self.plugin = EmailAssistantPlugin(
             self.context,
-            {"mail_accounts": [dict(ACCOUNT)], "max_fetch_per_check": 20, "network_timeout_seconds": 20},
+            {
+                "mail_accounts": [dict(ACCOUNT)],
+                "general_settings": {
+                    "max_fetch_per_check": 20,
+                    "network_timeout_seconds": 20,
+                },
+                "notification_settings": {},
+                "llm_write_settings": {},
+                "webui_settings": {},
+                "storage_settings": {},
+            },
         )
         self.account = self.plugin._accounts()[0]
 
@@ -386,7 +396,7 @@ class MainRuntimeTests(unittest.IsolatedAsyncioTestCase):
             await self.plugin._check_account(self.account)
 
     async def test_llm_notification_uses_persona_and_optionally_archives(self):
-        self.plugin.config.update(
+        self.plugin.config["notification_settings"].update(
             {
                 "notification_mode": "llm",
                 "llm_write_official_history": True,
@@ -422,8 +432,8 @@ class MainRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(pair["assistant_message"]["content"], "人格化转述")
 
     async def test_llm_notification_does_not_archive_when_disabled(self):
-        self.plugin.config["notification_mode"] = "llm"
-        self.plugin.config["llm_write_official_history"] = False
+        self.plugin.config["notification_settings"]["notification_mode"] = "llm"
+        self.plugin.config["notification_settings"]["llm_write_official_history"] = False
         self.context.provider = FakeProvider()
         self.context.persona_manager = FakePersonaManager()
         self.context.conversation_manager = FakeConversationManager()
@@ -433,7 +443,7 @@ class MainRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.context.conversation_manager.pairs, [])
 
     async def test_llm_notification_uses_configured_provider(self):
-        self.plugin.config.update(
+        self.plugin.config["notification_settings"].update(
             {
                 "notification_mode": "llm",
                 "narration_provider_id": "mail-provider",
@@ -452,7 +462,7 @@ class MainRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(default_provider.calls, [])
 
     async def test_blank_provider_falls_back_to_session_provider(self):
-        self.plugin.config.update(
+        self.plugin.config["notification_settings"].update(
             {
                 "notification_mode": "llm",
                 "narration_provider_id": "",
@@ -468,7 +478,7 @@ class MainRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("max_tokens", self.context.provider.calls[0])
 
     async def test_missing_configured_provider_fails_explicitly(self):
-        self.plugin.config.update(
+        self.plugin.config["notification_settings"].update(
             {
                 "notification_mode": "llm",
                 "narration_provider_id": "missing-provider",
@@ -478,7 +488,7 @@ class MainRuntimeTests(unittest.IsolatedAsyncioTestCase):
             await self.plugin._send_mail_notification(self.account, parsed())
 
     async def test_mail_summary_does_not_load_persona(self):
-        self.plugin.config["mail_processing_max_tokens"] = 0
+        self.plugin.config["webui_settings"]["mail_processing_max_tokens"] = 0
         self.context.provider = FakeProvider("简短总结")
         self.context.persona_manager = FakePersonaManager()
         result, _ = await self.plugin._process_mail_content(
@@ -499,7 +509,9 @@ class MainRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("max_tokens", call)
 
         default_key = self.plugin._mail_processing_cache_key("summary")
-        self.plugin.config["mail_summary_prompt"] = "自定义总结 {subject}：{body}"
+        self.plugin.config["webui_settings"]["mail_summary_prompt"] = (
+            "自定义总结 {subject}：{body}"
+        )
         self.assertNotEqual(
             default_key, self.plugin._mail_processing_cache_key("summary")
         )
@@ -533,7 +545,7 @@ class MainRuntimeTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_llm_request_includes_output_tool_when_available(self):
-        self.plugin.config["notification_mode"] = "llm"
+        self.plugin.config["notification_settings"]["notification_mode"] = "llm"
         self.context.provider = FakeProvider("正文转述")
         self.context.persona_manager = FakePersonaManager()
         output_tools = object()
@@ -548,7 +560,7 @@ class MainRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("send_message_to_user", call["prompt"])
 
     async def test_cron_notification_creates_one_shot_job_without_direct_send(self):
-        self.plugin.config["notification_mode"] = "cron"
+        self.plugin.config["notification_settings"]["notification_mode"] = "cron"
         self.context.cron_manager = FakeCronManager()
 
         await self.plugin._send_mail_notification(self.account, parsed(9))
@@ -624,7 +636,7 @@ class MainRuntimeTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_llm_tool_shows_bounded_message_body(self):
         event = FakeEvent("1", "p:FriendMessage:1")
-        self.plugin.config["detail_body_max_chars"] = 200
+        self.plugin.config["general_settings"]["detail_body_max_chars"] = 200
         mail = ParsedMail(
             13,
             "详情主题",
@@ -684,7 +696,7 @@ class MainRuntimeTests(unittest.IsolatedAsyncioTestCase):
 
     def _enable_llm_draft_workflow(self):
         index = self._enable_test_index()
-        self.plugin.config["llm_mail_write_enabled"] = True
+        self.plugin.config["llm_write_settings"]["llm_mail_write_enabled"] = True
         self.account.update(
             {
                 "email": "bot@example.com",
@@ -891,7 +903,7 @@ class MainRuntimeTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertFalse(disabled["success"])
 
-        self.plugin.config["llm_mail_write_enabled"] = True
+        self.plugin.config["llm_write_settings"]["llm_mail_write_enabled"] = True
         cron = FakeEvent(
             "1",
             "p:FriendMessage:1",
@@ -1341,7 +1353,7 @@ class MainRuntimeTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertFalse(verification["data"]["verification_cached"])
 
-    async def test_page_current_verification_uses_thirty_second_cooldown(self):
+    async def test_page_current_verification_uses_configured_cooldown(self):
         index = self._enable_test_index()
         timestamp = datetime(2026, 7, 16, 10, 0).timestamp()
         message = ParsedMail(
@@ -1358,12 +1370,25 @@ class MainRuntimeTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(page_api_module, "request", fake_request), patch.object(
             self.plugin, "_fetch_remote_detail", return_value=message
         ) as fetch:
+            self.assertEqual(api._verification_cooldown_seconds(), 300.0)
             first = await api.verify_message()
+            key = f"{api._message_key(self.account, 'INBOX', 20)}:10"
+            _cached_at, cached_result = api._verification_cache[key]
+            api._verification_cache[key] = (
+                page_api_module.time.monotonic() - 299.0,
+                cached_result,
+            )
             repeated = await api.verify_message()
+            api._verification_cache[key] = (
+                page_api_module.time.monotonic() - 301.0,
+                cached_result,
+            )
+            expired = await api.verify_message()
         self.assertEqual(first["data"]["verification_status"], "current")
         self.assertFalse(first["data"]["verification_cached"])
         self.assertTrue(repeated["data"]["verification_cached"])
-        fetch.assert_awaited_once()
+        self.assertFalse(expired["data"]["verification_cached"])
+        self.assertEqual(fetch.await_count, 2)
 
     async def test_page_concurrent_remote_detail_requests_are_merged(self):
         message = ParsedMail(

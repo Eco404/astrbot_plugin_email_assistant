@@ -38,6 +38,13 @@ class PromptLoaderTests(unittest.TestCase):
         webui = schema["webui_settings"]["items"]
         self.assertEqual(webui["mail_summary_prompt"]["default"], "")
         self.assertEqual(webui["mail_translation_prompt"]["default"], "")
+        self.assertEqual(
+            webui["mail_verification_cooldown_minutes"]["default"], 5
+        )
+        account_fields = schema["mail_accounts"]["templates"]["email_account"][
+            "items"
+        ]
+        self.assertNotIn("owner_umo", account_fields)
 
 
 if __name__ == "__main__":

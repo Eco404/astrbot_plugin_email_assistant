@@ -26,6 +26,7 @@ CONFIG_SECTIONS: dict[str, str] = {
     "mail_translation_prompt": "webui_settings",
     "translation_language": "webui_settings",
     "webui_auto_show_cached_ai": "webui_settings",
+    "mail_verification_cooldown_minutes": "webui_settings",
     "mail_processing_body_max_chars": "webui_settings",
     "mail_processing_max_tokens": "webui_settings",
     "local_index_enabled": "storage_settings",
@@ -45,13 +46,14 @@ CONFIG_SECTIONS: dict[str, str] = {
 
 
 def config_get(config: Any, key: str, default: Any = None) -> Any:
-    """Read grouped settings while keeping pre-v2.2 flat configs compatible."""
+    """Read settings from the current grouped configuration schema."""
     section_name = CONFIG_SECTIONS.get(key)
     getter = getattr(config, "get", None)
-    if section_name and callable(getter):
-        section = getter(section_name)
-        if isinstance(section, Mapping) and key in section:
-            return section[key]
+    if section_name:
+        if not callable(getter):
+            return default
+        section = getter(section_name, {})
+        return section.get(key, default) if isinstance(section, Mapping) else default
     if callable(getter):
         return getter(key, default)
     return default

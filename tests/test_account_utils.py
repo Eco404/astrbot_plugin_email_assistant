@@ -18,16 +18,16 @@ from astrbot_plugin_email_assistant.config_utils import config_get
 class AccountUtilsTests(unittest.TestCase):
     def setUp(self):
         self.config = {
-            "admin_uids": ["9000"],
+            "general_settings": {"admin_uids": ["9000"]},
             "mail_accounts": [
-                {"account_id": "one", "name": "私人", "owner_umo": "p:FriendMessage:1", "enabled": True},
-                {"account_id": "two", "name": "工作", "owner_umo": "p:FriendMessage:2", "enabled": True},
-                {"account_id": "off", "name": "关闭", "owner_umo": "p:FriendMessage:1", "enabled": False},
+                {"account_id": "one", "name": "私人", "owner_user_id": "1", "target_platform": "p", "enabled": True},
+                {"account_id": "two", "name": "工作", "owner_user_id": "2", "target_platform": "p", "enabled": True},
+                {"account_id": "off", "name": "关闭", "owner_user_id": "1", "target_platform": "p", "enabled": False},
             ],
         }
 
     def test_owner_only_sees_bound_enabled_accounts(self):
-        accounts = visible_accounts(self.config, umo="p:FriendMessage:1", sender_id="1")
+        accounts = visible_accounts(self.config, sender_id="1")
         self.assertEqual([item["account_id"] for item in accounts], ["one"])
 
     def test_new_owner_fields_and_pasted_umo_are_normalized(self):
@@ -40,21 +40,15 @@ class AccountUtilsTests(unittest.TestCase):
         config = {"mail_accounts": [{"account_id": "new", "enabled": True, **account}]}
         accounts = visible_accounts(
             config,
-            umo="platform-instance:FriendMessage:12345",
             sender_id="12345",
         )
         self.assertEqual([item["account_id"] for item in accounts], ["new"])
 
-    def test_legacy_umo_remains_supported(self):
-        account = {"owner_umo": "legacy-platform:FriendMessage:77"}
-        self.assertEqual(account_owner_user_id(account), "77")
-        self.assertEqual(account_target_platform(account), "legacy-platform")
-
     def test_admin_sees_all_enabled_accounts(self):
-        accounts = visible_accounts(self.config, umo="p:FriendMessage:9000", sender_id="9000")
+        accounts = visible_accounts(self.config, sender_id="9000")
         self.assertEqual({item["account_id"] for item in accounts}, {"one", "two"})
 
-    def test_grouped_config_takes_precedence_and_flat_config_remains_compatible(self):
+    def test_only_current_grouped_config_is_read(self):
         self.assertEqual(config_get(self.config, "max_query_results", 20), 20)
         grouped = {
             "admin_uids": ["old"],
@@ -62,6 +56,7 @@ class AccountUtilsTests(unittest.TestCase):
         }
         self.assertEqual(config_get(grouped, "admin_uids", []), ["new"])
         self.assertEqual(config_get(grouped, "max_query_results", 20), 7)
+        self.assertEqual(config_get({"admin_uids": ["old"]}, "admin_uids", []), [])
 
     def test_duplicate_name_requires_account_id(self):
         accounts = [

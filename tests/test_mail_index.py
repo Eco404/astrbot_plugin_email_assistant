@@ -168,47 +168,6 @@ class MailHeaderIndexTests(unittest.TestCase):
             )
         )
 
-    def test_initialize_migrates_existing_index_history_cursor(self):
-        path = Path(self.temp_dir.name) / "legacy.db"
-        connection = sqlite3.connect(path)
-        try:
-            with connection:
-                connection.executescript(
-                    """
-                CREATE TABLE mailboxes (
-                    account_id TEXT NOT NULL,
-                    folder TEXT NOT NULL,
-                    uidvalidity INTEGER NOT NULL,
-                    last_synced_uid INTEGER NOT NULL DEFAULT 0,
-                    last_sync_at REAL NOT NULL DEFAULT 0,
-                    last_reconcile_at REAL NOT NULL DEFAULT 0,
-                    PRIMARY KEY (account_id, folder)
-                );
-                CREATE TABLE mail_headers (
-                    account_id TEXT NOT NULL, folder TEXT NOT NULL,
-                    uidvalidity INTEGER NOT NULL, uid INTEGER NOT NULL,
-                    subject TEXT NOT NULL DEFAULT '', from_name TEXT NOT NULL DEFAULT '',
-                    from_addr TEXT NOT NULL DEFAULT '', reply_to TEXT NOT NULL DEFAULT '',
-                    date_text TEXT NOT NULL DEFAULT '', date_ts REAL NOT NULL DEFAULT 0,
-                    has_attachments INTEGER NOT NULL DEFAULT 0,
-                    message_id TEXT NOT NULL DEFAULT '', references_text TEXT NOT NULL DEFAULT '',
-                    remote_state TEXT NOT NULL DEFAULT 'active', last_seen_at REAL NOT NULL DEFAULT 0,
-                    PRIMARY KEY (account_id, folder, uidvalidity, uid)
-                );
-                INSERT INTO mailboxes VALUES ('one', 'INBOX', 10, 20, 0, 0);
-                INSERT INTO mail_headers (
-                    account_id, folder, uidvalidity, uid, remote_state
-                ) VALUES ('one', 'INBOX', 10, 12, 'active');
-                """
-                )
-        finally:
-            connection.close()
-        migrated = MailHeaderIndex(path)
-        migrated.initialize()
-        state = migrated.get_state("one", "INBOX")
-        self.assertEqual(state.history_before_uid, 12)
-        self.assertFalse(state.history_complete)
-
     def test_reconcile_hides_cloud_deleted_header(self):
         timestamp = datetime(2026, 7, 1).timestamp()
         result = self.index.apply_sync(
@@ -441,42 +400,6 @@ class MailHeaderIndexTests(unittest.TestCase):
         self.assertEqual(recovered.status, "failed")
         self.assertIn("不会自动重试", recovered.last_error)
         self.assertEqual(self.index.recover_interrupted_draft_sends(), 0)
-
-    def test_initialize_migrates_legacy_draft_schema_without_data_loss(self):
-        path = Path(self.temp_dir.name) / "legacy-drafts.db"
-        connection = sqlite3.connect(path)
-        try:
-            with connection:
-                connection.executescript(
-                    """
-                    CREATE TABLE mail_drafts (
-                        draft_id TEXT PRIMARY KEY, account_id TEXT NOT NULL,
-                        to_json TEXT NOT NULL DEFAULT '[]', cc_json TEXT NOT NULL DEFAULT '[]',
-                        bcc_json TEXT NOT NULL DEFAULT '[]', subject TEXT NOT NULL DEFAULT '',
-                        body_text TEXT NOT NULL DEFAULT '', body_html TEXT NOT NULL DEFAULT '',
-                        reply_folder TEXT NOT NULL DEFAULT '', reply_uid INTEGER,
-                        reply_message_id TEXT NOT NULL DEFAULT '', source TEXT NOT NULL DEFAULT 'user',
-                        status TEXT NOT NULL DEFAULT 'editing', revision INTEGER NOT NULL DEFAULT 1,
-                        created_at REAL NOT NULL, updated_at REAL NOT NULL, sent_at REAL,
-                        last_error TEXT NOT NULL DEFAULT ''
-                    );
-                    INSERT INTO mail_drafts (
-                        draft_id, account_id, to_json, subject, body_text, source,
-                        status, revision, created_at, updated_at
-                    ) VALUES ('legacy', 'one', '["reader@example.com"]', '旧主题',
-                              '旧正文', 'bot', 'pending_review', 3, 1, 2);
-                    """
-                )
-        finally:
-            connection.close()
-        migrated = MailHeaderIndex(path)
-        migrated.initialize()
-        draft = migrated.get_draft("legacy")
-        self.assertEqual(draft.subject, "旧主题")
-        self.assertEqual(draft.body_text, "旧正文")
-        self.assertEqual(draft.owner_umo, "")
-        self.assertEqual(draft.owner_sender_id, "")
-        self.assertEqual(draft.revision, 3)
 
     def test_header_page_uses_keyset_cursor_and_searches_sender_or_subject(self):
         timestamp = datetime(2026, 7, 1).timestamp()
