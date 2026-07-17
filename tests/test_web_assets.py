@@ -23,7 +23,12 @@ class WebAssetTests(unittest.TestCase):
         self.assertIn("html: false", renderer)
         self.assertIn("RETURN_DOM_FRAGMENT: true", renderer)
         self.assertIn("ALLOW_DATA_ATTR: false", renderer)
+        self.assertIn("normalizeMarkdownSource(source)", renderer)
+        self.assertIn(r"[^\n*]*?\S", renderer)
+        self.assertIn(r"[^\n*]*?[：:]", renderer)
         self.assertNotIn(".innerHTML", renderer)
+        self.assertIn('src="./app.js?v=2.2.3"', page)
+        self.assertIn('from "./markdown.js?v=2.2.3"', (PLUGIN_DIR / "pages/mailbox/app.js").read_text(encoding="utf-8"))
 
     def test_vendored_markdown_assets_match_locked_files(self):
         vendor = PLUGIN_DIR / "pages/mailbox/vendor"

@@ -224,7 +224,7 @@
       "mail_summary_prompt": {"type": "text", "description": "邮件总结提示词", "hint": "留空使用内置提示词。支持 {target_language}、{sender}、{date}、{subject}、{body}。", "default": ""},
       "mail_translation_prompt": {"type": "text", "description": "邮件翻译提示词", "hint": "留空使用内置提示词。支持 {target_language}、{sender}、{date}、{subject}、{body}。", "default": ""},
       "translation_language": {"type": "string", "description": "邮件翻译默认目标语言", "hint": "例如 简体中文、English、日本語。留空时使用 AstrBot WebUI 的界面语言。", "default": ""},
-      "webui_auto_show_cached_ai": {"type": "string", "description": "打开邮件时自动显示已有 AI 缓存", "hint": "只在对应缓存已经存在时显示，不会为了自动显示而调用 LLM。", "options": ["none", "summary", "translate"], "default": "none"},
+      "webui_auto_show_cached_ai": {"type": "string", "description": "打开邮件时自动显示已有 AI 缓存", "hint": "只在对应缓存已经存在时显示该任务的最新结果，不按默认目标语言筛选，也不会为了自动显示而调用 LLM。", "options": ["none", "summary", "translate"], "default": "none"},
       "mail_processing_body_max_chars": {"type": "int", "description": "总结/翻译读取正文最大字符数", "hint": "默认 12000，过长正文会截断后交给 LLM。", "default": 12000},
       "mail_processing_max_tokens": {"type": "int", "description": "总结/翻译最大输出 Token", "hint": "填 0 时不传递 max_tokens；正数范围 128 到 4000。", "default": 1200}
     }

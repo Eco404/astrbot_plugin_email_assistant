@@ -290,6 +290,7 @@ class MailHeaderIndex:
                 ON mail_drafts (account_id, status, updated_at DESC);
                 """
             )
+            self._prune_duplicate_ai_cache(connection)
             self._migrate_mail_drafts(connection)
             connection.executescript(
                 """
@@ -345,6 +346,37 @@ class MailHeaderIndex:
             os.chmod(self.path, 0o600)
         except OSError:
             pass
+
+    @staticmethod
+    def _prune_duplicate_ai_cache(connection: sqlite3.Connection) -> int:
+        """Keep only the newest summary and translation for each message."""
+        rows = connection.execute(
+            """
+            SELECT rowid, account_id, folder, uidvalidity, uid, task, created_at
+            FROM mail_ai_cache
+            ORDER BY created_at DESC, rowid DESC
+            """
+        ).fetchall()
+        seen: set[tuple[str, str, int, int, str]] = set()
+        stale_rowids: list[tuple[int]] = []
+        for row in rows:
+            task_family = str(row["task"]).split(":", 1)[0]
+            key = (
+                str(row["account_id"]),
+                str(row["folder"]),
+                int(row["uidvalidity"]),
+                int(row["uid"]),
+                task_family,
+            )
+            if key in seen:
+                stale_rowids.append((int(row["rowid"]),))
+            else:
+                seen.add(key)
+        if stale_rowids:
+            connection.executemany(
+                "DELETE FROM mail_ai_cache WHERE rowid = ?", stale_rowids
+            )
+        return len(stale_rowids)
 
     @staticmethod
     def _migrate_mail_drafts(connection: sqlite3.Connection) -> None:
@@ -952,7 +984,7 @@ class MailHeaderIndex:
         uid: int,
         content_hash: str,
         task: str,
-        target_language: str,
+        _target_language: str,
     ) -> CachedMailAIResult | None:
         now = time.time()
         key = (
@@ -962,14 +994,15 @@ class MailHeaderIndex:
             int(uid),
             str(content_hash),
             str(task),
-            str(target_language),
         )
         with self._connection() as connection:
             row = connection.execute(
                 """
                 SELECT * FROM mail_ai_cache
                 WHERE account_id = ? AND folder = ? AND uidvalidity = ? AND uid = ?
-                  AND content_hash = ? AND task = ? AND target_language = ?
+                  AND content_hash = ? AND task = ?
+                ORDER BY created_at DESC
+                LIMIT 1
                 """,
                 key,
             ).fetchone()
@@ -980,7 +1013,7 @@ class MailHeaderIndex:
                     WHERE account_id = ? AND folder = ? AND uidvalidity = ? AND uid = ?
                       AND content_hash = ? AND task = ? AND target_language = ?
                     """,
-                    (now, *key),
+                    (now, *key, str(row["target_language"])),
                 )
         if row is None:
             return None
@@ -1004,7 +1037,7 @@ class MailHeaderIndex:
         uidvalidity: int,
         uid: int,
         task: str,
-        target_language: str,
+        _target_language: str,
     ) -> CachedMailAIResult | None:
         """Return the current task cache without requiring a remote body hash.
 
@@ -1020,7 +1053,6 @@ class MailHeaderIndex:
             int(uidvalidity),
             int(uid),
             str(task),
-            str(target_language),
         )
         with self._connection() as connection:
             row = connection.execute(
@@ -1034,7 +1066,7 @@ class MailHeaderIndex:
                  AND headers.uid = cache.uid
                 WHERE cache.account_id = ? AND cache.folder = ?
                   AND cache.uidvalidity = ? AND cache.uid = ?
-                  AND cache.task = ? AND cache.target_language = ?
+                  AND cache.task = ?
                   AND headers.remote_state = 'active'
                 ORDER BY cache.created_at DESC
                 LIMIT 1
@@ -1057,7 +1089,7 @@ class MailHeaderIndex:
                         int(uid),
                         str(row["content_hash"]),
                         str(task),
-                        str(target_language),
+                        str(row["target_language"]),
                     ),
                 )
         if row is None:
@@ -1106,18 +1138,15 @@ class MailHeaderIndex:
                 """
                 DELETE FROM mail_ai_cache
                 WHERE account_id = ? AND folder = ? AND uidvalidity = ? AND uid = ?
-                  AND task LIKE ? AND target_language = ?
-                  AND (task != ? OR content_hash != ?)
+                  AND (task = ? OR task LIKE ?)
                 """,
                 (
                     account_id,
                     folder,
                     int(uidvalidity),
                     int(uid),
+                    str(task).split(":", 1)[0],
                     str(task).split(":", 1)[0] + ":%",
-                    str(target_language),
-                    str(task),
-                    str(content_hash),
                 ),
             )
             connection.execute(

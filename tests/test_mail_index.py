@@ -81,7 +81,7 @@ class MailHeaderIndexTests(unittest.TestCase):
             "remote_missing",
         )
 
-    def test_ai_cache_isolated_by_content_and_language(self):
+    def test_ai_cache_keeps_only_latest_result_per_task(self):
         timestamp = datetime(2026, 7, 1).timestamp()
         self.index.apply_sync("one", "INBOX", 10, 1, [mail(1, timestamp)])
         self.index.cache_ai_result(
@@ -100,10 +100,58 @@ class MailHeaderIndexTests(unittest.TestCase):
                 "one", "INBOX", 10, 1, "hash-b", "translate:v1", "简体中文"
             )
         )
-        self.assertIsNone(
-            self.index.get_ai_result(
-                "one", "INBOX", 10, 1, "hash-a", "translate:v1", "English"
+        cross_language_hit = self.index.get_ai_result(
+            "one", "INBOX", 10, 1, "hash-a", "translate:v1", "English"
+        )
+        self.assertEqual(cross_language_hit.result_text, "译文")
+        self.assertEqual(cross_language_hit.target_language, "简体中文")
+
+        self.index.cache_ai_result(
+            "one", "INBOX", 10, 1, "hash-a", "translate:v1",
+            "English", "latest translation", "provider",
+        )
+        latest = self.index.get_cached_ai_result_for_message(
+            "one", "INBOX", 10, 1, "translate:v1", "简体中文"
+        )
+        self.assertEqual(latest.result_text, "latest translation")
+        self.assertEqual(latest.target_language, "English")
+        with self.index._connection() as connection:
+            count = connection.execute(
+                """
+                SELECT COUNT(*) FROM mail_ai_cache
+                WHERE account_id = 'one' AND folder = 'INBOX'
+                  AND uidvalidity = 10 AND uid = 1 AND task LIKE 'translate:%'
+                """
+            ).fetchone()[0]
+        self.assertEqual(count, 1)
+
+        with self.index._connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO mail_ai_cache (
+                    account_id, folder, uidvalidity, uid, content_hash, task,
+                    target_language, result_text, provider_id,
+                    created_at, last_accessed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "one", "INBOX", 10, 1, "hash-a", "translate:v0",
+                    "Deutsch", "older legacy translation", "provider", 1.0, 1.0,
+                ),
             )
+        self.index.initialize()
+        with self.index._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT target_language, result_text FROM mail_ai_cache
+                WHERE account_id = 'one' AND folder = 'INBOX'
+                  AND uidvalidity = 10 AND uid = 1
+                  AND task LIKE 'translate:%'
+                """
+            ).fetchall()
+        self.assertEqual(
+            [(row["target_language"], row["result_text"]) for row in rows],
+            [("English", "latest translation")],
         )
 
         self.index.apply_sync(

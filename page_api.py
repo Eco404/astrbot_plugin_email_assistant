@@ -264,7 +264,7 @@ class EmailAssistantPageApi:
             return self._ok(
                 {
                     "plugin": {
-                        "version": "2.2.1",
+                        "version": "2.2.2",
                         "index_enabled": self.plugin._mail_index is not None,
                         "body_cache_mode": str(
                             config_get(self.plugin.config, "body_cache_mode") or "on_demand"
@@ -821,7 +821,9 @@ class EmailAssistantPageApi:
                     "content": cached.result_text if cached is not None else "",
                     "cached": cached is not None,
                     "task": task,
-                    "target_language": language,
+                    "target_language": (
+                        cached.target_language if cached is not None else language
+                    ),
                 }
             )
         except Exception as exc:
@@ -841,7 +843,7 @@ class EmailAssistantPageApi:
                 task, payload.get("locale"), payload.get("target_language")
             )
             force = payload.get("force") is True
-            lock_key = f"{self.plugin._account_key(account)}:{folder}:{uid}:{task}:{language}"
+            lock_key = f"{self.plugin._account_key(account)}:{folder}:{uid}:{task}"
             lock = self._ai_locks.setdefault(lock_key, asyncio.Lock())
             async with lock:
                 index = self._require_index()
@@ -864,7 +866,7 @@ class EmailAssistantPageApi:
                                 "content": cached.result_text,
                                 "cached": True,
                                 "task": task,
-                                "target_language": language,
+                                "target_language": cached.target_language,
                             }
                         )
                 mail = await self.plugin._fetch_remote_detail(account, uid, folder)
@@ -890,7 +892,7 @@ class EmailAssistantPageApi:
                             "content": cached.result_text,
                             "cached": True,
                             "task": task,
-                            "target_language": language,
+                            "target_language": cached.target_language,
                         }
                     )
                 result, provider_id = await self.plugin._process_mail_content(

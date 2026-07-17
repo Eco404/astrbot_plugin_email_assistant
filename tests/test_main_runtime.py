@@ -1273,7 +1273,7 @@ class MainRuntimeTests(unittest.IsolatedAsyncioTestCase):
         index.cache_ai_result(
             "one", "INBOX", 10, 9, mail_content_hash(message),
             self.plugin._mail_processing_cache_key("translate"),
-            "English", "stale cached result", "old-provider",
+            "简体中文", "旧中文缓存", "old-provider",
         )
         self.context.provider = FakeProvider("English result")
         api = EmailAssistantPageApi(self.plugin)
@@ -1286,19 +1286,28 @@ class MainRuntimeTests(unittest.IsolatedAsyncioTestCase):
             self.plugin, "_fetch_remote_detail", new=AsyncMock(return_value=message)
         ):
             result = await api.translate_message()
+            fake_request.payload = {
+                "account_id": "one", "folder": "INBOX", "uid": 9,
+                "locale": "zh-CN",
+            }
+            normal_click = await api.translate_message()
         self.assertEqual(result["status"], "ok")
         self.assertFalse(result["data"]["cached"])
         self.assertEqual(result["data"]["target_language"], "English")
+        self.assertTrue(normal_click["data"]["cached"])
+        self.assertEqual(normal_click["data"]["content"], "English result")
+        self.assertEqual(normal_click["data"]["target_language"], "English")
         self.assertEqual(len(self.context.provider.calls), 1)
 
         fake_request.query = {
             "account_id": "one", "folder": "INBOX", "uid": 9,
-            "locale": "zh-CN", "task": "translate", "target_language": "English",
+            "locale": "zh-CN", "task": "translate",
         }
         with patch.object(page_api_module, "request", fake_request):
             cached = await api.get_message_ai_cache()
         self.assertTrue(cached["data"]["available"])
         self.assertEqual(cached["data"]["content"], "English result")
+        self.assertEqual(cached["data"]["target_language"], "English")
 
     async def test_page_cached_detail_returns_before_separate_verification(self):
         index = self._enable_test_index()

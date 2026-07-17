@@ -1,4 +1,4 @@
-import { renderMarkdown } from "./markdown.js";
+import { renderMarkdown } from "./markdown.js?v=2.2.3";
 
 const state = {
   bridge: null,

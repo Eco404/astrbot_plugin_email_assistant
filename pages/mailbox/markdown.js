@@ -24,10 +24,24 @@ function plainTextFallback(root, source) {
   root.replaceChildren(paragraph);
 }
 
+export function normalizeMarkdownSource(source) {
+  // Some LLMs emit labels such as `**截止时间： **2026-06-28`.
+  // CommonMark does not allow whitespace immediately before a closing
+  // emphasis delimiter, so markdown-it correctly leaves the asterisks
+  // visible. Repair this narrow, common formatting mistake before parsing.
+  return String(source || "")
+    .replace(/\*\*([^\n*]*?\S)[\t ]+\*\*(?=\S)/g, "**$1** ")
+    .replace(/\*\*([^\n*]*?\S)[\t ]+\*\*/g, "**$1**")
+    // A bold label followed immediately by CJK text or a number is not a
+    // valid closing delimiter in CommonMark when the label ends in
+    // punctuation. Preserve the content and add the missing word boundary.
+    .replace(/\*\*([^\n*]*?[：:])\*\*(?=\S)/g, "**$1** ");
+}
+
 export function renderMarkdown(source) {
   const root = document.createElement("div");
   root.className = "markdown-body";
-  const text = String(source || "");
+  const text = normalizeMarkdownSource(source);
   if (!text) {
     plainTextFallback(root, "");
     return root;
