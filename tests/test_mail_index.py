@@ -91,6 +91,10 @@ class MailHeaderIndexTests(unittest.TestCase):
             "one", "INBOX", 10, 1, "hash-a", "translate:v1", "简体中文"
         )
         self.assertEqual(hit.result_text, "译文")
+        optimistic_hit = self.index.get_cached_ai_result_for_message(
+            "one", "INBOX", 10, 1, "translate:v1", "简体中文"
+        )
+        self.assertEqual(optimistic_hit.result_text, "译文")
         self.assertIsNone(
             self.index.get_ai_result(
                 "one", "INBOX", 10, 1, "hash-b", "translate:v1", "简体中文"
@@ -108,6 +112,11 @@ class MailHeaderIndexTests(unittest.TestCase):
         self.assertIsNone(
             self.index.get_ai_result(
                 "one", "INBOX", 10, 1, "hash-a", "translate:v1", "简体中文"
+            )
+        )
+        self.assertIsNone(
+            self.index.get_cached_ai_result_for_message(
+                "one", "INBOX", 10, 1, "translate:v1", "简体中文"
             )
         )
 

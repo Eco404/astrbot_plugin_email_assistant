@@ -432,6 +432,10 @@ class EmailAssistantPageApi:
                     "date_ts": mail.timestamp,
                     "body": body,
                     "body_truncated": len(body) < len(mail.body),
+                    "body_cached": bool(
+                        self.plugin._mail_index is not None
+                        and self.plugin._body_cache_enabled()
+                    ),
                     "has_attachments": mail.has_attachments,
                     "message_id": mail.message_id,
                 }
@@ -709,14 +713,34 @@ class EmailAssistantPageApi:
             lock_key = f"{self.plugin._account_key(account)}:{folder}:{uid}:{task}:{language}"
             lock = self._ai_locks.setdefault(lock_key, asyncio.Lock())
             async with lock:
-                mail = await self.plugin._fetch_remote_detail(account, uid, folder)
                 index = self._require_index()
                 account_id = self.plugin._account_key(account)
+                state = await asyncio.to_thread(index.get_state, account_id, folder)
+                task_key = self.plugin._mail_processing_cache_key(task)
+                if state is not None:
+                    cached = await asyncio.to_thread(
+                        index.get_cached_ai_result_for_message,
+                        account_id,
+                        folder,
+                        state.uidvalidity,
+                        uid,
+                        task_key,
+                        language,
+                    )
+                    if cached is not None:
+                        return self._ok(
+                            {
+                                "content": cached.result_text,
+                                "cached": True,
+                                "task": task,
+                                "target_language": language,
+                            }
+                        )
+                mail = await self.plugin._fetch_remote_detail(account, uid, folder)
                 state = await asyncio.to_thread(index.get_state, account_id, folder)
                 if state is None:
                     raise RuntimeError("邮件文件夹尚未完成索引。")
                 content_hash = mail_content_hash(mail)
-                task_key = self.plugin._mail_processing_cache_key(task)
                 cached = await asyncio.to_thread(
                     index.get_ai_result,
                     account_id,

@@ -58,7 +58,7 @@
 | Gmail | `imap.gmail.com:993` | `smtp.gmail.com:465` | `smtp.gmail.com:587` |
 | Outlook / Microsoft 365 | `outlook.office365.com:993` | — | `smtp.office365.com:587` |
 
-服务器设置可能调整，请以邮箱服务商当前文档为准。Gmail、Microsoft 365 等服务可能要求应用密码或 OAuth；v1 只支持用户名和应用密码认证，不支持 OAuth。
+服务器设置可能调整，请以邮箱服务商当前文档为准。当前版本只支持用户名和应用密码认证，不支持 OAuth。
 
 ## 命令
 
@@ -88,7 +88,7 @@
 /email reply personal_qq 1288 已收到，谢谢。
 ```
 
-`/email test` 只登录并执行协议级 NOOP，不会发送测试邮件。v1 不支持附件、抄送、密送或附件下载。
+`/email test` 只登录并执行协议级 NOOP，不会发送测试邮件。当前版本不支持附件、抄送、密送或附件下载。
 
 ## 新邮件通知
 

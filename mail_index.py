@@ -997,6 +997,84 @@ class MailHeaderIndex:
             created_at=float(row["created_at"]),
         )
 
+    def get_cached_ai_result_for_message(
+        self,
+        account_id: str,
+        folder: str,
+        uidvalidity: int,
+        uid: int,
+        task: str,
+        target_language: str,
+    ) -> CachedMailAIResult | None:
+        """Return the current task cache without requiring a remote body hash.
+
+        Header/body verification paths purge stale cache entries. This lookup is
+        intentionally optimistic so the WebUI can display an existing result
+        without waiting for IMAP; cached message views verify the cloud copy in
+        parallel.
+        """
+        now = time.time()
+        key = (
+            account_id,
+            folder,
+            int(uidvalidity),
+            int(uid),
+            str(task),
+            str(target_language),
+        )
+        with self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT cache.*
+                FROM mail_ai_cache AS cache
+                INNER JOIN mail_headers AS headers
+                  ON headers.account_id = cache.account_id
+                 AND headers.folder = cache.folder
+                 AND headers.uidvalidity = cache.uidvalidity
+                 AND headers.uid = cache.uid
+                WHERE cache.account_id = ? AND cache.folder = ?
+                  AND cache.uidvalidity = ? AND cache.uid = ?
+                  AND cache.task = ? AND cache.target_language = ?
+                  AND headers.remote_state = 'active'
+                ORDER BY cache.created_at DESC
+                LIMIT 1
+                """,
+                key,
+            ).fetchone()
+            if row is not None:
+                connection.execute(
+                    """
+                    UPDATE mail_ai_cache SET last_accessed_at = ?
+                    WHERE account_id = ? AND folder = ? AND uidvalidity = ?
+                      AND uid = ? AND content_hash = ? AND task = ?
+                      AND target_language = ?
+                    """,
+                    (
+                        now,
+                        account_id,
+                        folder,
+                        int(uidvalidity),
+                        int(uid),
+                        str(row["content_hash"]),
+                        str(task),
+                        str(target_language),
+                    ),
+                )
+        if row is None:
+            return None
+        return CachedMailAIResult(
+            account_id=str(row["account_id"]),
+            folder=str(row["folder"]),
+            uidvalidity=int(row["uidvalidity"]),
+            uid=int(row["uid"]),
+            content_hash=str(row["content_hash"]),
+            task=str(row["task"]),
+            target_language=str(row["target_language"]),
+            result_text=str(row["result_text"]),
+            provider_id=str(row["provider_id"]),
+            created_at=float(row["created_at"]),
+        )
+
     def cache_ai_result(
         self,
         account_id: str,

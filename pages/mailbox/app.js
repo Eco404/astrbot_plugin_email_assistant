@@ -327,6 +327,8 @@ function renderMessageList() {
 }
 
 async function openMessage(uid) {
+  const accountId = state.accountId;
+  const folder = state.folder;
   state.selectedUid = uid;
   renderMessageList();
   elements.messageDetail.className = "detail-panel";
@@ -334,11 +336,15 @@ async function openMessage(uid) {
   if (indexed?.body_cached) {
     try {
       const cached = await apiGet("message/cached", {
-        account_id: state.accountId,
-        folder: state.folder,
+        account_id: accountId,
+        folder,
         uid,
       });
-      if (state.selectedUid !== uid) return;
+      if (
+        state.accountId !== accountId
+        || state.folder !== folder
+        || state.selectedUid !== uid
+      ) return;
       renderMessageDetail(cached);
       void verifyCachedMessage(cached);
       return;
@@ -348,9 +354,18 @@ async function openMessage(uid) {
   }
   elements.messageDetail.replaceChildren(emptyNode("正在从云端读取正文…", "loading"));
   try {
-    const message = await apiGet("message", { account_id: state.accountId, folder: state.folder, uid });
+    const message = await apiGet("message", { account_id: accountId, folder, uid });
+    if (state.accountId !== accountId || state.folder !== folder) return;
+    const current = state.messages.find((item) => item.uid === uid);
+    if (current && message.body_cached) {
+      current.body_cached = true;
+      current.body_truncated = Boolean(message.body_truncated);
+      renderMessageList();
+    }
+    if (state.selectedUid !== uid) return;
     renderMessageDetail(message);
   } catch (error) {
+    if (state.selectedUid !== uid) return;
     elements.messageDetail.className = "detail-panel empty-state";
     elements.messageDetail.replaceChildren(emptyNode(error.message));
     toast(error.message, true);
@@ -365,6 +380,10 @@ async function verifyCachedMessage(message) {
       folder: message.folder,
       uid: message.uid,
     });
+    if (
+      state.accountId !== message.account_id
+      || state.folder !== message.folder
+    ) return;
     const indexed = state.messages.find((item) => item.uid === message.uid);
     if (indexed) indexed.verificationStatus = result.verification_status;
     renderMessageList();

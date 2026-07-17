@@ -1249,8 +1249,9 @@ class MainRuntimeTests(unittest.IsolatedAsyncioTestCase):
             "uid": 8,
             "locale": "zh-CN",
         }
+        remote_detail = AsyncMock(return_value=message)
         with patch.object(page_api_module, "request", fake_request), patch.object(
-            self.plugin, "_fetch_remote_detail", return_value=message
+            self.plugin, "_fetch_remote_detail", new=remote_detail
         ):
             first = await api.translate_message()
             second = await api.translate_message()
@@ -1259,6 +1260,7 @@ class MainRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(second["data"]["cached"])
         self.assertEqual(second["data"]["content"], "翻译结果")
         self.assertEqual(len(self.context.provider.calls), 1)
+        remote_detail.assert_awaited_once()
 
     async def test_page_cached_detail_returns_before_separate_verification(self):
         index = self._enable_test_index()

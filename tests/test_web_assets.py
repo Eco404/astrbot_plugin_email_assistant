@@ -39,6 +39,11 @@ class WebAssetTests(unittest.TestCase):
         self.assertTrue((vendor / "dompurify/LICENSE-APACHE-2.0").is_file())
         self.assertTrue((vendor / "dompurify/LICENSE-MPL-2.0").is_file())
 
+    def test_remote_body_read_updates_current_page_cache_state(self):
+        app = (PLUGIN_DIR / "pages/mailbox/app.js").read_text(encoding="utf-8")
+        self.assertIn("current.body_cached = true", app)
+        self.assertIn("if (state.selectedUid !== uid) return", app)
+
 
 if __name__ == "__main__":
     unittest.main()
