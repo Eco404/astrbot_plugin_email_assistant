@@ -294,6 +294,7 @@ class MainRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 },
                 "notification_settings": {},
                 "llm_write_settings": {},
+                "mail_ai_settings": {},
                 "webui_settings": {},
                 "storage_settings": {},
             },
@@ -488,7 +489,7 @@ class MainRuntimeTests(unittest.IsolatedAsyncioTestCase):
             await self.plugin._send_mail_notification(self.account, parsed())
 
     async def test_mail_summary_does_not_load_persona(self):
-        self.plugin.config["webui_settings"]["mail_processing_max_tokens"] = 0
+        self.plugin.config["mail_ai_settings"]["mail_processing_max_tokens"] = 0
         self.context.provider = FakeProvider("简短总结")
         self.context.persona_manager = FakePersonaManager()
         result, _ = await self.plugin._process_mail_content(
@@ -509,7 +510,7 @@ class MainRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("max_tokens", call)
 
         default_key = self.plugin._mail_processing_cache_key("summary")
-        self.plugin.config["webui_settings"]["mail_summary_prompt"] = (
+        self.plugin.config["mail_ai_settings"]["mail_summary_prompt"] = (
             "自定义总结 {subject}：{body}"
         )
         self.assertNotEqual(
@@ -657,6 +658,99 @@ class MainRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result["success"])
         self.assertTrue(result["message"]["body_truncated"])
         self.assertLessEqual(len(result["message"]["body"]), 201)
+
+    async def test_llm_summary_tool_generates_and_reuses_cache_and_body(self):
+        index = self._enable_test_index()
+        timestamp = datetime(2026, 7, 16, 10, 0).timestamp()
+        message = ParsedMail(
+            31,
+            "待总结邮件",
+            "Sender",
+            "sender@example.com",
+            "sender@example.com",
+            "2026-07-16 10:00:00",
+            timestamp,
+            "需要缓存的正文",
+            False,
+            "<message-31@example.com>",
+            "",
+        )
+        index.apply_sync("one", "INBOX", 10, 31, [message])
+        self.context.provider = FakeProvider("总结缓存结果")
+        event = FakeEvent("1", "p:FriendMessage:1")
+        with patch(
+            "astrbot_plugin_email_assistant.main.fetch_detail_checked",
+            return_value=(10, message),
+        ) as fetch:
+            generated = json.loads(
+                await self.plugin.tool_summarize_message(event, 31, account="one")
+            )
+            cached = json.loads(
+                await self.plugin.tool_summarize_message(event, 31, account="one")
+            )
+        self.assertTrue(generated["success"])
+        self.assertFalse(generated["cached"])
+        self.assertEqual(generated["content"], "总结缓存结果")
+        self.assertTrue(cached["cached"])
+        self.assertEqual(cached["content"], "总结缓存结果")
+        self.assertEqual(len(self.context.provider.calls), 1)
+        fetch.assert_called_once()
+        cached_body = index.get_cached_body("one", "INBOX", 10, 31)
+        self.assertIsNotNone(cached_body)
+        self.assertEqual(cached_body.body_text, "需要缓存的正文")
+
+    async def test_llm_translation_tool_replaces_different_language_cache(self):
+        index = self._enable_test_index()
+        timestamp = datetime(2026, 7, 16, 10, 0).timestamp()
+        message = ParsedMail(
+            32,
+            "待翻译邮件",
+            "Sender",
+            "sender@example.com",
+            "sender@example.com",
+            "2026-07-16 10:00:00",
+            timestamp,
+            "Mail body",
+            False,
+            "<message-32@example.com>",
+            "",
+        )
+        index.apply_sync("one", "INBOX", 10, 32, [message])
+        index.cache_ai_result(
+            "one",
+            "INBOX",
+            10,
+            32,
+            mail_content_hash(message),
+            self.plugin._mail_processing_cache_key("translate"),
+            "简体中文",
+            "旧中文译文",
+            "old-provider",
+        )
+        self.context.provider = FakeProvider("English translation")
+        event = FakeEvent("1", "p:FriendMessage:1")
+        remote = AsyncMock(return_value=message)
+        with patch.object(self.plugin, "_fetch_remote_detail", new=remote):
+            translated = json.loads(
+                await self.plugin.tool_translate_message(
+                    event,
+                    32,
+                    account="one",
+                    target_language="English",
+                )
+            )
+            latest = json.loads(
+                await self.plugin.tool_translate_message(event, 32, account="one")
+            )
+        self.assertTrue(translated["success"])
+        self.assertFalse(translated["cached"])
+        self.assertEqual(translated["target_language"], "English")
+        self.assertEqual(translated["content"], "English translation")
+        self.assertTrue(latest["cached"])
+        self.assertEqual(latest["target_language"], "English")
+        self.assertEqual(latest["content"], "English translation")
+        self.assertEqual(len(self.context.provider.calls), 1)
+        remote.assert_awaited_once()
 
     async def test_llm_tool_gets_latest_message_in_one_operation(self):
         event = FakeEvent("1", "p:FriendMessage:1")

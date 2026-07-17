@@ -19,7 +19,7 @@ from .imap_client import (
     create_folder as imap_create_folder,
     transfer_message,
 )
-from .mail_index import IndexedMailHeader, MailDraft, mail_content_hash
+from .mail_index import IndexedMailHeader, MailDraft
 from .smtp_client import build_draft_message
 
 try:  # AstrBot's current Plugin Pages request facade.
@@ -50,7 +50,6 @@ class EmailAssistantPageApi:
     def __init__(self, plugin: Any) -> None:
         self.plugin = plugin
         self._draft_send_locks = plugin._draft_service.locks
-        self._ai_locks: dict[str, asyncio.Lock] = {}
         self._detail_tasks: dict[str, asyncio.Task] = {}
         self._verification_cache: dict[str, tuple[float, dict[str, Any]]] = {}
 
@@ -855,85 +854,16 @@ class EmailAssistantPageApi:
             language = self._processing_language(
                 task, payload.get("locale"), payload.get("target_language")
             )
-            force = payload.get("force") is True
-            lock_key = f"{self.plugin._account_key(account)}:{folder}:{uid}:{task}"
-            lock = self._ai_locks.setdefault(lock_key, asyncio.Lock())
-            async with lock:
-                index = self._require_index()
-                account_id = self.plugin._account_key(account)
-                state = await asyncio.to_thread(index.get_state, account_id, folder)
-                task_key = self.plugin._mail_processing_cache_key(task)
-                if state is not None and not force:
-                    cached = await asyncio.to_thread(
-                        index.get_cached_ai_result_for_message,
-                        account_id,
-                        folder,
-                        state.uidvalidity,
-                        uid,
-                        task_key,
-                        language,
-                    )
-                    if cached is not None:
-                        return self._ok(
-                            {
-                                "content": cached.result_text,
-                                "cached": True,
-                                "task": task,
-                                "target_language": cached.target_language,
-                            }
-                        )
-                mail = await self.plugin._fetch_remote_detail(account, uid, folder)
-                state = await asyncio.to_thread(index.get_state, account_id, folder)
-                if state is None:
-                    raise RuntimeError("邮件文件夹尚未完成索引。")
-                content_hash = mail_content_hash(mail)
-                cached = None
-                if not force:
-                    cached = await asyncio.to_thread(
-                        index.get_ai_result,
-                        account_id,
-                        folder,
-                        state.uidvalidity,
-                        uid,
-                        content_hash,
-                        task_key,
-                        language,
-                    )
-                if cached is not None:
-                    return self._ok(
-                        {
-                            "content": cached.result_text,
-                            "cached": True,
-                            "task": task,
-                            "target_language": cached.target_language,
-                        }
-                    )
-                result, provider_id = await self.plugin._process_mail_content(
-                    account,
-                    mail,
-                    task=task,
-                    target_language=language,
-                )
-                await asyncio.to_thread(
-                    index.cache_ai_result,
-                    account_id,
-                    folder,
-                    state.uidvalidity,
-                    uid,
-                    content_hash,
-                    task_key,
-                    language,
-                    result,
-                    provider_id,
-                )
-                return self._ok(
-                    {
-                        "content": result,
-                        "cached": False,
-                        "task": task,
-                        "target_language": language,
-                    }
-                )
+            result = await self.plugin._process_mail_with_cache(
+                account,
+                uid,
+                task=task,
+                target_language=language,
+                folder=folder,
+                force=payload.get("force") is True,
+            )
+            result.pop("provider_id", None)
+            return self._ok(result)
         except Exception as exc:
             return self._error(exc)
 

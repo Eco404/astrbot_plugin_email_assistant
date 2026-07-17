@@ -90,7 +90,7 @@ def _one_line(value: Any, limit: int = 160) -> str:
     PLUGIN_NAME,
     "econeco",
     "支持多账户 IMAP 收信通知、LLM 安全草稿与查询、SMTP 收发和邮件中心 WebUI 的邮件助手",
-    "2.2.5",
+    "2.3.0",
 )
 class EmailAssistantPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig) -> None:
@@ -100,6 +100,7 @@ class EmailAssistantPlugin(Star):
         self._stop_event = asyncio.Event()
         self._poll_task: asyncio.Task | None = None
         self._account_locks: dict[str, asyncio.Lock] = {}
+        self._mail_processing_locks: dict[str, asyncio.Lock] = {}
         self._status: dict[str, dict[str, Any]] = {}
         self._index_warnings: dict[str, str] = {}
         self.data_dir = None
@@ -1104,6 +1105,125 @@ class EmailAssistantPlugin(Star):
         )
         return text, provider_label
 
+    @staticmethod
+    def _mail_processing_language_matches(cached_language: str, wanted: str) -> bool:
+        return str(cached_language or "").strip().casefold() == str(
+            wanted or ""
+        ).strip().casefold()
+
+    async def _process_mail_with_cache(
+        self,
+        account: dict[str, Any],
+        uid: int,
+        *,
+        task: str,
+        target_language: str,
+        folder: str | None = None,
+        force: bool = False,
+        require_language_match: bool = False,
+    ) -> dict[str, Any]:
+        """Return a cached mail AI result or generate and persist a new one."""
+        if task not in {"summary", "translate"}:
+            raise ValueError("不支持的邮件处理任务。")
+        normalized_uid = int(uid)
+        if normalized_uid <= 0:
+            raise ValueError("邮件 UID 必须是正整数。")
+        index = self._mail_index
+        if index is None:
+            raise RuntimeError("本地邮件索引未启用，无法缓存邮件总结或翻译。")
+        effective_folder = str(folder or self._folder(account)).strip() or "INBOX"
+        language = str(target_language or "").strip() or "与用户当前对话相同的语言"
+        account_id = self._account_key(account)
+        lock_key = f"{account_id}:{effective_folder}:{normalized_uid}:{task}"
+        lock = self._mail_processing_locks.setdefault(lock_key, asyncio.Lock())
+
+        def usable(cached: Any) -> bool:
+            return cached is not None and (
+                not require_language_match
+                or self._mail_processing_language_matches(
+                    cached.target_language, language
+                )
+            )
+
+        async with lock:
+            state = await asyncio.to_thread(
+                index.get_state, account_id, effective_folder
+            )
+            task_key = self._mail_processing_cache_key(task)
+            if state is not None and not force:
+                cached = await asyncio.to_thread(
+                    index.get_cached_ai_result_for_message,
+                    account_id,
+                    effective_folder,
+                    state.uidvalidity,
+                    normalized_uid,
+                    task_key,
+                    language,
+                )
+                if usable(cached):
+                    return {
+                        "content": cached.result_text,
+                        "cached": True,
+                        "task": task,
+                        "target_language": cached.target_language,
+                        "provider_id": cached.provider_id,
+                    }
+
+            mail = await self._fetch_remote_detail(
+                account, normalized_uid, effective_folder
+            )
+            state = await asyncio.to_thread(
+                index.get_state, account_id, effective_folder
+            )
+            if state is None:
+                raise RuntimeError("邮件文件夹尚未完成索引。")
+            content_hash = mail_content_hash(mail)
+            if not force:
+                cached = await asyncio.to_thread(
+                    index.get_ai_result,
+                    account_id,
+                    effective_folder,
+                    state.uidvalidity,
+                    normalized_uid,
+                    content_hash,
+                    task_key,
+                    language,
+                )
+                if usable(cached):
+                    return {
+                        "content": cached.result_text,
+                        "cached": True,
+                        "task": task,
+                        "target_language": cached.target_language,
+                        "provider_id": cached.provider_id,
+                    }
+
+            result, provider_id = await self._process_mail_content(
+                account,
+                mail,
+                task=task,
+                target_language=language,
+            )
+            await asyncio.to_thread(
+                index.cache_ai_result,
+                account_id,
+                effective_folder,
+                state.uidvalidity,
+                normalized_uid,
+                content_hash,
+                task_key,
+                language,
+                result,
+                provider_id,
+            )
+            return {
+                "content": result,
+                "cached": False,
+                "task": task,
+                "target_language": language,
+                "provider_id": provider_id,
+            }
+
     async def _archive_narration(self, owner_umo: str, narration: str) -> None:
         conv_manager = getattr(self.context, "conversation_manager", None)
         if conv_manager is None:
@@ -1667,6 +1787,117 @@ class EmailAssistantPlugin(Star):
             self._mail_detail_result(selected, mail),
             ensure_ascii=False,
             separators=(",", ":"),
+        )
+
+    async def _tool_process_mail(
+        self,
+        event: AstrMessageEvent,
+        uid: int,
+        *,
+        task: str,
+        account: str,
+        target_language: str,
+        force: bool,
+    ) -> str:
+        selected, error = self._resolve_query_tool_account(event, account)
+        if selected is None:
+            return self._tool_result(False, error=error)
+        if self._mail_index is None:
+            return self._tool_result(
+                False,
+                error="本地邮件索引未启用，无法使用可缓存的邮件总结或翻译工具。",
+            )
+        try:
+            normalized_uid = int(uid)
+        except (TypeError, ValueError):
+            normalized_uid = 0
+        if normalized_uid <= 0:
+            return self._tool_result(False, error="uid 必须是正整数。")
+        requested_language = _one_line(target_language, 80)
+        language = requested_language or _one_line(
+            config_get(self.config, "translation_language"), 80
+        )
+        language = language or "与用户当前对话相同的语言"
+        try:
+            result = await self._process_mail_with_cache(
+                selected,
+                normalized_uid,
+                task=task,
+                target_language=language,
+                force=force is True,
+                require_language_match=bool(requested_language),
+            )
+        except Exception as exc:
+            operation_name = "总结" if task == "summary" else "翻译"
+            logger.warning(
+                "[EmailAssistant] LLM 邮件%s工具失败 account=%s uid=%s error=%s",
+                operation_name,
+                self._account_key(selected),
+                normalized_uid,
+                _one_line(exc, 180),
+            )
+            return self._tool_result(
+                False,
+                error=f"邮件{operation_name}失败：{_one_line(exc)}",
+            )
+        self._log_mail_operation(
+            f"llm_{task}",
+            selected,
+            uid=normalized_uid,
+            detail=f"cached={str(bool(result['cached'])).lower()}",
+        )
+        return self._tool_result(
+            True,
+            account_id=self._account_key(selected),
+            folder=self._folder(selected),
+            uid=normalized_uid,
+            task=task,
+            target_language=result["target_language"],
+            content=result["content"],
+            cached=bool(result["cached"]),
+            usage_hint="直接向用户呈现 content，不要重新读取邮件或再次自行总结。",
+        )
+
+    @_email_llm_tool(
+        "email_assistant_summarize_message",
+        "tool_summarize_message_description",
+    )
+    async def tool_summarize_message(
+        self,
+        event: AstrMessageEvent,
+        uid: int,
+        account: str = "",
+        target_language: str = "",
+        force: bool = False,
+    ) -> str:
+        return await self._tool_process_mail(
+            event,
+            uid,
+            task="summary",
+            account=account,
+            target_language=target_language,
+            force=force,
+        )
+
+    @_email_llm_tool(
+        "email_assistant_translate_message",
+        "tool_translate_message_description",
+    )
+    async def tool_translate_message(
+        self,
+        event: AstrMessageEvent,
+        uid: int,
+        account: str = "",
+        target_language: str = "",
+        force: bool = False,
+    ) -> str:
+        return await self._tool_process_mail(
+            event,
+            uid,
+            task="translate",
+            account=account,
+            target_language=target_language,
+            force=force,
         )
 
     @_email_llm_tool(

@@ -15,6 +15,8 @@ REQUIRED_PROMPTS = {
     "tool_list_messages_description",
     "tool_get_latest_message_description",
     "tool_show_message_description",
+    "tool_summarize_message_description",
+    "tool_translate_message_description",
     "tool_create_draft_description",
     "tool_create_reply_draft_description",
     "tool_confirm_send_description",

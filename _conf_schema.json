@@ -191,7 +191,7 @@
     "items": {
       "notification_mode": {"type": "string", "description": "新邮件通知模式", "hint": "title 模式不调用 LLM 仅通知邮件标题。llm 模式会读取当前 AstrBot 人格后生成邮件转述，不会触发其他插件的 LLM 请求/响应处理。cron 模式使用官方定时任务创建一个很近的一次性主动 Agent 任务，进入完整 AstrBot Agent 与插件事件链，可能受到其他插件的注入、审核或协同处理影响。", "options": ["title", "llm", "cron"], "default": "title"},
       "narration_provider_id": {"type": "string", "description": "邮件转述模型", "hint": "仅用于 llm 模式。留空时使用目标私聊会话当前生效的模型；官方定时任务仍使用该会话的主 Agent 模型。", "_special": "select_provider", "default": ""},
-      "llm_write_official_history": {"type": "bool", "description": "LLM 转述写入官方对话历史", "hint": "仅在通知模式为 llm 时生效。发送成功后在对话历史总写入“邮件主动承接占位 + 实际转述”。", "default": false},
+      "llm_write_official_history": {"type": "bool", "description": "LLM 转述写入官方对话历史", "hint": "仅在通知模式为 llm 时生效。发送成功后在对话历史中写入“邮件主动承接占位 + 实际转述”。", "default": false},
       "narration_prompt": {"type": "text", "description": "邮件转述提示词", "hint": "留空时使用内置提示词。支持 {account_name}、{sender}、{date}、{subject}、{has_attachments}、{body}、{uid}。", "default": ""},
       "narration_body_max_chars": {"type": "int", "description": "转述模型输入的正文最大字符数", "hint": "默认 5000，只作用于新邮件转述。", "default": 5000},
       "narration_max_tokens": {"type": "int", "description": "llm 模式转述最大输出 Token", "hint": "填 0 时不传递 max_tokens；正数只限制 llm 模式转述输出。", "default": 500},
@@ -208,19 +208,26 @@
       "llm_draft_body_max_chars": {"type": "int", "description": "LLM 创建草稿正文最大字符数", "hint": "运行时限制为 200 到 100000 字符。", "default": 20000}
     }
   },
+  "mail_ai_settings": {
+    "type": "object",
+    "description": "邮件总结与翻译",
+    "hint": "同时作用于邮件中心 WebUI 和 Bot 的邮件总结/翻译工具，不带入聊天人格。",
+    "items": {
+      "mail_processing_provider_id": {"type": "string", "description": "邮件总结与翻译模型", "hint": "留空时使用邮箱绑定私聊当前生效的模型。", "_special": "select_provider", "default": ""},
+      "mail_summary_prompt": {"type": "text", "description": "邮件总结提示词", "hint": "留空使用内置提示词。支持 {target_language}、{sender}、{date}、{subject}、{body}。", "default": ""},
+      "mail_translation_prompt": {"type": "text", "description": "邮件翻译提示词", "hint": "留空使用内置提示词。支持 {target_language}、{sender}、{date}、{subject}、{body}。", "default": ""},
+      "translation_language": {"type": "string", "description": "默认目标语言", "hint": "例如 简体中文、English、日本語。留空时 WebUI 使用界面语言，Bot 工具使用当前对话语言。已有缓存且未明确指定语言时优先返回最新缓存。", "default": ""},
+      "mail_processing_body_max_chars": {"type": "int", "description": "总结/翻译读取正文最大字符数", "hint": "默认 12000，过长正文会截断后交给 LLM。", "default": 12000},
+      "mail_processing_max_tokens": {"type": "int", "description": "总结/翻译最大输出 Token", "hint": "填 0 时不传递 max_tokens；正数范围 128 到 4000。", "default": 1200}
+    }
+  },
   "webui_settings": {
     "type": "object",
     "description": "邮件中心 WebUI",
-    "hint": "只控制邮件中心页面的正文显示、总结和翻译；不会改变新邮件主动转述。",
+    "hint": "只控制邮件中心页面行为；总结和翻译模型设置位于“邮件总结与翻译”。",
     "items": {
-      "mail_processing_provider_id": {"type": "string", "description": "邮件总结与翻译模型", "hint": "总结和翻译不会带入人格。留空时使用邮箱绑定私聊当前生效的模型。", "_special": "select_provider", "default": ""},
-      "mail_summary_prompt": {"type": "text", "description": "邮件总结提示词", "hint": "留空使用内置提示词。支持 {target_language}、{sender}、{date}、{subject}、{body}。", "default": ""},
-      "mail_translation_prompt": {"type": "text", "description": "邮件翻译提示词", "hint": "留空使用内置提示词。支持 {target_language}、{sender}、{date}、{subject}、{body}。", "default": ""},
-      "translation_language": {"type": "string", "description": "邮件翻译默认目标语言", "hint": "例如 简体中文、English、日本語。留空时使用 AstrBot WebUI 的界面语言。", "default": ""},
       "webui_auto_show_cached_ai": {"type": "string", "description": "打开邮件时自动显示已有 AI 缓存", "hint": "打开邮件时，如果已有对应缓存则显示之前缓存的结果（如总结或翻译）。", "options": ["none", "summary", "translate"], "default": "none"},
-      "mail_verification_cooldown_minutes": {"type": "int", "description": "邮件云端校验冷却（分钟）", "hint": "同一邮件确认未变化后，在冷却期内切换回来会复用校验结果，避免频繁连接 IMAP。默认 5 分钟，范围 1 到 1440 分钟；发现邮件变化或删除时不会缓存为正常结果。", "default": 5},
-      "mail_processing_body_max_chars": {"type": "int", "description": "总结/翻译读取正文最大字符数", "hint": "默认 12000，过长正文会截断后交给 LLM。", "default": 12000},
-      "mail_processing_max_tokens": {"type": "int", "description": "总结/翻译最大输出 Token", "hint": "填 0 时不传递 max_tokens；正数范围 128 到 4000。", "default": 1200}
+      "mail_verification_cooldown_minutes": {"type": "int", "description": "邮件云端校验冷却（分钟）", "hint": "同一邮件确认未变化后，在冷却期内切换回来会复用校验结果，避免频繁连接 IMAP。默认 5 分钟，范围 1 到 1440 分钟；发现邮件变化或删除时不会缓存为正常结果。", "default": 5}
     }
   },
   "storage_settings": {

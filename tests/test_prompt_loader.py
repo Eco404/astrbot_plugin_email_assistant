@@ -35,9 +35,10 @@ class PromptLoaderTests(unittest.TestCase):
             schema["notification_settings"]["items"]["narration_prompt"]["default"],
             "",
         )
+        mail_ai = schema["mail_ai_settings"]["items"]
+        self.assertEqual(mail_ai["mail_summary_prompt"]["default"], "")
+        self.assertEqual(mail_ai["mail_translation_prompt"]["default"], "")
         webui = schema["webui_settings"]["items"]
-        self.assertEqual(webui["mail_summary_prompt"]["default"], "")
-        self.assertEqual(webui["mail_translation_prompt"]["default"], "")
         self.assertEqual(
             webui["mail_verification_cooldown_minutes"]["default"], 5
         )
