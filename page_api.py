@@ -12,6 +12,7 @@ from typing import Any
 
 from astrbot.api import logger
 
+from .config_utils import config_get
 from .imap_client import (
     MailFolder,
     MailNotFoundError,
@@ -66,6 +67,7 @@ class EmailAssistantPageApi:
             ("/messages/move", self.move_message, ["POST"], "Email Assistant move message"),
             ("/message/summary", self.summarize_message, ["POST"], "Email Assistant summarize message"),
             ("/message/translate", self.translate_message, ["POST"], "Email Assistant translate message"),
+            ("/message/ai-cache", self.get_message_ai_cache, ["GET"], "Email Assistant cached AI result"),
             ("/sync", self.sync_accounts, ["POST"], "Email Assistant index sync"),
             ("/drafts", self.list_drafts, ["GET"], "Email Assistant drafts"),
             ("/draft", self.get_draft, ["GET"], "Email Assistant draft detail"),
@@ -202,11 +204,12 @@ class EmailAssistantPageApi:
             return self._ok(
                 {
                     "plugin": {
-                        "version": "2.0.0",
+                        "version": "2.2.0",
                         "index_enabled": self.plugin._mail_index is not None,
                         "body_cache_mode": str(
-                            self.plugin.config.get("body_cache_mode") or "on_demand"
+                            config_get(self.plugin.config, "body_cache_mode") or "on_demand"
                         ),
+                        "webui_auto_show_cached_ai": self._auto_show_cached_ai(),
                     },
                     "accounts": accounts,
                 }
@@ -413,7 +416,7 @@ class EmailAssistantPageApi:
             self.plugin._log_mail_operation("web_show", account, uid=uid)
             mail = await self.plugin._fetch_remote_detail(account, uid, folder)
             body_limit = self._int(
-                self.plugin.config.get("detail_body_max_chars"),
+                config_get(self.plugin.config, "detail_body_max_chars"),
                 4000,
                 200,
                 12000,
@@ -465,7 +468,7 @@ class EmailAssistantPageApi:
             if header is None or cached is None:
                 raise KeyError("这封邮件没有可用的本地正文缓存。")
             body_limit = self._int(
-                self.plugin.config.get("detail_body_max_chars"),
+                config_get(self.plugin.config, "detail_body_max_chars"),
                 4000,
                 200,
                 12000,
@@ -691,6 +694,70 @@ class EmailAssistantPageApi:
         }
         return mappings.get(locale, locale or "简体中文")
 
+    def _auto_show_cached_ai(self) -> str:
+        value = _one_line(
+            config_get(self.plugin.config, "webui_auto_show_cached_ai") or "none",
+            20,
+        ).lower()
+        return value if value in {"none", "summary", "translate"} else "none"
+
+    def _processing_language(
+        self, task: str, locale: Any, requested_language: Any = None
+    ) -> str:
+        requested = _one_line(requested_language, 80)
+        if requested:
+            return requested
+        interface_language = self._locale_language(locale)
+        if task == "translate":
+            configured = _one_line(
+                config_get(self.plugin.config, "translation_language"), 80
+            )
+            return configured or interface_language
+        return interface_language
+
+    async def get_message_ai_cache(self) -> dict[str, Any]:
+        """Return an existing summary/translation without generating one."""
+        try:
+            query = self._query()
+            task = _one_line(query.get("task"), 20).lower()
+            if task not in {"summary", "translate"}:
+                raise ValueError("缓存类型必须是 summary 或 translate。")
+            account = self._resolve_account(
+                query.get("account_id"), capability="query_enabled"
+            )
+            folder = await self._folder(account, query.get("folder"))
+            uid = self._int(query.get("uid"), 0, 0, 2_147_483_647)
+            if uid <= 0:
+                raise ValueError("邮件 UID 必须是正整数。")
+            language = self._processing_language(
+                task, query.get("locale"), query.get("target_language")
+            )
+            index = self._require_index()
+            account_id = self.plugin._account_key(account)
+            state = await asyncio.to_thread(index.get_state, account_id, folder)
+            cached = None
+            if state is not None:
+                cached = await asyncio.to_thread(
+                    index.get_cached_ai_result_for_message,
+                    account_id,
+                    folder,
+                    state.uidvalidity,
+                    uid,
+                    self.plugin._mail_processing_cache_key(task),
+                    language,
+                )
+            return self._ok(
+                {
+                    "available": cached is not None,
+                    "content": cached.result_text if cached is not None else "",
+                    "cached": cached is not None,
+                    "task": task,
+                    "target_language": language,
+                }
+            )
+        except Exception as exc:
+            return self._error(exc)
+
     async def _process_message(self, task: str) -> dict[str, Any]:
         try:
             payload = await self._json_payload()
@@ -701,15 +768,10 @@ class EmailAssistantPageApi:
             uid = self._int(payload.get("uid"), 0, 0, 2_147_483_647)
             if uid <= 0:
                 raise ValueError("邮件 UID 必须是正整数。")
-            interface_language = self._locale_language(payload.get("locale"))
-            configured_language = _one_line(
-                self.plugin.config.get("translation_language"), 80
+            language = self._processing_language(
+                task, payload.get("locale"), payload.get("target_language")
             )
-            language = (
-                configured_language or interface_language
-                if task == "translate"
-                else interface_language
-            )
+            force = payload.get("force") is True
             lock_key = f"{self.plugin._account_key(account)}:{folder}:{uid}:{task}:{language}"
             lock = self._ai_locks.setdefault(lock_key, asyncio.Lock())
             async with lock:
@@ -717,7 +779,7 @@ class EmailAssistantPageApi:
                 account_id = self.plugin._account_key(account)
                 state = await asyncio.to_thread(index.get_state, account_id, folder)
                 task_key = self.plugin._mail_processing_cache_key(task)
-                if state is not None:
+                if state is not None and not force:
                     cached = await asyncio.to_thread(
                         index.get_cached_ai_result_for_message,
                         account_id,
@@ -741,16 +803,18 @@ class EmailAssistantPageApi:
                 if state is None:
                     raise RuntimeError("邮件文件夹尚未完成索引。")
                 content_hash = mail_content_hash(mail)
-                cached = await asyncio.to_thread(
-                    index.get_ai_result,
-                    account_id,
-                    folder,
-                    state.uidvalidity,
-                    uid,
-                    content_hash,
-                    task_key,
-                    language,
-                )
+                cached = None
+                if not force:
+                    cached = await asyncio.to_thread(
+                        index.get_ai_result,
+                        account_id,
+                        folder,
+                        state.uidvalidity,
+                        uid,
+                        content_hash,
+                        task_key,
+                        language,
+                    )
                 if cached is not None:
                     return self._ok(
                         {

@@ -14,6 +14,7 @@ const state = {
   drafts: [],
   draft: null,
   draftDirty: false,
+  autoShowCachedAi: "none",
 };
 
 const $ = (selector) => document.querySelector(selector);
@@ -137,6 +138,7 @@ async function loadOverview() {
   renderAccounts();
   renderDraftAccountOptions();
   const enabled = Boolean(data.plugin?.index_enabled);
+  state.autoShowCachedAi = data.plugin?.webui_auto_show_cached_ai || "none";
   elements.runtimeState.textContent = enabled ? `${state.accounts.length} 个账户 · 索引就绪` : "本地索引不可用";
   elements.runtimeState.classList.toggle("error", !enabled);
 }
@@ -440,17 +442,11 @@ function renderMessageDetail(message) {
   reply.className = "button secondary";
   reply.textContent = "回复此邮件";
   reply.onclick = () => startReply(message);
-  const summary = document.createElement("button");
-  summary.className = "button secondary";
-  summary.textContent = "总结邮件";
-  summary.onclick = () => processMessage(message, "summary", summary, aiResult);
-  const translate = document.createElement("button");
-  translate.className = "button secondary";
-  translate.textContent = "翻译邮件";
-  translate.onclick = () => processMessage(message, "translate", translate, aiResult);
-  actions.append(reply, summary, translate);
   const aiResult = document.createElement("div");
   aiResult.className = "mail-ai-result hidden";
+  const summary = createProcessingButton(message, "summary", aiResult);
+  const translate = createProcessingButton(message, "translate", aiResult);
+  actions.append(reply, summary, translate);
   const body = document.createElement("div");
   body.className = "detail-body";
   body.textContent = message.body || "（无可显示的纯文本正文）";
@@ -497,9 +493,100 @@ function renderMessageDetail(message) {
     elements.messageDetail.append(folderActions);
   }
   elements.messageDetail.append(aiResult, body);
+  void showConfiguredCachedResult(message, aiResult);
 }
 
-async function processMessage(message, task, button, resultNode) {
+function createProcessingButton(message, task, resultNode) {
+  const group = document.createElement("span");
+  group.className = "split-button";
+  const main = document.createElement("button");
+  main.className = "button secondary split-main";
+  main.textContent = task === "summary" ? "总结邮件" : "翻译邮件";
+  main.onclick = () => processMessage(message, task, main, resultNode);
+  const regenerate = document.createElement("button");
+  regenerate.className = "button secondary split-regenerate";
+  regenerate.type = "button";
+  regenerate.textContent = "↻";
+  regenerate.title = task === "summary" ? "指定语言并重新总结" : "指定语言并重新翻译";
+  regenerate.setAttribute("aria-label", regenerate.title);
+  regenerate.onclick = async () => {
+    const requested = await requestProcessingLanguage(task);
+    if (requested === null) return;
+    await processMessage(message, task, main, resultNode, {
+      force: true,
+      targetLanguage: requested,
+    });
+  };
+  group.append(main, regenerate);
+  return group;
+}
+
+function displayAiResult(resultNode, task, result) {
+  resultNode.replaceChildren();
+  const heading = document.createElement("strong");
+  heading.className = "mail-ai-heading";
+  heading.textContent = `${task === "summary" ? `邮件总结（${result.target_language}）` : `邮件翻译（${result.target_language}）`}${result.cached ? " · 已使用缓存" : ""}`;
+  resultNode.append(heading, renderMarkdown(result.content));
+  resultNode.classList.remove("hidden");
+}
+
+async function showConfiguredCachedResult(message, resultNode) {
+  const task = state.autoShowCachedAi;
+  if (!["summary", "translate"].includes(task)) return;
+  const accountId = message.account_id;
+  const folder = message.folder;
+  const uid = message.uid;
+  const requestVersion = resultNode.dataset.requestVersion || "0";
+  try {
+    const locale = state.bridge.getLocale?.() || state.context.locale || "zh-CN";
+    const result = await apiGet("message/ai-cache", {
+      account_id: accountId,
+      folder,
+      uid,
+      task,
+      locale,
+    });
+    if (
+      !result.available
+      || state.accountId !== accountId
+      || state.folder !== folder
+      || state.selectedUid !== uid
+      || (resultNode.dataset.requestVersion || "0") !== requestVersion
+    ) return;
+    displayAiResult(resultNode, task, result);
+  } catch (_error) {
+    // Automatic display is best-effort; manual buttons still report errors.
+  }
+}
+
+function requestProcessingLanguage(task) {
+  const modal = $("#processing-modal");
+  const input = $("#processing-language-input");
+  $("#processing-modal-title").textContent = task === "summary" ? "重新总结邮件" : "重新翻译邮件";
+  $("#processing-modal-message").textContent = "输入目标语言后会忽略已有缓存并重新调用模型；留空则使用插件配置或 AstrBot 界面语言。";
+  input.value = "";
+  modal.classList.remove("hidden");
+  input.focus();
+  return new Promise((resolve) => {
+    const finish = (value) => {
+      modal.classList.add("hidden");
+      $("#processing-modal-confirm").onclick = null;
+      $("#processing-modal-cancel").onclick = null;
+      input.onkeydown = null;
+      resolve(value);
+    };
+    $("#processing-modal-confirm").onclick = () => finish(input.value.trim());
+    $("#processing-modal-cancel").onclick = () => finish(null);
+    input.onkeydown = (event) => {
+      if (event.key === "Enter") finish(input.value.trim());
+      if (event.key === "Escape") finish(null);
+    };
+  });
+}
+
+async function processMessage(message, task, button, resultNode, options = {}) {
+  const requestVersion = String(Number(resultNode.dataset.requestVersion || "0") + 1);
+  resultNode.dataset.requestVersion = requestVersion;
   setBusy(button, true, task === "summary" ? "总结中…" : "翻译中…");
   try {
     const locale = state.bridge.getLocale?.() || state.context.locale || "zh-CN";
@@ -508,13 +595,12 @@ async function processMessage(message, task, button, resultNode) {
       folder: message.folder,
       uid: message.uid,
       locale,
+      target_language: options.targetLanguage || "",
+      force: options.force === true,
     });
-    resultNode.replaceChildren();
-    const heading = document.createElement("strong");
-    heading.className = "mail-ai-heading";
-    heading.textContent = `${task === "summary" ? "邮件总结" : `邮件翻译（${result.target_language}）`}${result.cached ? " · 已使用缓存" : ""}`;
-    resultNode.append(heading, renderMarkdown(result.content));
-    resultNode.classList.remove("hidden");
+    if (resultNode.dataset.requestVersion === requestVersion) {
+      displayAiResult(resultNode, task, result);
+    }
   } catch (error) {
     toast(error.message, true);
   } finally {

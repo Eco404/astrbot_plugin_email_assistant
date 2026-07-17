@@ -12,6 +12,7 @@ from astrbot_plugin_email_assistant.account_utils import (
     resolve_account,
     visible_accounts,
 )
+from astrbot_plugin_email_assistant.config_utils import config_get
 
 
 class AccountUtilsTests(unittest.TestCase):
@@ -52,6 +53,15 @@ class AccountUtilsTests(unittest.TestCase):
     def test_admin_sees_all_enabled_accounts(self):
         accounts = visible_accounts(self.config, umo="p:FriendMessage:9000", sender_id="9000")
         self.assertEqual({item["account_id"] for item in accounts}, {"one", "two"})
+
+    def test_grouped_config_takes_precedence_and_flat_config_remains_compatible(self):
+        self.assertEqual(config_get(self.config, "max_query_results", 20), 20)
+        grouped = {
+            "admin_uids": ["old"],
+            "general_settings": {"admin_uids": ["new"], "max_query_results": 7},
+        }
+        self.assertEqual(config_get(grouped, "admin_uids", []), ["new"])
+        self.assertEqual(config_get(grouped, "max_query_results", 20), 7)
 
     def test_duplicate_name_requires_account_id(self):
         accounts = [

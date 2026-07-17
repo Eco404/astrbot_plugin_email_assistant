@@ -113,6 +113,10 @@ input:focus, select:focus, textarea:focus, .search-field:focus-within { border-c
 .detail-subject { margin: 0 0 18px; font-size: 24px; line-height: 1.35; }
 .detail-meta { display: grid; gap: 5px; padding-bottom: 20px; border-bottom: 1px solid var(--line); color: var(--muted); font-size: 13px; }
 .detail-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; margin: 14px 0; }
+.split-button { display: inline-flex; }
+.split-button .button { border-radius: 0; }
+.split-button .split-main { border-radius: 9px 0 0 9px; }
+.split-button .split-regenerate { min-width: 38px; padding: 8px 10px; border-left: 0; border-radius: 0 9px 9px 0; font-size: 18px; line-height: 1; }
 .detail-body { white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.7; font-family: inherit; }
 .mail-ai-result { margin: 12px 0 18px; padding: 14px; border: 1px solid var(--line); border-radius: 11px; background: var(--panel-soft); line-height: 1.65; }
 .mail-ai-heading { display: block; margin-bottom: 8px; }

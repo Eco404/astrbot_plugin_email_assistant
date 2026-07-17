@@ -31,9 +31,13 @@ class PromptLoaderTests(unittest.TestCase):
         schema = json.loads(
             (PLUGIN_DIR / "_conf_schema.json").read_text(encoding="utf-8")
         )
-        self.assertEqual(schema["narration_prompt"]["default"], "")
-        self.assertEqual(schema["mail_summary_prompt"]["default"], "")
-        self.assertEqual(schema["mail_translation_prompt"]["default"], "")
+        self.assertEqual(
+            schema["notification_settings"]["items"]["narration_prompt"]["default"],
+            "",
+        )
+        webui = schema["webui_settings"]["items"]
+        self.assertEqual(webui["mail_summary_prompt"]["default"], "")
+        self.assertEqual(webui["mail_translation_prompt"]["default"], "")
 
 
 if __name__ == "__main__":

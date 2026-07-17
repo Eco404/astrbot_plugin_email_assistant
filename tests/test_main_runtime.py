@@ -120,7 +120,7 @@ from astrbot_plugin_email_assistant.imap_client import (
     MailFolder,
     MailNotFoundError,
 )
-from astrbot_plugin_email_assistant.mail_index import MailHeaderIndex
+from astrbot_plugin_email_assistant.mail_index import MailHeaderIndex, mail_content_hash
 from astrbot_plugin_email_assistant.mail_parser import ParsedMail
 from astrbot_plugin_email_assistant.main import EmailAssistantPlugin
 from astrbot_plugin_email_assistant import page_api as page_api_module
@@ -1261,6 +1261,44 @@ class MainRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(second["data"]["content"], "翻译结果")
         self.assertEqual(len(self.context.provider.calls), 1)
         remote_detail.assert_awaited_once()
+
+    async def test_page_forced_translation_uses_requested_language_and_replaces_cache(self):
+        index = self._enable_test_index()
+        timestamp = datetime(2026, 7, 16, 10, 0).timestamp()
+        message = ParsedMail(
+            9, "Subject", "Sender", "a@example.com", "a@example.com",
+            "2026-07-16", timestamp, "Mail body", False, "", ""
+        )
+        index.apply_sync("one", "INBOX", 10, 9, [message])
+        index.cache_ai_result(
+            "one", "INBOX", 10, 9, mail_content_hash(message),
+            self.plugin._mail_processing_cache_key("translate"),
+            "English", "stale cached result", "old-provider",
+        )
+        self.context.provider = FakeProvider("English result")
+        api = EmailAssistantPageApi(self.plugin)
+        fake_request = FakePageRequest()
+        fake_request.payload = {
+            "account_id": "one", "folder": "INBOX", "uid": 9,
+            "locale": "zh-CN", "target_language": "English", "force": True,
+        }
+        with patch.object(page_api_module, "request", fake_request), patch.object(
+            self.plugin, "_fetch_remote_detail", new=AsyncMock(return_value=message)
+        ):
+            result = await api.translate_message()
+        self.assertEqual(result["status"], "ok")
+        self.assertFalse(result["data"]["cached"])
+        self.assertEqual(result["data"]["target_language"], "English")
+        self.assertEqual(len(self.context.provider.calls), 1)
+
+        fake_request.query = {
+            "account_id": "one", "folder": "INBOX", "uid": 9,
+            "locale": "zh-CN", "task": "translate", "target_language": "English",
+        }
+        with patch.object(page_api_module, "request", fake_request):
+            cached = await api.get_message_ai_cache()
+        self.assertTrue(cached["data"]["available"])
+        self.assertEqual(cached["data"]["content"], "English result")
 
     async def test_page_cached_detail_returns_before_separate_verification(self):
         index = self._enable_test_index()

@@ -178,215 +178,75 @@
       }
     }
   },
-  "admin_uids": {
-    "type": "list",
-    "description": "管理员用户 ID",
-    "hint": "管理员仍只能在私聊中执行命令，但可以操作全部邮箱。",
-    "default": []
+  "general_settings": {
+    "type": "object",
+    "description": "通用与权限设置",
+    "hint": "管理命令权限、轮询频率和网络查询限制。",
+    "items": {
+      "admin_uids": {"type": "list", "description": "管理员用户 ID", "hint": "管理员仍只能在私聊中执行命令，但可以操作全部邮箱。", "default": []},
+      "poll_interval_seconds": {"type": "int", "description": "自动检查间隔（秒）", "hint": "可用范围最小 30 秒。", "default": 60},
+      "network_timeout_seconds": {"type": "int", "description": "邮件服务器连接超时（秒）", "default": 20},
+      "max_fetch_per_check": {"type": "int", "description": "每账户单次最多处理的新邮件数", "default": 20},
+      "max_query_results": {"type": "int", "description": "列表查询最多返回邮件数", "default": 20},
+      "detail_body_max_chars": {"type": "int", "description": "WebUI 与 LLM 查询工具显示正文最大字符数", "hint": "作用于网页详情和 LLM 邮件详情工具，不影响转述、总结或翻译输入。", "default": 12000}
+    }
   },
-  "llm_mail_write_enabled": {
-    "type": "bool",
-    "description": "允许 LLM 创建并确认发送邮件草稿",
-    "hint": "默认关闭。开启后 LLM 只能先创建本地待确认草稿；实际发送必须由用户在下一条真实私聊消息中输入一次性确认指令。定时任务、群聊和合成事件不能使用。",
-    "default": false
+  "notification_settings": {
+    "type": "object",
+    "description": "新邮件通知与转述",
+    "hint": "控制标题通知、人格转述和官方定时任务转述。",
+    "items": {
+      "notification_mode": {"type": "string", "description": "新邮件通知模式", "hint": "标题直发不调用 LLM。直接 LLM 会读取当前 AstrBot 人格后生成并立即发送，不会触发其他插件的 LLM 请求/响应处理。官方定时任务会创建一个很近的一次性主动 Agent 任务，进入完整 AstrBot Agent 与插件事件链，可能受到其他插件的注入、审核或协同处理影响。", "options": ["title", "llm", "cron"], "default": "title"},
+      "narration_provider_id": {"type": "string", "description": "邮件转述模型", "hint": "仅用于直接 LLM 转述模式。留空时使用目标私聊会话当前生效的模型；官方定时任务仍使用该会话的主 Agent 模型。", "_special": "select_provider", "default": ""},
+      "llm_write_official_history": {"type": "bool", "description": "直接 LLM 转述写入官方对话历史", "hint": "仅在通知模式为 llm 时生效。发送成功后写入“邮件主动承接占位 + 实际转述”。", "default": false},
+      "narration_prompt": {"type": "text", "description": "邮件转述提示词", "hint": "留空时使用内置提示词。支持 {account_name}、{sender}、{date}、{subject}、{has_attachments}、{body}、{uid}。", "default": ""},
+      "narration_body_max_chars": {"type": "int", "description": "转述模型输入的正文最大字符数", "hint": "默认 5000，只作用于新邮件转述。", "default": 5000},
+      "narration_max_tokens": {"type": "int", "description": "直接 LLM 转述最大输出 Token", "hint": "填 0 时不传递 max_tokens；正数只限制直接 LLM 转述输出。", "default": 500},
+      "cron_narration_delay_seconds": {"type": "int", "description": "定时任务转述延迟（秒）", "hint": "仅在 cron 模式生效，可用范围 1 到 300 秒。", "default": 5}
+    }
   },
-  "llm_send_confirmation_ttl_minutes": {
-    "type": "int",
-    "description": "LLM 草稿确认码有效期（分钟）",
-    "hint": "默认 10 分钟，运行时限制为 1 到 60 分钟。确认码只能使用一次，草稿被编辑后也会失效。",
-    "default": 10
+  "llm_write_settings": {
+    "type": "object",
+    "description": "LLM 写邮件与发送安全",
+    "hint": "LLM 只能先创建本地草稿，再由真实私聊消息确认发送。",
+    "items": {
+      "llm_mail_write_enabled": {"type": "bool", "description": "允许 LLM 创建并确认发送邮件草稿", "hint": "默认关闭。定时任务、群聊和合成事件不能确认发送。", "default": false},
+      "llm_send_confirmation_ttl_minutes": {"type": "int", "description": "LLM 草稿确认码有效期（分钟）", "hint": "范围 1 到 60 分钟；确认码只能使用一次，草稿被编辑后也会失效。", "default": 10},
+      "llm_draft_body_max_chars": {"type": "int", "description": "LLM 创建草稿正文最大字符数", "hint": "运行时限制为 200 到 100000 字符。", "default": 20000}
+    }
   },
-  "llm_draft_body_max_chars": {
-    "type": "int",
-    "description": "LLM 创建草稿正文最大字符数",
-    "hint": "限制 LLM 写入本地草稿和提交 SMTP 的正文长度，运行时限制为 200 到 100000 字符。",
-    "default": 20000
+  "webui_settings": {
+    "type": "object",
+    "description": "邮件中心 WebUI",
+    "hint": "只控制邮件中心页面的正文显示、总结和翻译；不会改变新邮件主动转述。",
+    "items": {
+      "mail_processing_provider_id": {"type": "string", "description": "邮件总结与翻译模型", "hint": "总结和翻译不会带入人格。留空时使用邮箱绑定私聊当前生效的模型。", "_special": "select_provider", "default": ""},
+      "mail_summary_prompt": {"type": "text", "description": "邮件总结提示词", "hint": "留空使用内置提示词。支持 {target_language}、{sender}、{date}、{subject}、{body}。", "default": ""},
+      "mail_translation_prompt": {"type": "text", "description": "邮件翻译提示词", "hint": "留空使用内置提示词。支持 {target_language}、{sender}、{date}、{subject}、{body}。", "default": ""},
+      "translation_language": {"type": "string", "description": "邮件翻译默认目标语言", "hint": "例如 简体中文、English、日本語。留空时使用 AstrBot WebUI 的界面语言。", "default": ""},
+      "webui_auto_show_cached_ai": {"type": "string", "description": "打开邮件时自动显示已有 AI 缓存", "hint": "只在对应缓存已经存在时显示，不会为了自动显示而调用 LLM。", "options": ["none", "summary", "translate"], "default": "none"},
+      "mail_processing_body_max_chars": {"type": "int", "description": "总结/翻译读取正文最大字符数", "hint": "默认 12000，过长正文会截断后交给 LLM。", "default": 12000},
+      "mail_processing_max_tokens": {"type": "int", "description": "总结/翻译最大输出 Token", "hint": "填 0 时不传递 max_tokens；正数范围 128 到 4000。", "default": 1200}
+    }
   },
-  "notification_mode": {
-    "type": "string",
-    "description": "新邮件通知模式",
-    "hint": "标题直发不调用 LLM。直接 LLM 会读取当前 AstrBot 人格后生成并立即发送，不会触发其他插件的 LLM 请求/响应处理。官方定时任务会创建一个很近的一次性主动 Agent 任务，进入完整 AstrBot Agent 与插件事件链，可能受到其他插件的注入、审核或协同处理影响。",
-    "options": ["title", "llm", "cron"],
-    "default": "title"
-  },
-  "narration_provider_id": {
-    "type": "string",
-    "description": "邮件转述模型",
-    "hint": "仅用于直接 LLM 转述模式。留空或不选择时，使用目标私聊会话当前生效的 AstrBot 模型；官方定时任务模式仍使用该会话的主 Agent 模型。",
-    "_special": "select_provider",
-    "default": ""
-  },
-  "llm_write_official_history": {
-    "type": "bool",
-    "description": "直接 LLM 转述写入官方对话历史",
-    "hint": "仅在通知模式为 llm 时生效。发送成功后写入“邮件主动承接占位 + 实际转述”；归档失败不会重复发送邮件通知。",
-    "default": false
-  },
-  "narration_prompt": {
-    "type": "text",
-    "description": "邮件转述提示词",
-    "hint": "留空时使用插件内置默认提示词。支持 {account_name}、{sender}、{date}、{subject}、{has_attachments}、{body}、{uid} 占位符。",
-    "default": ""
-  },
-  "narration_body_max_chars": {
-    "type": "int",
-    "description": "转述模型输入的正文最大字符数",
-    "hint": "默认 5000, 只作用于直接 LLM 和官方定时任务的新邮件转述，不影响 WebUI 正文显示、总结或翻译。",
-    "default": 5000
-  },
-  "narration_max_tokens": {
-    "type": "int",
-    "description": "直接 LLM 转述最大输出 Token",
-    "hint": "默认 500, 填 0 时不向模型传递 max_tokens，由 AstrBot Provider 或上游 API 决定。正数仅限制直接 LLM 模式生成的转述长度，不限制输入正文，也不作用于官方定时任务。",
-    "default": 500
-  },
-  "mail_processing_provider_id": {
-    "type": "string",
-    "description": "邮件总结与翻译模型",
-    "hint": "邮件中心的总结和翻译不会带入人格。留空时使用该邮箱绑定私聊当前生效的 AstrBot 模型。",
-    "_special": "select_provider",
-    "default": ""
-  },
-  "mail_summary_prompt": {
-    "type": "text",
-    "description": "邮件总结提示词",
-    "hint": "留空时使用插件内置默认提示词。支持 {target_language}、{sender}、{date}、{subject}、{body} 占位符。",
-    "default": ""
-  },
-  "mail_translation_prompt": {
-    "type": "text",
-    "description": "邮件翻译提示词",
-    "hint": "留空时使用插件内置默认提示词。支持 {target_language}、{sender}、{date}、{subject}、{body} 占位符。",
-    "default": ""
-  },
-  "translation_language": {
-    "type": "string",
-    "description": "邮件翻译目标语言",
-    "hint": "例如 简体中文、English、日本語。留空时使用当前 AstrBot WebUI 的界面语言。",
-    "default": ""
-  },
-  "mail_processing_body_max_chars": {
-    "type": "int",
-    "description": "总结/翻译读取正文最大字符数",
-    "hint": "默认 12000, 过长正文会截断后交给 LLM，可用范围 500 到 50000 字符。",
-    "default": 12000
-  },
-  "mail_processing_max_tokens": {
-    "type": "int",
-    "description": "总结/翻译最大输出 Token",
-    "hint": "默认 1200, 填 0 时不向模型传递 max_tokens，由 AstrBot Provider 或上游 API 决定；正数范围限制在 128 到 4000。",
-    "default": 1200
-  },
-  "detail_body_max_chars": {
-    "type": "int",
-    "description": "WebUI 与 LLM 查询工具显示正文最大字符数",
-    "hint": "默认 12000, 作用于网页邮件详情以及 LLM 读取邮件详情工具，不影响新邮件转述、总结或翻译。",
-    "default": 12000
-  },
-  "cron_narration_delay_seconds": {
-    "type": "int",
-    "description": "定时任务转述延迟（秒）",
-    "hint": "仅在通知模式为 cron 时生效，可用范围 1 到 300 秒。",
-    "default": 5
-  },
-  "poll_interval_seconds": {
-    "type": "int",
-    "description": "自动检查间隔（秒）",
-    "hint": "可用范围最小 30 秒。",
-    "default": 60
-  },
-  "network_timeout_seconds": {
-    "type": "int",
-    "description": "邮件服务器连接超时（秒）",
-    "default": 20
-  },
-  "max_fetch_per_check": {
-    "type": "int",
-    "description": "每账户单次最多处理的新邮件数",
-    "default": 20
-  },
-  "max_query_results": {
-    "type": "int",
-    "description": "列表查询最多返回邮件数",
-    "default": 20
-  },
-  "local_index_enabled": {
-    "type": "bool",
-    "description": "启用本地邮件头索引",
-    "hint": "索引保存在 AstrBot plugin_data 中，保存邮件头、同步状态、草稿，并可按正文缓存设置保存已经读取过的纯文本。",
-    "default": true
-  },
-  "local_index_initial_days": {
-    "type": "int",
-    "description": "首次索引最近天数",
-    "hint": "首次同步先拉取该时间范围内的邮件头，之后后台会分批向更早邮件回填，直到覆盖整个文件夹；始终不下载历史邮件正文。可用范围 1 到 3650 天。",
-    "default": 90
-  },
-  "local_index_initial_max_messages": {
-    "type": "int",
-    "description": "首次索引最多邮件数",
-    "hint": "每个账户首次建立索引时最多保存的近期邮件头数量；较早邮件会在后续轮询中继续回填。可用范围 20 到 10000。",
-    "default": 500
-  },
-  "local_index_sync_batch_size": {
-    "type": "int",
-    "description": "索引每轮邮件数",
-    "hint": "后台每轮为每个账户最多拉取的邮件头总数；优先同步新增邮件，剩余额度用于向更早历史邮件回填。",
-    "default": 100
-  },
-  "local_index_reconcile_interval_hours": {
-    "type": "int",
-    "description": "云端删除核对间隔（小时）",
-    "hint": "定期只拉取云端 UID 集合，用于把已删除或移出当前文件夹的本地索引标记为失效。可用范围 1 到 720 小时。",
-    "default": 24
-  },
-  "local_index_all_folders": {
-    "type": "bool",
-    "description": "后台渐进索引全部邮件文件夹",
-    "hint": "开启后会在正常收件轮询之后逐个索引其他可选择文件夹；新邮件主动通知仍只监控账户配置的主文件夹。",
-    "default": true
-  },
-  "secondary_folders_per_poll": {
-    "type": "int",
-    "description": "每轮最多索引的次要文件夹数",
-    "hint": "默认每轮处理 1 个，避免同时拉取整个邮箱；填 0 可暂停次要文件夹后台索引，范围最大 10。",
-    "default": 1
-  },
-  "folder_list_refresh_interval_hours": {
-    "type": "int",
-    "description": "邮件文件夹清单刷新间隔（小时）",
-    "hint": "后台自动执行 IMAP LIST 发现新建、删除或重命名的文件夹，可用范围 1 到 720 小时。",
-    "default": 6
-  },
-  "body_cache_mode": {
-    "type": "string",
-    "description": "邮件正文缓存模式",
-    "hint": "off 不保存正文并在插件启动时清空已有正文缓存；on_demand 会缓存新邮件通知、查看详情或回复时已经读取过的规范化纯文本。不会后台批量下载历史正文，也不保存 HTML 和附件。",
-    "options": ["off", "on_demand"],
-    "default": "on_demand"
-  },
-  "body_cache_retention_days": {
-    "type": "int",
-    "description": "正文缓存保留天数",
-    "hint": "按最后访问时间清理，可用范围 1 到 3650 天。",
-    "default": 90
-  },
-  "body_cache_max_item_kb": {
-    "type": "int",
-    "description": "单封正文缓存上限（KB）",
-    "hint": "超过上限时只缓存前半部分纯文本并记录截断状态，可用范围 16 到 10240 KB。",
-    "default": 512
-  },
-  "body_cache_max_total_mb": {
-    "type": "int",
-    "description": "正文缓存总容量（MB）",
-    "hint": "超过容量后按最久未访问顺序清理，可用范围 10 到 10240 MB。",
-    "default": 200
-  },
-  "body_cache_purge_on_remote_delete": {
-    "type": "bool",
-    "description": "云端删除时清理正文缓存",
-    "hint": "邮件被确认删除或移出当前文件夹时清理本地正文，建议保持开启。UIDVALIDITY 变化时为防止 UID 错配，无论本项设置如何都会清理旧代正文。",
-    "default": true
+  "storage_settings": {
+    "type": "object",
+    "description": "索引、文件夹与正文缓存",
+    "hint": "控制 plugin_data 中的本地索引、渐进同步和正文缓存。",
+    "items": {
+      "local_index_enabled": {"type": "bool", "description": "启用本地邮件头索引", "hint": "保存邮件头、同步状态、草稿，并按正文缓存设置保存已读取的纯文本。", "default": true},
+      "local_index_initial_days": {"type": "int", "description": "首次索引最近天数", "hint": "随后会分批向更早邮件回填，直到覆盖整个文件夹。", "default": 90},
+      "local_index_initial_max_messages": {"type": "int", "description": "首次索引最多邮件数", "hint": "较早邮件会在后续轮询中继续回填。", "default": 500},
+      "local_index_sync_batch_size": {"type": "int", "description": "索引每轮邮件数", "hint": "优先同步新增邮件，剩余额度用于回填历史邮件。", "default": 100},
+      "local_index_reconcile_interval_hours": {"type": "int", "description": "云端删除核对间隔（小时）", "hint": "定期拉取云端 UID 集合，把已删除或移出的本地索引标记为失效。", "default": 24},
+      "local_index_all_folders": {"type": "bool", "description": "后台渐进索引全部邮件文件夹", "hint": "正常收件后逐个索引其他文件夹；主动通知仍只监控主文件夹。", "default": true},
+      "secondary_folders_per_poll": {"type": "int", "description": "每轮最多索引的次要文件夹数", "hint": "填 0 可暂停次要文件夹后台索引，最大 10。", "default": 1},
+      "folder_list_refresh_interval_hours": {"type": "int", "description": "邮件文件夹清单刷新间隔（小时）", "hint": "后台自动执行 IMAP LIST，范围 1 到 720 小时。", "default": 6},
+      "body_cache_mode": {"type": "string", "description": "邮件正文缓存模式", "hint": "off 不保存正文；on_demand 缓存已读取的规范化纯文本，不批量下载历史正文。", "options": ["off", "on_demand"], "default": "on_demand"},
+      "body_cache_retention_days": {"type": "int", "description": "正文缓存保留天数", "hint": "按最后访问时间清理。", "default": 90},
+      "body_cache_max_item_kb": {"type": "int", "description": "单封正文缓存上限（KB）", "hint": "超过上限只缓存前半部分并记录截断状态。", "default": 512},
+      "body_cache_max_total_mb": {"type": "int", "description": "正文缓存总容量（MB）", "hint": "超过容量后按最久未访问顺序清理。", "default": 200},
+      "body_cache_purge_on_remote_delete": {"type": "bool", "description": "云端删除时清理正文缓存", "hint": "建议保持开启；UIDVALIDITY 变化时始终清理旧代正文。", "default": true}
+    }
   }
 }

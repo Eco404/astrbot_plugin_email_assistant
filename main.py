@@ -29,6 +29,7 @@ from .account_utils import (
     resolve_account,
     visible_accounts,
 )
+from .config_utils import config_get
 from .imap_client import (
     MailboxChangedError,
     MailNotFoundError,
@@ -89,7 +90,7 @@ def _one_line(value: Any, limit: int = 160) -> str:
     PLUGIN_NAME,
     "econeco",
     "支持多账户 IMAP 收信通知、LLM 安全草稿与查询、SMTP 收发和邮件中心 WebUI 的邮件助手",
-    "2.1.1",
+    "2.2.0",
 )
 class EmailAssistantPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig) -> None:
@@ -108,7 +109,7 @@ class EmailAssistantPlugin(Star):
 
     async def initialize(self) -> None:
         self._stop_event.clear()
-        if self.config.get("local_index_enabled", True):
+        if config_get(self.config, "local_index_enabled", True):
             try:
                 self.data_dir = StarTools.get_data_dir(PLUGIN_NAME)
                 self._mail_index = MailHeaderIndex(self.data_dir / "mail_headers.db")
@@ -171,7 +172,7 @@ class EmailAssistantPlugin(Star):
             )
 
     def _accounts(self) -> list[dict[str, Any]]:
-        raw = self.config.get("mail_accounts", [])
+        raw = config_get(self.config, "mail_accounts", [])
         return [item for item in raw if isinstance(item, dict)] if isinstance(raw, list) else []
 
     def _account_key(self, account: dict[str, Any]) -> str:
@@ -201,20 +202,20 @@ class EmailAssistantPlugin(Star):
         return self._account_locks.setdefault(self._account_key(account), asyncio.Lock())
 
     def _timeout(self) -> int:
-        return _safe_int(self.config.get("network_timeout_seconds", 20), 20, 5, 120)
+        return _safe_int(config_get(self.config, "network_timeout_seconds", 20), 20, 5, 120)
 
     def _fetch_limit(self) -> int:
-        return _safe_int(self.config.get("max_fetch_per_check", 20), 20, 1, 100)
+        return _safe_int(config_get(self.config, "max_fetch_per_check", 20), 20, 1, 100)
 
     def _query_limit(self) -> int:
-        return _safe_int(self.config.get("max_query_results", 20), 20, 1, 50)
+        return _safe_int(config_get(self.config, "max_query_results", 20), 20, 1, 50)
 
     def _initial_index_days(self) -> int:
-        return _safe_int(self.config.get("local_index_initial_days", 90), 90, 1, 3650)
+        return _safe_int(config_get(self.config, "local_index_initial_days", 90), 90, 1, 3650)
 
     def _initial_index_limit(self) -> int:
         return _safe_int(
-            self.config.get("local_index_initial_max_messages", 500),
+            config_get(self.config, "local_index_initial_max_messages", 500),
             500,
             20,
             10000,
@@ -222,12 +223,12 @@ class EmailAssistantPlugin(Star):
 
     def _index_batch_limit(self) -> int:
         return _safe_int(
-            self.config.get("local_index_sync_batch_size", 100), 100, 10, 1000
+            config_get(self.config, "local_index_sync_batch_size", 100), 100, 10, 1000
         )
 
     def _reconcile_interval_seconds(self) -> int:
         hours = _safe_int(
-            self.config.get("local_index_reconcile_interval_hours", 24),
+            config_get(self.config, "local_index_reconcile_interval_hours", 24),
             24,
             1,
             720,
@@ -236,7 +237,7 @@ class EmailAssistantPlugin(Star):
 
     def _folder_catalog_refresh_seconds(self) -> int:
         hours = _safe_int(
-            self.config.get("folder_list_refresh_interval_hours", 6),
+            config_get(self.config, "folder_list_refresh_interval_hours", 6),
             6,
             1,
             720,
@@ -245,33 +246,33 @@ class EmailAssistantPlugin(Star):
 
     def _secondary_folders_per_poll(self) -> int:
         try:
-            value = int(self.config.get("secondary_folders_per_poll", 1))
+            value = int(config_get(self.config, "secondary_folders_per_poll", 1))
         except (TypeError, ValueError):
             value = 1
         return max(0, min(10, value))
 
     def _body_cache_enabled(self) -> bool:
-        return str(self.config.get("body_cache_mode") or "on_demand").lower() == "on_demand"
+        return str(config_get(self.config, "body_cache_mode") or "on_demand").lower() == "on_demand"
 
     def _body_cache_retention_days(self) -> int:
         return _safe_int(
-            self.config.get("body_cache_retention_days", 90), 90, 1, 3650
+            config_get(self.config, "body_cache_retention_days", 90), 90, 1, 3650
         )
 
     def _body_cache_max_item_bytes(self) -> int:
         kilobytes = _safe_int(
-            self.config.get("body_cache_max_item_kb", 512), 512, 16, 10240
+            config_get(self.config, "body_cache_max_item_kb", 512), 512, 16, 10240
         )
         return kilobytes * 1024
 
     def _body_cache_max_total_bytes(self) -> int:
         megabytes = _safe_int(
-            self.config.get("body_cache_max_total_mb", 200), 200, 10, 10240
+            config_get(self.config, "body_cache_max_total_mb", 200), 200, 10, 10240
         )
         return megabytes * 1024 * 1024
 
     def _purge_cached_body_on_remote_delete(self) -> bool:
-        return bool(self.config.get("body_cache_purge_on_remote_delete", True))
+        return bool(config_get(self.config, "body_cache_purge_on_remote_delete", True))
 
     async def _cache_mail_body(
         self,
@@ -303,12 +304,12 @@ class EmailAssistantPlugin(Star):
         return str(account.get("folder") or "INBOX").strip() or "INBOX"
 
     def _notification_mode(self) -> str:
-        mode = _one_line(self.config.get("notification_mode") or "title", 40).lower()
+        mode = _one_line(config_get(self.config, "notification_mode") or "title", 40).lower()
         return mode if mode in {"title", "llm", "cron"} else "title"
 
     def _narration_body_limit(self) -> int:
         return _safe_int(
-            self.config.get("narration_body_max_chars", 3000), 3000, 200, 12000
+            config_get(self.config, "narration_body_max_chars", 3000), 3000, 200, 12000
         )
 
     @staticmethod
@@ -502,7 +503,7 @@ class EmailAssistantPlugin(Star):
     async def _sync_secondary_folder_step(self, account: dict[str, Any]) -> None:
         if (
             self._mail_index is None
-            or not self.config.get("local_index_all_folders", True)
+            or not config_get(self.config, "local_index_all_folders", True)
             or not account.get("query_enabled", True)
         ):
             return
@@ -731,7 +732,7 @@ class EmailAssistantPlugin(Star):
                         _one_line(exc, 180),
                     )
                 await self._sync_secondary_folder_step(account)
-            interval = _safe_int(self.config.get("poll_interval_seconds", 60), 60, 30, 86400)
+            interval = _safe_int(config_get(self.config, "poll_interval_seconds", 60), 60, 30, 86400)
             try:
                 await asyncio.wait_for(self._stop_event.wait(), timeout=interval)
             except asyncio.TimeoutError:
@@ -831,7 +832,7 @@ class EmailAssistantPlugin(Star):
     def _render_narration_prompt(
         self, account: dict[str, Any], mail: ParsedMail
     ) -> str:
-        template = str(self.config.get("narration_prompt") or "").strip()
+        template = str(config_get(self.config, "narration_prompt") or "").strip()
         if not template:
             template = get_prompt("default_narration")
         sender = mail.from_name.strip()
@@ -853,10 +854,10 @@ class EmailAssistantPlugin(Star):
 
     def _mail_processing_prompt_template(self, task: str) -> str:
         if task == "summary":
-            configured = str(self.config.get("mail_summary_prompt") or "").strip()
+            configured = str(config_get(self.config, "mail_summary_prompt") or "").strip()
             return configured or get_prompt("mail_summary")
         if task == "translate":
-            configured = str(self.config.get("mail_translation_prompt") or "").strip()
+            configured = str(config_get(self.config, "mail_translation_prompt") or "").strip()
             return configured or get_prompt("mail_translate")
         raise ValueError("不支持的邮件处理任务。")
 
@@ -866,7 +867,7 @@ class EmailAssistantPlugin(Star):
                 task,
                 self._mail_processing_prompt_template(task),
                 get_prompt("mail_content_system"),
-                _one_line(self.config.get("mail_processing_provider_id"), 160),
+                _one_line(config_get(self.config, "mail_processing_provider_id"), 160),
             ]
         )
         digest = hashlib.sha256(seed.encode("utf-8")).hexdigest()[:16]
@@ -958,7 +959,7 @@ class EmailAssistantPlugin(Star):
 
     async def _generate_narration(self, owner_umo: str, prompt: str) -> str:
         configured_provider_id = _one_line(
-            self.config.get("narration_provider_id"), 160
+            config_get(self.config, "narration_provider_id"), 160
         )
         if configured_provider_id:
             get_provider_by_id = getattr(self.context, "get_provider_by_id", None)
@@ -1005,7 +1006,7 @@ class EmailAssistantPlugin(Star):
             "system_prompt": persona_prompt,
         }
         max_tokens = _optional_max_tokens(
-            self.config.get("narration_max_tokens", 500), 500, 64, 2000
+            config_get(self.config, "narration_max_tokens", 500), 500, 64, 2000
         )
         if max_tokens is not None:
             kwargs["max_tokens"] = max_tokens
@@ -1034,7 +1035,7 @@ class EmailAssistantPlugin(Star):
         if task not in {"summary", "translate"}:
             raise ValueError("不支持的邮件处理任务。")
         configured_provider_id = _one_line(
-            self.config.get("mail_processing_provider_id"), 160
+            config_get(self.config, "mail_processing_provider_id"), 160
         )
         if configured_provider_id:
             getter = getattr(self.context, "get_provider_by_id", None)
@@ -1059,7 +1060,7 @@ class EmailAssistantPlugin(Star):
         if mail.from_addr:
             sender = f"{sender} <{mail.from_addr}>" if sender else mail.from_addr
         body_limit = _safe_int(
-            self.config.get("mail_processing_body_max_chars", 12000),
+            config_get(self.config, "mail_processing_body_max_chars", 12000),
             12000,
             500,
             50000,
@@ -1087,7 +1088,7 @@ class EmailAssistantPlugin(Star):
             "system_prompt": get_prompt("mail_content_system"),
         }
         max_tokens = _optional_max_tokens(
-            self.config.get("mail_processing_max_tokens", 1200),
+            config_get(self.config, "mail_processing_max_tokens", 1200),
             1200,
             128,
             4000,
@@ -1142,7 +1143,7 @@ class EmailAssistantPlugin(Star):
         cron_manager = self._cron_manager()
         if cron_manager is None:
             raise RuntimeError("当前 AstrBot 版本或运行环境不提供官方定时任务管理器。")
-        delay = _safe_int(self.config.get("cron_narration_delay_seconds", 5), 5, 1, 300)
+        delay = _safe_int(config_get(self.config, "cron_narration_delay_seconds", 5), 5, 1, 300)
         run_at = datetime.now().astimezone() + timedelta(seconds=delay)
         note = render_prompt("cron_narration_note", narration_prompt=prompt)
         await cron_manager.add_active_job(
@@ -1190,7 +1191,7 @@ class EmailAssistantPlugin(Star):
         )
         if sent is False:
             raise RuntimeError(f"AstrBot 未找到目标平台，会话 {owner_umo} 未发送。")
-        if self.config.get("llm_write_official_history", False):
+        if config_get(self.config, "llm_write_official_history", False):
             try:
                 await self._archive_narration(owner_umo, narration)
             except Exception as exc:
@@ -1359,7 +1360,7 @@ class EmailAssistantPlugin(Star):
         guard_error = self._guard_read_tool(event)
         if guard_error:
             return guard_error
-        if not self.config.get("llm_mail_write_enabled", False):
+        if not config_get(self.config, "llm_mail_write_enabled", False):
             return "LLM 邮件草稿和发送工具已在插件设置中关闭。"
         if self._mail_index is None:
             return "本地邮件索引未启用，无法使用安全草稿工作流。"
@@ -1396,7 +1397,7 @@ class EmailAssistantPlugin(Star):
 
     def _llm_draft_body_limit(self) -> int:
         return _safe_int(
-            self.config.get("llm_draft_body_max_chars", 20000),
+            config_get(self.config, "llm_draft_body_max_chars", 20000),
             20000,
             200,
             100000,
@@ -1449,7 +1450,7 @@ class EmailAssistantPlugin(Star):
             has_email_capability = any(
                 account.get("query_enabled", True)
                 or (
-                    self.config.get("llm_mail_write_enabled", False)
+                    config_get(self.config, "llm_mail_write_enabled", False)
                     and account.get("send_enabled", True)
                 )
                 for account in self._visible_accounts(event)
@@ -1470,7 +1471,7 @@ class EmailAssistantPlugin(Star):
         self, account: dict[str, Any], mail: ParsedMail
     ) -> dict[str, Any]:
         body_limit = _safe_int(
-            self.config.get("detail_body_max_chars", 4000), 4000, 200, 12000
+            config_get(self.config, "detail_body_max_chars", 4000), 4000, 200, 12000
         )
         return {
             "success": True,
@@ -1502,7 +1503,7 @@ class EmailAssistantPlugin(Star):
             if not (
                 account.get("query_enabled", True)
                 or (
-                    self.config.get("llm_mail_write_enabled", False)
+                    config_get(self.config, "llm_mail_write_enabled", False)
                     and account.get("send_enabled", True)
                 )
             ):
@@ -2095,7 +2096,7 @@ class EmailAssistantPlugin(Star):
         except Exception as exc:
             yield event.plain_result(f"❌ 获取邮件失败：{_one_line(exc)}")
             return
-        limit = _safe_int(self.config.get("detail_body_max_chars", 4000), 4000, 200, 12000)
+        limit = _safe_int(config_get(self.config, "detail_body_max_chars", 4000), 4000, 200, 12000)
         body = mail.body_preview(limit) or "（无可显示的纯文本正文）"
         attachment = "有" if mail.has_attachments else "无"
         yield event.plain_result(

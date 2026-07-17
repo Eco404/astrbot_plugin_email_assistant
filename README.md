@@ -33,7 +33,9 @@
 
 每个账户的 `organize_enabled` 默认关闭。开启后，邮件中心才允许创建文件夹、复制和移动云端邮件；移动会二次确认。服务器支持 `UID MOVE` 时直接移动，否则只在支持 `UIDPLUS/UID EXPUNGE` 的情况下安全回退，避免普通 `EXPUNGE` 误删其他已标记邮件。
 
-邮件详情的“总结邮件”和“翻译邮件”不会加载当前聊天人格。可通过 `mail_processing_provider_id` 指定模型；留空时使用该邮箱绑定私聊当前生效的模型。`translation_language` 留空时跟随 AstrBot WebUI 的界面语言。处理结果按账户、文件夹、UIDVALIDITY、UID、正文内容哈希、任务和目标语言保存在 `plugin_data` SQLite 中；正文没有变化时再次点击直接返回缓存。
+邮件详情的“总结邮件”和“翻译邮件”不会加载当前聊天人格。可在“邮件中心 WebUI”配置区指定模型；留空时使用该邮箱绑定私聊当前生效的模型。翻译默认目标语言留空时跟随 AstrBot WebUI 的界面语言。处理结果按账户、文件夹、UIDVALIDITY、UID、正文内容哈希、任务和目标语言保存在 `plugin_data` SQLite 中；正文没有变化时再次点击直接返回缓存。
+
+总结和翻译按钮右侧的 `↻` 可以指定目标语言并强制重新生成；输入框留空时使用默认语言。配置项“打开邮件时自动显示已有 AI 缓存”可选择不自动显示、总结或翻译。自动显示只读取已有缓存，不会因此调用 LLM。
 
 总结和翻译结果使用插件内置的本地固定版本 `markdown-it` 渲染 Markdown，再由 DOMPurify 清理后作为 DOM Fragment 显示。原始 HTML 默认关闭，页面运行时不连接 CDN；具体版本、完整性和许可证见 `pages/mailbox/vendor/THIRD_PARTY_NOTICES.md`。
 
@@ -132,6 +134,8 @@ account_id: 账户 ID | uid: 邮件 UID
 `narration_max_tokens` 是直接 LLM 转述的最大**输出**预算：它不限制输入邮件长度，也不作用于官方定时任务。模型可以提前结束，不会被要求用满；设置过小可能让转述被截断，设置更大则只会放宽上限。设为 `0` 时插件不传递 `max_tokens`，改由 AstrBot Provider 或上游 API 的默认规则决定。`mail_processing_max_tokens` 对总结/翻译采用相同的 `0` 语义。
 
 插件内置的 LLM/Cron 提示词统一保存在 `prompts.json`，由 `prompt_loader.py` 加载和校验。配置页的 `narration_prompt`、`mail_summary_prompt` 和 `mail_translation_prompt` 默认均为空；留空时后端分别回退到内置转述、总结和翻译提示词。修改总结/翻译提示词后，缓存键也会变化，下一次处理会重新调用模型。
+
+配置页面按“通用与权限”“新邮件通知与转述”“LLM 写邮件与发送安全”“邮件中心 WebUI”“索引、文件夹与正文缓存”分组。后端仍兼容 v2.2.0 以前的扁平配置键，升级不会要求手工改写旧配置文件。
 
 ## LLM 只读邮件工具
 

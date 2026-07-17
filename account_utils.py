@@ -3,6 +3,8 @@ from __future__ import annotations
 import shlex
 from typing import Any
 
+from .config_utils import config_get
+
 
 def private_user_id(value: Any) -> str:
     """Normalize a plain private user ID or extract it from a private UMO."""
@@ -31,12 +33,12 @@ def account_target_platform(account: dict[str, Any]) -> str:
 
 
 def enabled_accounts(config: dict[str, Any]) -> list[dict[str, Any]]:
-    accounts = config.get("mail_accounts", []) if isinstance(config, dict) else []
+    accounts = config_get(config, "mail_accounts", [])
     return [item for item in accounts if isinstance(item, dict) and item.get("enabled", True)]
 
 
 def is_admin(sender_id: str, config: dict[str, Any]) -> bool:
-    admins = config.get("admin_uids", []) if isinstance(config, dict) else []
+    admins = config_get(config, "admin_uids", [])
     return str(sender_id or "").strip() in {str(item).strip() for item in admins if str(item).strip()}
 
 

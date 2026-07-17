@@ -7,6 +7,7 @@ import secrets
 import time
 from typing import Any, Callable
 
+from .config_utils import config_get
 from .mail_index import MailDraft
 from .smtp_client import build_draft_message, send_draft_message
 
@@ -59,7 +60,7 @@ class EmailDraftService:
 
     def _confirmation_ttl_minutes(self) -> int:
         try:
-            value = int(self.plugin.config.get("llm_send_confirmation_ttl_minutes", 10))
+            value = int(config_get(self.plugin.config, "llm_send_confirmation_ttl_minutes", 10))
         except (TypeError, ValueError):
             value = 10
         return max(1, min(60, value))

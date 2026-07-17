@@ -44,6 +44,16 @@ class WebAssetTests(unittest.TestCase):
         self.assertIn("current.body_cached = true", app)
         self.assertIn("if (state.selectedUid !== uid) return", app)
 
+    def test_ai_cache_auto_display_and_forced_language_controls_exist(self):
+        app = (PLUGIN_DIR / "pages/mailbox/app.js").read_text(encoding="utf-8")
+        page = (PLUGIN_DIR / "pages/mailbox/index.html").read_text(encoding="utf-8")
+        self.assertIn('apiGet("message/ai-cache"', app)
+        self.assertIn("showConfiguredCachedResult(message, aiResult)", app)
+        self.assertIn("target_language: options.targetLanguage", app)
+        self.assertIn("force: options.force === true", app)
+        self.assertIn('className = "button secondary split-regenerate"', app)
+        self.assertIn('id="processing-language-input"', page)
+
 
 if __name__ == "__main__":
     unittest.main()
