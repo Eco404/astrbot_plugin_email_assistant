@@ -37,6 +37,8 @@ _DRAFT_STATUSES = {
     "editing", "pending_review", "approved", "sending",
     "sent", "failed", "cancelled",
 }
+_VERIFICATION_CACHE_SECONDS = 30.0
+_VERIFICATION_CACHE_MAX_ITEMS = 512
 
 
 def _one_line(value: Any, limit: int = 180) -> str:
@@ -50,6 +52,8 @@ class EmailAssistantPageApi:
         self.plugin = plugin
         self._draft_send_locks = plugin._draft_service.locks
         self._ai_locks: dict[str, asyncio.Lock] = {}
+        self._detail_tasks: dict[str, asyncio.Task] = {}
+        self._verification_cache: dict[str, tuple[float, dict[str, Any]]] = {}
 
     def register_routes(self) -> None:
         register = self.plugin.context.register_web_api
@@ -130,6 +134,62 @@ class EmailAssistantPageApi:
             raise RuntimeError("本地邮件索引未启用或初始化失败，邮件中心暂不可用。")
         return index
 
+    def _message_key(
+        self, account: dict[str, Any], folder: str, uid: int
+    ) -> str:
+        return f"{self.plugin._account_key(account)}:{folder}:{int(uid)}"
+
+    async def _fetch_detail_shared(
+        self, account: dict[str, Any], folder: str, uid: int
+    ):
+        """Merge concurrent WebUI reads for the same remote message."""
+        key = self._message_key(account, folder, uid)
+        task = self._detail_tasks.get(key)
+        if task is None or task.done():
+            task = asyncio.create_task(
+                self.plugin._fetch_remote_detail(account, uid, folder),
+                name=f"email_web_detail:{key}",
+            )
+            self._detail_tasks[key] = task
+
+            def cleanup(done: asyncio.Task) -> None:
+                if self._detail_tasks.get(key) is done:
+                    self._detail_tasks.pop(key, None)
+                if done.cancelled():
+                    return
+                done.exception()
+
+            task.add_done_callback(cleanup)
+        try:
+            return await asyncio.shield(task)
+        finally:
+            if task.done() and self._detail_tasks.get(key) is task:
+                self._detail_tasks.pop(key, None)
+
+    def _recent_verification(self, key: str) -> dict[str, Any] | None:
+        cached = self._verification_cache.get(key)
+        if cached is None:
+            return None
+        cached_at, result = cached
+        if time.monotonic() - cached_at >= _VERIFICATION_CACHE_SECONDS:
+            self._verification_cache.pop(key, None)
+            return None
+        return dict(result, verification_cached=True)
+
+    def _cache_verification(self, key: str, result: dict[str, Any]) -> None:
+        now = time.monotonic()
+        if len(self._verification_cache) >= _VERIFICATION_CACHE_MAX_ITEMS:
+            expired = [
+                item_key
+                for item_key, (cached_at, _result) in self._verification_cache.items()
+                if now - cached_at >= _VERIFICATION_CACHE_SECONDS
+            ]
+            for item_key in expired:
+                self._verification_cache.pop(item_key, None)
+            while len(self._verification_cache) >= _VERIFICATION_CACHE_MAX_ITEMS:
+                self._verification_cache.pop(next(iter(self._verification_cache)))
+        self._verification_cache[key] = (now, dict(result))
+
     def _resolve_account(
         self, account_id: Any, *, capability: str | None = None
     ) -> dict[str, Any]:
@@ -204,7 +264,7 @@ class EmailAssistantPageApi:
             return self._ok(
                 {
                     "plugin": {
-                        "version": "2.2.0",
+                        "version": "2.2.1",
                         "index_enabled": self.plugin._mail_index is not None,
                         "body_cache_mode": str(
                             config_get(self.plugin.config, "body_cache_mode") or "on_demand"
@@ -414,7 +474,7 @@ class EmailAssistantPageApi:
                 raise ValueError("邮件 UID 必须是正整数。")
             folder = await self._folder(account, query.get("folder"))
             self.plugin._log_mail_operation("web_show", account, uid=uid)
-            mail = await self.plugin._fetch_remote_detail(account, uid, folder)
+            mail = await self._fetch_detail_shared(account, folder, uid)
             body_limit = self._int(
                 config_get(self.plugin.config, "detail_body_max_chars"),
                 4000,
@@ -509,6 +569,13 @@ class EmailAssistantPageApi:
             index = self._require_index()
             account_id = self.plugin._account_key(account)
             state = await asyncio.to_thread(index.get_state, account_id, folder)
+            verification_key = (
+                f"{self._message_key(account, folder, uid)}:"
+                f"{state.uidvalidity if state is not None else 0}"
+            )
+            recent = self._recent_verification(verification_key)
+            if recent is not None:
+                return self._ok(recent)
             header = await asyncio.to_thread(index.get_header, account_id, folder, uid)
             cached = (
                 await asyncio.to_thread(
@@ -522,25 +589,27 @@ class EmailAssistantPageApi:
                 else None
             )
             try:
-                remote = await self.plugin._fetch_remote_detail(account, uid, folder)
+                remote = await self._fetch_detail_shared(account, folder, uid)
             except MailNotFoundError:
-                return self._ok(
-                    {
-                        "verification_status": "deleted",
-                        "message": "邮件已在云端删除或移出当前文件夹。",
-                    }
-                )
+                result = {
+                    "verification_status": "deleted",
+                    "message": "邮件已在云端删除或移出当前文件夹。",
+                    "verification_cached": False,
+                }
+                return self._ok(result)
             changed = bool(
                 header is not None
                 and cached is not None
                 and not self._cached_matches_remote(header, cached, remote)
             )
-            return self._ok(
-                {
-                    "verification_status": "changed" if changed else "current",
-                    "message": "云端邮件内容已变化。" if changed else "云端校验通过。",
-                }
-            )
+            result = {
+                "verification_status": "changed" if changed else "current",
+                "message": "云端邮件内容已变化。" if changed else "云端校验通过。",
+                "verification_cached": False,
+            }
+            if not changed:
+                self._cache_verification(verification_key, result)
+            return self._ok(result)
         except Exception as exc:
             return self._error(exc)
 

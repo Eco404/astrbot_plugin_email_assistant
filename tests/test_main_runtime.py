@@ -1330,6 +1330,62 @@ class MainRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             verification["data"]["verification_status"], "changed"
         )
+        self.assertFalse(verification["data"]["verification_cached"])
+
+    async def test_page_current_verification_uses_thirty_second_cooldown(self):
+        index = self._enable_test_index()
+        timestamp = datetime(2026, 7, 16, 10, 0).timestamp()
+        message = ParsedMail(
+            20, "未变化", "Sender", "a@example.com", "a@example.com",
+            "2026-07-16", timestamp, "缓存正文", False, "", "",
+        )
+        index.apply_sync("one", "INBOX", 10, 20, [message])
+        index.cache_body("one", "INBOX", 10, 20, message.body, 1024)
+        api = EmailAssistantPageApi(self.plugin)
+        fake_request = FakePageRequest()
+        fake_request.payload = {
+            "account_id": "one", "folder": "INBOX", "uid": 20,
+        }
+        with patch.object(page_api_module, "request", fake_request), patch.object(
+            self.plugin, "_fetch_remote_detail", return_value=message
+        ) as fetch:
+            first = await api.verify_message()
+            repeated = await api.verify_message()
+        self.assertEqual(first["data"]["verification_status"], "current")
+        self.assertFalse(first["data"]["verification_cached"])
+        self.assertTrue(repeated["data"]["verification_cached"])
+        fetch.assert_awaited_once()
+
+    async def test_page_concurrent_remote_detail_requests_are_merged(self):
+        message = ParsedMail(
+            19, "并发正文", "Sender", "a@example.com", "a@example.com",
+            "2026-07-16", datetime(2026, 7, 16, 10, 0).timestamp(),
+            "body", False, "", "",
+        )
+        api = EmailAssistantPageApi(self.plugin)
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def delayed_detail(*_args):
+            started.set()
+            await release.wait()
+            return message
+
+        with patch.object(
+            self.plugin, "_fetch_remote_detail", new=AsyncMock(side_effect=delayed_detail)
+        ) as fetch:
+            first = asyncio.create_task(
+                api._fetch_detail_shared(self.account, "INBOX", 19)
+            )
+            await started.wait()
+            second = asyncio.create_task(
+                api._fetch_detail_shared(self.account, "INBOX", 19)
+            )
+            await asyncio.sleep(0)
+            release.set()
+            results = await asyncio.gather(first, second)
+        self.assertEqual([item.uid for item in results], [19, 19])
+        fetch.assert_awaited_once()
 
 
 if __name__ == "__main__":
