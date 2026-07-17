@@ -1,7 +1,7 @@
 name: astrbot_plugin_email_assistant
 display_name: 邮件助手
-desc: 多账户 IMAP 收信通知、LLM 安全草稿与查询、SMTP 收发和邮件中心 WebUI
+desc: AstrBot 多账户邮件助手，支持 IMAP/SMTP；让 LLM 带人格参与邮件转述通知与发送，也可用指令控制以及草稿编辑；支持 WebUI 邮件中心，可总结邮件和翻译邮件
 version: v2.1.0
 author: econeco
-astrbot_version: ">=4.26.0"
+astrbot_version: ">=4.22.0"
 repo: "https://github.com/Eco404/astrbot_plugin_email_assistant"
