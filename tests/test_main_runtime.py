@@ -122,7 +122,10 @@ from astrbot_plugin_email_assistant.imap_client import (
 )
 from astrbot_plugin_email_assistant.mail_index import MailHeaderIndex, mail_content_hash
 from astrbot_plugin_email_assistant.mail_parser import ParsedMail
-from astrbot_plugin_email_assistant.main import EmailAssistantPlugin
+from astrbot_plugin_email_assistant.main import (
+    EMAIL_LLM_TOOL_NAMES,
+    EmailAssistantPlugin,
+)
 from astrbot_plugin_email_assistant import page_api as page_api_module
 from astrbot_plugin_email_assistant.page_api import EmailAssistantPageApi
 
@@ -270,6 +273,22 @@ class FakePageRequest:
 
     async def json(self, default=None):
         return self.payload
+
+
+class FakeTool:
+    def __init__(self, name):
+        self.name = name
+
+
+class FakeToolSet:
+    def __init__(self, names):
+        self.tools = [FakeTool(name) for name in names]
+
+    def names(self):
+        return [tool.name for tool in self.tools]
+
+    def remove_tool(self, name):
+        self.tools = [tool for tool in self.tools if tool.name != name]
 
 
 class MainRuntimeTests(unittest.IsolatedAsyncioTestCase):
@@ -583,29 +602,83 @@ class MainRuntimeTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_llm_request_injects_silent_email_tool_rules_once(self):
         event = FakeEvent("1", "p:FriendMessage:1")
-        req = types.SimpleNamespace(system_prompt="原人格提示")
+        req = types.SimpleNamespace(
+            system_prompt="原人格提示",
+            func_tool=FakeToolSet(EMAIL_LLM_TOOL_NAMES),
+        )
 
         await self.plugin.inject_email_tool_conversation_rules(event, req)
         first_prompt = req.system_prompt
         await self.plugin.inject_email_tool_conversation_rules(event, req)
 
         self.assertIn("原人格提示", req.system_prompt)
-        self.assertIn("直接返回工具调用", req.system_prompt)
-        self.assertIn("不要逐步播报", req.system_prompt)
+        self.assertIn("不输出中间步骤", req.system_prompt)
         self.assertEqual(req.system_prompt, first_prompt)
+        self.assertNotIn("email_assistant_create_draft", req.func_tool.names())
+        self.assertNotIn("email_assistant_summarize_message", req.func_tool.names())
+        self.assertIn("email_assistant_list_messages", req.func_tool.names())
 
     async def test_llm_request_does_not_inject_for_group_or_unbound_user(self):
-        group_req = types.SimpleNamespace(system_prompt="原提示")
+        group_req = types.SimpleNamespace(
+            system_prompt="原提示",
+            func_tool=FakeToolSet(EMAIL_LLM_TOOL_NAMES),
+        )
         await self.plugin.inject_email_tool_conversation_rules(
             FakeEvent("1", "p:GroupMessage:1"), group_req
         )
         self.assertEqual(group_req.system_prompt, "原提示")
+        self.assertFalse(set(group_req.func_tool.names()) & EMAIL_LLM_TOOL_NAMES)
 
-        other_req = types.SimpleNamespace(system_prompt="原提示")
+        other_req = types.SimpleNamespace(
+            system_prompt="原提示",
+            func_tool=FakeToolSet(EMAIL_LLM_TOOL_NAMES),
+        )
         await self.plugin.inject_email_tool_conversation_rules(
             FakeEvent("2", "p:FriendMessage:2"), other_req
         )
         self.assertEqual(other_req.system_prompt, "原提示")
+        self.assertFalse(set(other_req.func_tool.names()) & EMAIL_LLM_TOOL_NAMES)
+
+    async def test_llm_request_keeps_only_tools_supported_by_account_capabilities(self):
+        self._enable_test_index()
+        self.plugin.config["llm_write_settings"]["llm_mail_write_enabled"] = True
+        self.account["query_enabled"] = False
+        req = types.SimpleNamespace(
+            system_prompt="原提示",
+            func_tool=FakeToolSet([*EMAIL_LLM_TOOL_NAMES, "other_plugin_tool"]),
+        )
+
+        await self.plugin.inject_email_tool_conversation_rules(
+            FakeEvent("1", "p:FriendMessage:1"), req
+        )
+
+        names = set(req.func_tool.names())
+        self.assertIn("other_plugin_tool", names)
+        self.assertIn("email_assistant_list_accounts", names)
+        self.assertIn("email_assistant_create_draft", names)
+        self.assertIn("email_assistant_confirm_send", names)
+        self.assertIn("email_assistant_cancel_draft", names)
+        self.assertNotIn("email_assistant_list_messages", names)
+        self.assertNotIn("email_assistant_create_reply_draft", names)
+        self.assertNotIn("email_assistant_summarize_message", names)
+        self.assertIn("不输出中间步骤", req.system_prompt)
+
+    async def test_llm_request_keeps_processing_tools_but_removes_disabled_write_tools(self):
+        self._enable_test_index()
+        req = types.SimpleNamespace(
+            system_prompt="原提示",
+            func_tool=FakeToolSet(EMAIL_LLM_TOOL_NAMES),
+        )
+
+        await self.plugin.inject_email_tool_conversation_rules(
+            FakeEvent("1", "p:FriendMessage:1"), req
+        )
+
+        names = set(req.func_tool.names())
+        self.assertIn("email_assistant_summarize_message", names)
+        self.assertIn("email_assistant_translate_message", names)
+        self.assertNotIn("email_assistant_create_draft", names)
+        self.assertNotIn("email_assistant_confirm_send", names)
 
     async def test_llm_tool_lists_messages_with_limit(self):
         event = FakeEvent("1", "p:FriendMessage:1")

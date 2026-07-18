@@ -53,6 +53,35 @@ PLUGIN_NAME = "astrbot_plugin_email_assistant"
 
 EMAIL_TOOL_PROMPT_MARKER = "<!-- email_assistant_tool_conversation_v2 -->"
 
+EMAIL_ACCOUNT_TOOL = "email_assistant_list_accounts"
+EMAIL_QUERY_TOOL_NAMES = frozenset(
+    {
+        "email_assistant_list_messages",
+        "email_assistant_get_latest_message",
+        "email_assistant_show_message",
+    }
+)
+EMAIL_PROCESS_TOOL_NAMES = frozenset(
+    {
+        "email_assistant_summarize_message",
+        "email_assistant_translate_message",
+    }
+)
+EMAIL_SEND_TOOL_NAMES = frozenset(
+    {
+        "email_assistant_create_draft",
+        "email_assistant_confirm_send",
+        "email_assistant_cancel_draft",
+    }
+)
+EMAIL_REPLY_TOOL = "email_assistant_create_reply_draft"
+EMAIL_LLM_TOOL_NAMES = frozenset(
+    {EMAIL_ACCOUNT_TOOL, EMAIL_REPLY_TOOL}
+    | EMAIL_QUERY_TOOL_NAMES
+    | EMAIL_PROCESS_TOOL_NAMES
+    | EMAIL_SEND_TOOL_NAMES
+)
+
 
 def _email_llm_tool(name: str, description_prompt: str):
     def decorator(func):
@@ -90,7 +119,7 @@ def _one_line(value: Any, limit: int = 160) -> str:
     PLUGIN_NAME,
     "econeco",
     "支持多账户 IMAP 收信通知、LLM 安全草稿与查询、SMTP 收发和邮件中心 WebUI 的邮件助手",
-    "2.3.0",
+    "2.3.1",
 )
 class EmailAssistantPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig) -> None:
@@ -1554,25 +1583,97 @@ class EmailAssistantPlugin(Star):
             return None, "该邮箱的查询功能已关闭。"
         return account, ""
 
+    @staticmethod
+    def _request_tool_names(req: Any) -> set[str]:
+        tool_set = getattr(req, "func_tool", None)
+        if tool_set is None:
+            return set()
+        names = getattr(tool_set, "names", None)
+        if callable(names):
+            try:
+                return {str(name) for name in names()}
+            except Exception:
+                pass
+        tools = getattr(tool_set, "tools", None)
+        if isinstance(tools, list):
+            return {
+                str(getattr(tool, "name", "") or "")
+                for tool in tools
+                if str(getattr(tool, "name", "") or "")
+            }
+        return set()
+
+    @staticmethod
+    def _remove_request_tools(req: Any, names: set[str]) -> None:
+        if not names:
+            return
+        tool_set = getattr(req, "func_tool", None)
+        if tool_set is None:
+            return
+        remove_tool = getattr(tool_set, "remove_tool", None)
+        if callable(remove_tool):
+            for name in names:
+                remove_tool(name)
+            return
+        tools = getattr(tool_set, "tools", None)
+        if isinstance(tools, list):
+            tool_set.tools = [
+                tool
+                for tool in tools
+                if str(getattr(tool, "name", "") or "") not in names
+            ]
+
+    def _allowed_email_tool_names(self, event: AstrMessageEvent) -> set[str]:
+        if self._guard_read_tool(event):
+            return set()
+        try:
+            accounts = [
+                account
+                for account in self._visible_accounts(event)
+                if not self._validate_account(account)
+            ]
+        except Exception:
+            return set()
+        query_accounts = [
+            account for account in accounts if account.get("query_enabled", True)
+        ]
+        write_available = bool(
+            config_get(self.config, "llm_mail_write_enabled", False)
+            and self._mail_index is not None
+        )
+        send_accounts = (
+            [account for account in accounts if account.get("send_enabled", True)]
+            if write_available
+            else []
+        )
+
+        allowed: set[str] = set()
+        if query_accounts:
+            allowed.add(EMAIL_ACCOUNT_TOOL)
+            allowed.update(EMAIL_QUERY_TOOL_NAMES)
+            if self._mail_index is not None:
+                allowed.update(EMAIL_PROCESS_TOOL_NAMES)
+        if send_accounts:
+            allowed.add(EMAIL_ACCOUNT_TOOL)
+            allowed.update(EMAIL_SEND_TOOL_NAMES)
+            if any(account.get("query_enabled", True) for account in send_accounts):
+                allowed.add(EMAIL_REPLY_TOOL)
+        return allowed
+
     @filter.on_llm_request()
     async def inject_email_tool_conversation_rules(
         self, event: AstrMessageEvent, req: Any
     ) -> None:
-        """让邮件工具静默执行，只在全部完成后输出最终结果。"""
-        if req is None or not self._is_private(event):
+        """按当前用户能力裁剪邮件工具，并注入精简交互规则。"""
+        if req is None:
             return
-        try:
-            has_email_capability = any(
-                account.get("query_enabled", True)
-                or (
-                    config_get(self.config, "llm_mail_write_enabled", False)
-                    and account.get("send_enabled", True)
-                )
-                for account in self._visible_accounts(event)
-            )
-        except Exception:
+        present_email_tools = self._request_tool_names(req) & EMAIL_LLM_TOOL_NAMES
+        if not present_email_tools:
             return
-        if not has_email_capability:
+        allowed_email_tools = self._allowed_email_tool_names(event)
+        self._remove_request_tools(req, present_email_tools - allowed_email_tools)
+        remaining_email_tools = self._request_tool_names(req) & EMAIL_LLM_TOOL_NAMES
+        if not remaining_email_tools:
             return
         current_prompt = str(getattr(req, "system_prompt", "") or "")
         if EMAIL_TOOL_PROMPT_MARKER in current_prompt:
