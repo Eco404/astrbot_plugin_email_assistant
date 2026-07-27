@@ -117,6 +117,35 @@ class FakeTransferMailbox:
 
 
 class IMAPClientTests(unittest.TestCase):
+    def test_gmail_fetch_records_stable_message_id(self):
+        raw = (
+            b"From: sender@example.com\r\n"
+            b"To: reader@example.com\r\n"
+            b"Subject: Test\r\n"
+            b"Message-ID: <test@example.com>\r\n"
+            b"\r\nBody"
+        )
+
+        class Connection:
+            capabilities = (b"IMAP4REV1", b"X-GM-EXT-1")
+
+            def __init__(self):
+                self.calls = []
+
+            def uid(self, *args):
+                self.calls.append(args)
+                return "OK", [
+                    (b"7 (X-GM-MSGID 123456789 RFC822 {120}", raw),
+                    b")",
+                ]
+
+        mailbox = object.__new__(ImapMailbox)
+        mailbox.connection = Connection()
+        parsed = mailbox.fetch_uid(7)
+
+        self.assertEqual(parsed.gmail_msgid, "123456789")
+        self.assertIn("X-GM-MSGID", mailbox.connection.calls[0][2])
+
     def test_folder_list_uses_rfc_compatible_default_arguments(self):
         class Connection:
             def __init__(self):

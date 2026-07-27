@@ -247,7 +247,7 @@
       "body_cache_retention_days": {"type": "int", "description": "正文缓存保留天数", "hint": "按最后访问时间清理。", "default": 90},
       "body_cache_max_item_kb": {"type": "int", "description": "单封正文缓存上限（KB）", "hint": "超过上限只缓存前半部分并记录截断状态。", "default": 512},
       "body_cache_max_total_mb": {"type": "int", "description": "正文缓存总容量（MB）", "hint": "超过容量后按最久未访问顺序清理。", "default": 200},
-      "body_cache_purge_on_remote_delete": {"type": "bool", "description": "云端删除时清理正文缓存", "hint": "建议保持开启；UIDVALIDITY 变化时始终清理旧代正文。", "default": true}
+      "body_cache_purge_on_remote_delete": {"type": "bool", "description": "云端删除时清理正文缓存", "hint": "建议保持开启。邮件移出当前文件夹后会先保留 24 小时供目标文件夹复用；仅在没有其他有效位置时清理，避免把移动误判为删除。", "default": true}
     }
   }
 }

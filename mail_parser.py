@@ -124,6 +124,7 @@ class ParsedMail:
     has_attachments: bool
     message_id: str
     references: str
+    gmail_msgid: str = ""
 
     def body_preview(self, limit: int) -> str:
         if limit <= 0 or len(self.body) <= limit:
@@ -157,4 +158,3 @@ def parse_since_date(value: str | None, *, default_days: int = 7) -> datetime:
     if value:
         return datetime.strptime(value, "%Y-%m-%d")
     return datetime.now().replace(microsecond=0) - timedelta(days=default_days)
-

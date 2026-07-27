@@ -724,21 +724,6 @@ class EmailAssistantPageApi:
                         state.uidvalidity,
                         uid,
                     )
-                    if self.plugin._purge_cached_body_on_remote_delete():
-                        await asyncio.to_thread(
-                            index.delete_cached_body,
-                            account_id,
-                            source,
-                            state.uidvalidity,
-                            uid,
-                        )
-                    await asyncio.to_thread(
-                        index.delete_ai_results,
-                        account_id,
-                        source,
-                        state.uidvalidity,
-                        uid,
-                    )
             await self.plugin._sync_account_index(account, folder=target)
             if move:
                 await self.plugin._sync_account_index(

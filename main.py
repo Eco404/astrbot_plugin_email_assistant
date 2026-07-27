@@ -119,7 +119,7 @@ def _one_line(value: Any, limit: int = 160) -> str:
     PLUGIN_NAME,
     "econeco",
     "支持多账户 IMAP 收信通知、LLM 安全草稿与查询、SMTP 收发和邮件中心 WebUI 的邮件助手",
-    "2.3.1",
+    "2.4.0",
 )
 class EmailAssistantPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig) -> None:
@@ -423,7 +423,7 @@ class EmailAssistantPlugin(Star):
             result.history_before_uid,
             result.history_complete,
         )
-        if apply_result.remote_state_changes:
+        if result.remote_uids is not None:
             if self._purge_cached_body_on_remote_delete():
                 await asyncio.to_thread(
                     index.purge_remote_missing_bodies, account_id, folder
@@ -658,18 +658,10 @@ class EmailAssistantPlugin(Star):
                     )
                     if self._purge_cached_body_on_remote_delete():
                         await asyncio.to_thread(
-                            index.delete_cached_body,
-                            account_id,
-                            folder,
-                            expected_uidvalidity,
-                            int(uid),
+                            index.purge_remote_missing_bodies, account_id, folder
                         )
                     await asyncio.to_thread(
-                        index.delete_ai_results,
-                        account_id,
-                        folder,
-                        expected_uidvalidity,
-                        int(uid),
+                        index.purge_remote_missing_ai_results, account_id, folder
                     )
                 raise MailNotFoundError(
                     f"UID {uid} 已在云端删除、移动，或不再属于当前文件夹；本地索引已标记失效。"

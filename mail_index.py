@@ -11,7 +11,11 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
+from .db_migration import MailDatabaseVersion
 from .mail_parser import ParsedMail
+
+
+MESSAGE_RELOCATION_GRACE_SECONDS = 86400
 
 
 def mail_content_hash(mail: ParsedMail) -> str:
@@ -26,6 +30,32 @@ def mail_content_hash(mail: ParsedMail) -> str:
         ]
     )
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def mail_identity(mail: ParsedMail) -> tuple[str, str, str]:
+    gmail_msgid = str(mail.gmail_msgid or "").strip()
+    if gmail_msgid:
+        kind = "gmail_msgid"
+        value = gmail_msgid
+    else:
+        message_id = "".join(str(mail.message_id or "").split()).casefold()
+        if message_id:
+            kind = "message_id"
+            value = message_id
+        else:
+            kind = "header_fingerprint"
+            value = "\n".join(
+                (
+                    str(mail.subject or "").strip(),
+                    str(mail.from_addr or "").strip().casefold(),
+                    str(mail.reply_to or "").strip().casefold(),
+                    str(mail.date or "").strip(),
+                    str(mail.references or "").strip(),
+                    "1" if mail.has_attachments else "0",
+                )
+            )
+    digest = hashlib.sha256(f"{kind}\0{value}".encode("utf-8")).hexdigest()
+    return f"{kind}:{digest}", kind, value
 
 
 @dataclass(slots=True)
@@ -160,6 +190,8 @@ class MailHeaderIndex:
     def initialize(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._connection() as connection:
+            is_new_database = MailDatabaseVersion.verify_or_prepare(connection)
+            MailDatabaseVersion.create_version_table(connection)
             connection.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS mailboxes (
@@ -174,11 +206,27 @@ class MailHeaderIndex:
                     PRIMARY KEY (account_id, folder)
                 );
 
+                CREATE TABLE IF NOT EXISTS mail_messages (
+                    account_id TEXT NOT NULL,
+                    message_key TEXT NOT NULL,
+                    identity_kind TEXT NOT NULL,
+                    identity_value TEXT NOT NULL,
+                    message_id TEXT NOT NULL DEFAULT '',
+                    gmail_msgid TEXT NOT NULL DEFAULT '',
+                    first_seen_at REAL NOT NULL DEFAULT 0,
+                    last_seen_at REAL NOT NULL DEFAULT 0,
+                    PRIMARY KEY (account_id, message_key)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_mail_messages_identity
+                ON mail_messages (account_id, identity_kind, identity_value);
+
                 CREATE TABLE IF NOT EXISTS mail_headers (
                     account_id TEXT NOT NULL,
                     folder TEXT NOT NULL,
                     uidvalidity INTEGER NOT NULL,
                     uid INTEGER NOT NULL,
+                    message_key TEXT NOT NULL,
                     subject TEXT NOT NULL DEFAULT '',
                     from_name TEXT NOT NULL DEFAULT '',
                     from_addr TEXT NOT NULL DEFAULT '',
@@ -190,7 +238,9 @@ class MailHeaderIndex:
                     references_text TEXT NOT NULL DEFAULT '',
                     remote_state TEXT NOT NULL DEFAULT 'active',
                     last_seen_at REAL NOT NULL DEFAULT 0,
-                    PRIMARY KEY (account_id, folder, uidvalidity, uid)
+                    PRIMARY KEY (account_id, folder, uidvalidity, uid),
+                    FOREIGN KEY (account_id, message_key)
+                        REFERENCES mail_messages (account_id, message_key)
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_mail_headers_query
@@ -200,18 +250,16 @@ class MailHeaderIndex:
 
                 CREATE TABLE IF NOT EXISTS mail_bodies (
                     account_id TEXT NOT NULL,
-                    folder TEXT NOT NULL,
-                    uidvalidity INTEGER NOT NULL,
-                    uid INTEGER NOT NULL,
+                    message_key TEXT NOT NULL,
                     body_text TEXT NOT NULL DEFAULT '',
                     content_hash TEXT NOT NULL DEFAULT '',
                     size_bytes INTEGER NOT NULL DEFAULT 0,
                     truncated INTEGER NOT NULL DEFAULT 0,
                     fetched_at REAL NOT NULL DEFAULT 0,
                     last_accessed_at REAL NOT NULL DEFAULT 0,
-                    PRIMARY KEY (account_id, folder, uidvalidity, uid),
-                    FOREIGN KEY (account_id, folder, uidvalidity, uid)
-                        REFERENCES mail_headers (account_id, folder, uidvalidity, uid)
+                    PRIMARY KEY (account_id, message_key),
+                    FOREIGN KEY (account_id, message_key)
+                        REFERENCES mail_messages (account_id, message_key)
                         ON DELETE CASCADE
                 );
 
@@ -236,9 +284,7 @@ class MailHeaderIndex:
 
                 CREATE TABLE IF NOT EXISTS mail_ai_cache (
                     account_id TEXT NOT NULL,
-                    folder TEXT NOT NULL,
-                    uidvalidity INTEGER NOT NULL,
-                    uid INTEGER NOT NULL,
+                    message_key TEXT NOT NULL,
                     content_hash TEXT NOT NULL,
                     task TEXT NOT NULL,
                     target_language TEXT NOT NULL DEFAULT '',
@@ -247,11 +293,11 @@ class MailHeaderIndex:
                     created_at REAL NOT NULL,
                     last_accessed_at REAL NOT NULL,
                     PRIMARY KEY (
-                        account_id, folder, uidvalidity, uid,
-                        content_hash, task, target_language
+                        account_id, message_key, content_hash,
+                        task, target_language
                     ),
-                    FOREIGN KEY (account_id, folder, uidvalidity, uid)
-                        REFERENCES mail_headers (account_id, folder, uidvalidity, uid)
+                    FOREIGN KEY (account_id, message_key)
+                        REFERENCES mail_messages (account_id, message_key)
                         ON DELETE CASCADE
                 );
 
@@ -311,6 +357,8 @@ class MailHeaderIndex:
                 ON mail_send_confirmations (draft_id, consumed_at, expires_at);
                 """
             )
+            if is_new_database:
+                MailDatabaseVersion.record_current_version(connection)
         try:
             os.chmod(self.path, 0o600)
         except OSError:
@@ -321,20 +369,18 @@ class MailHeaderIndex:
         """Keep only the newest summary and translation for each message."""
         rows = connection.execute(
             """
-            SELECT rowid, account_id, folder, uidvalidity, uid, task, created_at
+            SELECT rowid, account_id, message_key, task, created_at
             FROM mail_ai_cache
             ORDER BY created_at DESC, rowid DESC
             """
         ).fetchall()
-        seen: set[tuple[str, str, int, int, str]] = set()
+        seen: set[tuple[str, str, str]] = set()
         stale_rowids: list[tuple[int]] = []
         for row in rows:
             task_family = str(row["task"]).split(":", 1)[0]
             key = (
                 str(row["account_id"]),
-                str(row["folder"]),
-                int(row["uidvalidity"]),
-                int(row["uid"]),
+                str(row["message_key"]),
                 task_family,
             )
             if key in seen:
@@ -452,11 +498,71 @@ class MailHeaderIndex:
         )
 
     @staticmethod
+    def _upsert_message(
+        connection: sqlite3.Connection,
+        account_id: str,
+        mail: ParsedMail,
+        now: float,
+    ) -> str:
+        message_key, identity_kind, identity_value = mail_identity(mail)
+        connection.execute(
+            """
+            INSERT INTO mail_messages (
+                account_id, message_key, identity_kind, identity_value,
+                message_id, gmail_msgid, first_seen_at, last_seen_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(account_id, message_key) DO UPDATE SET
+                message_id = CASE
+                    WHEN excluded.message_id != '' THEN excluded.message_id
+                    ELSE mail_messages.message_id
+                END,
+                gmail_msgid = CASE
+                    WHEN excluded.gmail_msgid != '' THEN excluded.gmail_msgid
+                    ELSE mail_messages.gmail_msgid
+                END,
+                last_seen_at = excluded.last_seen_at
+            """,
+            (
+                account_id,
+                message_key,
+                identity_kind,
+                identity_value,
+                str(mail.message_id or ""),
+                str(mail.gmail_msgid or ""),
+                now,
+                now,
+            ),
+        )
+        return message_key
+
+    @staticmethod
+    def _message_key_for_location(
+        connection: sqlite3.Connection,
+        account_id: str,
+        folder: str,
+        uidvalidity: int,
+        uid: int,
+        *,
+        active_only: bool = False,
+    ) -> str | None:
+        active_clause = " AND remote_state = 'active'" if active_only else ""
+        row = connection.execute(
+            f"""
+            SELECT message_key FROM mail_headers
+            WHERE account_id = ? AND folder = ? AND uidvalidity = ? AND uid = ?
+              {active_clause}
+            """,
+            (account_id, folder, int(uidvalidity), int(uid)),
+        ).fetchone()
+        return str(row["message_key"]) if row is not None else None
+
+    @staticmethod
     def _header_values(
         account_id: str,
         folder: str,
         uidvalidity: int,
         mail: ParsedMail,
+        message_key: str,
         now: float,
     ) -> tuple:
         return (
@@ -464,6 +570,7 @@ class MailHeaderIndex:
             folder,
             int(uidvalidity),
             int(mail.uid),
+            message_key,
             str(mail.subject or ""),
             str(mail.from_name or ""),
             str(mail.from_addr or ""),
@@ -506,20 +613,6 @@ class MailHeaderIndex:
                     WHERE account_id = ? AND folder = ? AND remote_state != 'stale_uidvalidity'
                     """,
                     (account_id, folder),
-                )
-                connection.execute(
-                    """
-                    DELETE FROM mail_bodies
-                    WHERE account_id = ? AND folder = ? AND uidvalidity != ?
-                    """,
-                    (account_id, folder, int(uidvalidity)),
-                )
-                connection.execute(
-                    """
-                    DELETE FROM mail_ai_cache
-                    WHERE account_id = ? AND folder = ? AND uidvalidity != ?
-                    """,
-                    (account_id, folder, int(uidvalidity)),
                 )
 
             previous_synced = 0
@@ -586,16 +679,27 @@ class MailHeaderIndex:
             )
 
             if headers:
-                header_values = [
-                    self._header_values(account_id, folder, uidvalidity, mail, now)
-                    for mail in headers
-                ]
-                changed_header_uids: list[int] = []
+                header_values = []
+                for mail in headers:
+                    message_key = self._upsert_message(
+                        connection, account_id, mail, now
+                    )
+                    header_values.append(
+                        self._header_values(
+                            account_id,
+                            folder,
+                            uidvalidity,
+                            mail,
+                            message_key,
+                            now,
+                        )
+                    )
+                content_changed_message_keys: set[str] = set()
                 for values in header_values:
                     existing = connection.execute(
                         """
-                        SELECT subject, from_name, from_addr, reply_to, date_text,
-                               date_ts, has_attachments, message_id,
+                        SELECT message_key, subject, from_name, from_addr,
+                               reply_to, date_text, date_ts, has_attachments, message_id,
                                references_text, remote_state
                         FROM mail_headers
                         WHERE account_id = ? AND folder = ?
@@ -603,20 +707,26 @@ class MailHeaderIndex:
                         """,
                         values[:4],
                     ).fetchone()
-                    expected = values[4:14]
-                    if existing is None or tuple(existing) != expected:
+                    expected = values[4:15]
+                    existing_values = tuple(existing) if existing is not None else ()
+                    if existing is None or existing_values != expected:
                         header_changes += 1
-                        if existing is not None:
-                            changed_header_uids.append(int(values[3]))
+                        if (
+                            existing is not None
+                            and str(existing["message_key"]) == str(values[4])
+                            and existing_values[:-1] != expected[:-1]
+                        ):
+                            content_changed_message_keys.add(str(values[4]))
                 connection.executemany(
                     """
                     INSERT INTO mail_headers (
-                        account_id, folder, uidvalidity, uid, subject,
+                        account_id, folder, uidvalidity, uid, message_key, subject,
                         from_name, from_addr, reply_to, date_text, date_ts,
                         has_attachments, message_id, references_text,
                         remote_state, last_seen_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(account_id, folder, uidvalidity, uid) DO UPDATE SET
+                        message_key = excluded.message_key,
                         subject = excluded.subject,
                         from_name = excluded.from_name,
                         from_addr = excluded.from_addr,
@@ -631,20 +741,27 @@ class MailHeaderIndex:
                     """,
                     header_values,
                 )
-                if changed_header_uids:
-                    placeholders = ",".join("?" for _ in changed_header_uids)
+                if content_changed_message_keys:
+                    placeholders = ",".join(
+                        "?" for _ in content_changed_message_keys
+                    )
+                    parameters = (
+                        account_id,
+                        *sorted(content_changed_message_keys),
+                    )
+                    connection.execute(
+                        f"""
+                        DELETE FROM mail_bodies
+                        WHERE account_id = ? AND message_key IN ({placeholders})
+                        """,
+                        parameters,
+                    )
                     connection.execute(
                         f"""
                         DELETE FROM mail_ai_cache
-                        WHERE account_id = ? AND folder = ? AND uidvalidity = ?
-                          AND uid IN ({placeholders})
+                        WHERE account_id = ? AND message_key IN ({placeholders})
                         """,
-                        (
-                            account_id,
-                            folder,
-                            int(uidvalidity),
-                            *changed_header_uids,
-                        ),
+                        parameters,
                     )
 
             if remote_uids is not None:
@@ -745,14 +862,24 @@ class MailHeaderIndex:
         )
         now = time.time()
         with self._connection() as connection:
+            message_key = self._message_key_for_location(
+                connection,
+                account_id,
+                folder,
+                uidvalidity,
+                uid,
+                active_only=True,
+            )
+            if message_key is None:
+                raise KeyError("邮件位置尚未写入本地索引。")
             connection.execute(
                 """
                 INSERT INTO mail_bodies (
-                    account_id, folder, uidvalidity, uid, body_text,
+                    account_id, message_key, body_text,
                     content_hash, size_bytes, truncated,
                     fetched_at, last_accessed_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(account_id, folder, uidvalidity, uid) DO UPDATE SET
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(account_id, message_key) DO UPDATE SET
                     body_text = excluded.body_text,
                     content_hash = excluded.content_hash,
                     size_bytes = excluded.size_bytes,
@@ -762,9 +889,7 @@ class MailHeaderIndex:
                 """,
                 (
                     account_id,
-                    folder,
-                    int(uidvalidity),
-                    int(uid),
+                    message_key,
                     cached_text,
                     content_hash,
                     size_bytes,
@@ -792,8 +917,13 @@ class MailHeaderIndex:
         with self._connection() as connection:
             row = connection.execute(
                 """
-                SELECT * FROM mail_bodies
-                WHERE account_id = ? AND folder = ? AND uidvalidity = ? AND uid = ?
+                SELECT bodies.* FROM mail_headers AS headers
+                INNER JOIN mail_bodies AS bodies
+                  ON bodies.account_id = headers.account_id
+                 AND bodies.message_key = headers.message_key
+                WHERE headers.account_id = ? AND headers.folder = ?
+                  AND headers.uidvalidity = ? AND headers.uid = ?
+                  AND headers.remote_state = 'active'
                 """,
                 (account_id, folder, int(uidvalidity), int(uid)),
             ).fetchone()
@@ -801,17 +931,17 @@ class MailHeaderIndex:
                 connection.execute(
                     """
                     UPDATE mail_bodies SET last_accessed_at = ?
-                    WHERE account_id = ? AND folder = ? AND uidvalidity = ? AND uid = ?
+                    WHERE account_id = ? AND message_key = ?
                     """,
-                    (now, account_id, folder, int(uidvalidity), int(uid)),
+                    (now, account_id, str(row["message_key"])),
                 )
         if row is None:
             return None
         return CachedMailBody(
-            account_id=str(row["account_id"]),
-            folder=str(row["folder"]),
-            uidvalidity=int(row["uidvalidity"]),
-            uid=int(row["uid"]),
+            account_id=account_id,
+            folder=folder,
+            uidvalidity=int(uidvalidity),
+            uid=int(uid),
             body_text=str(row["body_text"]),
             content_hash=str(row["content_hash"]),
             size_bytes=int(row["size_bytes"]),
@@ -835,15 +965,13 @@ class MailHeaderIndex:
             row = connection.execute(
                 f"""
                 SELECT headers.*,
-                       CASE WHEN bodies.uid IS NULL THEN 0 ELSE 1 END AS body_cached,
+                       CASE WHEN bodies.message_key IS NULL THEN 0 ELSE 1 END AS body_cached,
                        COALESCE(bodies.truncated, 0) AS body_truncated,
                        COALESCE(bodies.fetched_at, 0) AS body_fetched_at
                 FROM mail_headers AS headers
                 LEFT JOIN mail_bodies AS bodies
                   ON bodies.account_id = headers.account_id
-                 AND bodies.folder = headers.folder
-                 AND bodies.uidvalidity = headers.uidvalidity
-                 AND bodies.uid = headers.uid
+                 AND bodies.message_key = headers.message_key
                 WHERE headers.account_id = ? AND headers.folder = ?
                   AND headers.uidvalidity = ? AND headers.uid = ?{active_clause}
                 """,
@@ -855,12 +983,21 @@ class MailHeaderIndex:
         self, account_id: str, folder: str, uidvalidity: int, uid: int
     ) -> None:
         with self._connection() as connection:
+            message_key = self._message_key_for_location(
+                connection,
+                account_id,
+                folder,
+                uidvalidity,
+                uid,
+            )
+            if message_key is None:
+                return
             connection.execute(
                 """
                 DELETE FROM mail_bodies
-                WHERE account_id = ? AND folder = ? AND uidvalidity = ? AND uid = ?
+                WHERE account_id = ? AND message_key = ?
                 """,
-                (account_id, folder, int(uidvalidity), int(uid)),
+                (account_id, message_key),
             )
 
     def get_ai_result(
@@ -874,41 +1011,50 @@ class MailHeaderIndex:
         _target_language: str,
     ) -> CachedMailAIResult | None:
         now = time.time()
-        key = (
-            account_id,
-            folder,
-            int(uidvalidity),
-            int(uid),
-            str(content_hash),
-            str(task),
-        )
         with self._connection() as connection:
+            message_key = self._message_key_for_location(
+                connection,
+                account_id,
+                folder,
+                uidvalidity,
+                uid,
+                active_only=True,
+            )
+            if message_key is None:
+                return None
             row = connection.execute(
                 """
                 SELECT * FROM mail_ai_cache
-                WHERE account_id = ? AND folder = ? AND uidvalidity = ? AND uid = ?
+                WHERE account_id = ? AND message_key = ?
                   AND content_hash = ? AND task = ?
                 ORDER BY created_at DESC
                 LIMIT 1
                 """,
-                key,
+                (account_id, message_key, str(content_hash), str(task)),
             ).fetchone()
             if row is not None:
                 connection.execute(
                     """
                     UPDATE mail_ai_cache SET last_accessed_at = ?
-                    WHERE account_id = ? AND folder = ? AND uidvalidity = ? AND uid = ?
+                    WHERE account_id = ? AND message_key = ?
                       AND content_hash = ? AND task = ? AND target_language = ?
                     """,
-                    (now, *key, str(row["target_language"])),
+                    (
+                        now,
+                        account_id,
+                        message_key,
+                        str(content_hash),
+                        str(task),
+                        str(row["target_language"]),
+                    ),
                 )
         if row is None:
             return None
         return CachedMailAIResult(
-            account_id=str(row["account_id"]),
-            folder=str(row["folder"]),
-            uidvalidity=int(row["uidvalidity"]),
-            uid=int(row["uid"]),
+            account_id=account_id,
+            folder=folder,
+            uidvalidity=int(uidvalidity),
+            uid=int(uid),
             content_hash=str(row["content_hash"]),
             task=str(row["task"]),
             target_language=str(row["target_language"]),
@@ -934,46 +1080,39 @@ class MailHeaderIndex:
         parallel.
         """
         now = time.time()
-        key = (
-            account_id,
-            folder,
-            int(uidvalidity),
-            int(uid),
-            str(task),
-        )
         with self._connection() as connection:
+            header = connection.execute(
+                """
+                SELECT message_key FROM mail_headers
+                WHERE account_id = ? AND folder = ? AND uidvalidity = ? AND uid = ?
+                  AND remote_state = 'active'
+                """,
+                (account_id, folder, int(uidvalidity), int(uid)),
+            ).fetchone()
+            if header is None:
+                return None
+            message_key = str(header["message_key"])
             row = connection.execute(
                 """
-                SELECT cache.*
-                FROM mail_ai_cache AS cache
-                INNER JOIN mail_headers AS headers
-                  ON headers.account_id = cache.account_id
-                 AND headers.folder = cache.folder
-                 AND headers.uidvalidity = cache.uidvalidity
-                 AND headers.uid = cache.uid
-                WHERE cache.account_id = ? AND cache.folder = ?
-                  AND cache.uidvalidity = ? AND cache.uid = ?
-                  AND cache.task = ?
-                  AND headers.remote_state = 'active'
-                ORDER BY cache.created_at DESC
+                SELECT * FROM mail_ai_cache
+                WHERE account_id = ? AND message_key = ? AND task = ?
+                ORDER BY created_at DESC
                 LIMIT 1
                 """,
-                key,
+                (account_id, message_key, str(task)),
             ).fetchone()
             if row is not None:
                 connection.execute(
                     """
                     UPDATE mail_ai_cache SET last_accessed_at = ?
-                    WHERE account_id = ? AND folder = ? AND uidvalidity = ?
-                      AND uid = ? AND content_hash = ? AND task = ?
+                    WHERE account_id = ? AND message_key = ?
+                      AND content_hash = ? AND task = ?
                       AND target_language = ?
                     """,
                     (
                         now,
                         account_id,
-                        folder,
-                        int(uidvalidity),
-                        int(uid),
+                        message_key,
                         str(row["content_hash"]),
                         str(task),
                         str(row["target_language"]),
@@ -982,10 +1121,10 @@ class MailHeaderIndex:
         if row is None:
             return None
         return CachedMailAIResult(
-            account_id=str(row["account_id"]),
-            folder=str(row["folder"]),
-            uidvalidity=int(row["uidvalidity"]),
-            uid=int(row["uid"]),
+            account_id=account_id,
+            folder=folder,
+            uidvalidity=int(uidvalidity),
+            uid=int(uid),
             content_hash=str(row["content_hash"]),
             task=str(row["task"]),
             target_language=str(row["target_language"]),
@@ -1007,7 +1146,58 @@ class MailHeaderIndex:
         provider_id: str,
     ) -> CachedMailAIResult:
         now = time.time()
-        values = (
+        with self._connection() as connection:
+            message_key = self._message_key_for_location(
+                connection,
+                account_id,
+                folder,
+                uidvalidity,
+                uid,
+                active_only=True,
+            )
+            if message_key is None:
+                raise KeyError("邮件位置尚未写入本地索引。")
+            connection.execute(
+                """
+                DELETE FROM mail_ai_cache
+                WHERE account_id = ? AND message_key = ?
+                  AND (task = ? OR task LIKE ?)
+                """,
+                (
+                    account_id,
+                    message_key,
+                    str(task).split(":", 1)[0],
+                    str(task).split(":", 1)[0] + ":%",
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO mail_ai_cache (
+                    account_id, message_key, content_hash,
+                    task, target_language, result_text, provider_id,
+                    created_at, last_accessed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(
+                    account_id, message_key, content_hash, task, target_language
+                ) DO UPDATE SET
+                    result_text = excluded.result_text,
+                    provider_id = excluded.provider_id,
+                    created_at = excluded.created_at,
+                    last_accessed_at = excluded.last_accessed_at
+                """,
+                (
+                    account_id,
+                    message_key,
+                    str(content_hash),
+                    str(task),
+                    str(target_language),
+                    str(result_text),
+                    str(provider_id),
+                    now,
+                    now,
+                ),
+            )
+        return CachedMailAIResult(
             account_id,
             folder,
             int(uidvalidity),
@@ -1018,54 +1208,23 @@ class MailHeaderIndex:
             str(result_text),
             str(provider_id),
             now,
-            now,
         )
-        with self._connection() as connection:
-            connection.execute(
-                """
-                DELETE FROM mail_ai_cache
-                WHERE account_id = ? AND folder = ? AND uidvalidity = ? AND uid = ?
-                  AND (task = ? OR task LIKE ?)
-                """,
-                (
-                    account_id,
-                    folder,
-                    int(uidvalidity),
-                    int(uid),
-                    str(task).split(":", 1)[0],
-                    str(task).split(":", 1)[0] + ":%",
-                ),
-            )
-            connection.execute(
-                """
-                INSERT INTO mail_ai_cache (
-                    account_id, folder, uidvalidity, uid, content_hash,
-                    task, target_language, result_text, provider_id,
-                    created_at, last_accessed_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(
-                    account_id, folder, uidvalidity, uid,
-                    content_hash, task, target_language
-                ) DO UPDATE SET
-                    result_text = excluded.result_text,
-                    provider_id = excluded.provider_id,
-                    created_at = excluded.created_at,
-                    last_accessed_at = excluded.last_accessed_at
-                """,
-                values,
-            )
-        return CachedMailAIResult(*values[:-1])
 
     def delete_ai_results(
         self, account_id: str, folder: str, uidvalidity: int, uid: int
     ) -> int:
         with self._connection() as connection:
+            message_key = self._message_key_for_location(
+                connection, account_id, folder, uidvalidity, uid
+            )
+            if message_key is None:
+                return 0
             cursor = connection.execute(
                 """
                 DELETE FROM mail_ai_cache
-                WHERE account_id = ? AND folder = ? AND uidvalidity = ? AND uid = ?
+                WHERE account_id = ? AND message_key = ?
                 """,
-                (account_id, folder, int(uidvalidity), int(uid)),
+                (account_id, message_key),
             )
             return max(0, int(cursor.rowcount))
 
@@ -1078,17 +1237,19 @@ class MailHeaderIndex:
         current_content_hash: str,
     ) -> int:
         with self._connection() as connection:
+            message_key = self._message_key_for_location(
+                connection, account_id, folder, uidvalidity, uid
+            )
+            if message_key is None:
+                return 0
             cursor = connection.execute(
                 """
                 DELETE FROM mail_ai_cache
-                WHERE account_id = ? AND folder = ? AND uidvalidity = ? AND uid = ?
-                  AND content_hash != ?
+                WHERE account_id = ? AND message_key = ? AND content_hash != ?
                 """,
                 (
                     account_id,
-                    folder,
-                    int(uidvalidity),
-                    int(uid),
+                    message_key,
                     str(current_content_hash),
                 ),
             )
@@ -1099,39 +1260,57 @@ class MailHeaderIndex:
             cursor = connection.execute("DELETE FROM mail_bodies")
             return max(0, int(cursor.rowcount))
 
-    def purge_remote_missing_bodies(self, account_id: str, folder: str) -> int:
+    def purge_remote_missing_bodies(
+        self,
+        account_id: str,
+        folder: str,
+        grace_seconds: int = MESSAGE_RELOCATION_GRACE_SECONDS,
+    ) -> int:
+        cutoff = time.time() - max(0, int(grace_seconds))
         with self._connection() as connection:
             cursor = connection.execute(
                 """
                 DELETE FROM mail_bodies
-                WHERE account_id = ? AND folder = ? AND EXISTS (
-                    SELECT 1 FROM mail_headers AS headers
-                    WHERE headers.account_id = mail_bodies.account_id
-                      AND headers.folder = mail_bodies.folder
-                      AND headers.uidvalidity = mail_bodies.uidvalidity
-                      AND headers.uid = mail_bodies.uid
+                WHERE account_id = ? AND message_key IN (
+                    SELECT headers.message_key FROM mail_headers AS headers
+                    WHERE headers.account_id = ? AND headers.folder = ?
                       AND headers.remote_state != 'active'
+                      AND headers.last_seen_at <= ?
+                ) AND NOT EXISTS (
+                    SELECT 1 FROM mail_headers AS active_headers
+                    WHERE active_headers.account_id = mail_bodies.account_id
+                      AND active_headers.message_key = mail_bodies.message_key
+                      AND active_headers.remote_state = 'active'
                 )
                 """,
-                (account_id, folder),
+                (account_id, account_id, folder, cutoff),
             )
             return max(0, int(cursor.rowcount))
 
-    def purge_remote_missing_ai_results(self, account_id: str, folder: str) -> int:
+    def purge_remote_missing_ai_results(
+        self,
+        account_id: str,
+        folder: str,
+        grace_seconds: int = MESSAGE_RELOCATION_GRACE_SECONDS,
+    ) -> int:
+        cutoff = time.time() - max(0, int(grace_seconds))
         with self._connection() as connection:
             cursor = connection.execute(
                 """
                 DELETE FROM mail_ai_cache
-                WHERE account_id = ? AND folder = ? AND EXISTS (
-                    SELECT 1 FROM mail_headers AS headers
-                    WHERE headers.account_id = mail_ai_cache.account_id
-                      AND headers.folder = mail_ai_cache.folder
-                      AND headers.uidvalidity = mail_ai_cache.uidvalidity
-                      AND headers.uid = mail_ai_cache.uid
+                WHERE account_id = ? AND message_key IN (
+                    SELECT headers.message_key FROM mail_headers AS headers
+                    WHERE headers.account_id = ? AND headers.folder = ?
                       AND headers.remote_state != 'active'
+                      AND headers.last_seen_at <= ?
+                ) AND NOT EXISTS (
+                    SELECT 1 FROM mail_headers AS active_headers
+                    WHERE active_headers.account_id = mail_ai_cache.account_id
+                      AND active_headers.message_key = mail_ai_cache.message_key
+                      AND active_headers.remote_state = 'active'
                 )
                 """,
-                (account_id, folder),
+                (account_id, account_id, folder, cutoff),
             )
             return max(0, int(cursor.rowcount))
 
@@ -1155,7 +1334,7 @@ class MailHeaderIndex:
             if budget and total > budget:
                 rows = connection.execute(
                     """
-                    SELECT account_id, folder, uidvalidity, uid, size_bytes
+                    SELECT account_id, message_key, size_bytes
                     FROM mail_bodies
                     ORDER BY last_accessed_at ASC, fetched_at ASC
                     """
@@ -1166,14 +1345,11 @@ class MailHeaderIndex:
                     connection.execute(
                         """
                         DELETE FROM mail_bodies
-                        WHERE account_id = ? AND folder = ?
-                          AND uidvalidity = ? AND uid = ?
+                        WHERE account_id = ? AND message_key = ?
                         """,
                         (
                             row["account_id"],
-                            row["folder"],
-                            row["uidvalidity"],
-                            row["uid"],
+                            row["message_key"],
                         ),
                     )
                     total -= int(row["size_bytes"])
@@ -1784,15 +1960,13 @@ class MailHeaderIndex:
             rows = connection.execute(
                 f"""
                 SELECT headers.*,
-                       CASE WHEN bodies.uid IS NULL THEN 0 ELSE 1 END AS body_cached,
+                       CASE WHEN bodies.message_key IS NULL THEN 0 ELSE 1 END AS body_cached,
                        COALESCE(bodies.truncated, 0) AS body_truncated,
                        COALESCE(bodies.fetched_at, 0) AS body_fetched_at
                 FROM mail_headers AS headers
                 LEFT JOIN mail_bodies AS bodies
                   ON bodies.account_id = headers.account_id
-                 AND bodies.folder = headers.folder
-                 AND bodies.uidvalidity = headers.uidvalidity
-                 AND bodies.uid = headers.uid
+                 AND bodies.message_key = headers.message_key
                 WHERE {' AND '.join(clauses)}
                 ORDER BY headers.date_ts DESC, headers.uid DESC
                 LIMIT ?
@@ -1825,9 +1999,13 @@ class MailHeaderIndex:
             ).fetchall()
             body_stats = connection.execute(
                 """
-                SELECT COUNT(*) AS count, COALESCE(SUM(size_bytes), 0) AS bytes
-                FROM mail_bodies
-                WHERE account_id = ? AND folder = ? AND uidvalidity = ?
+                SELECT COUNT(*) AS count, COALESCE(SUM(bodies.size_bytes), 0) AS bytes
+                FROM mail_headers AS headers
+                INNER JOIN mail_bodies AS bodies
+                  ON bodies.account_id = headers.account_id
+                 AND bodies.message_key = headers.message_key
+                WHERE headers.account_id = ? AND headers.folder = ?
+                  AND headers.uidvalidity = ? AND headers.remote_state = 'active'
                 """,
                 (account_id, folder, state.uidvalidity),
             ).fetchone()

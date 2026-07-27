@@ -331,18 +331,63 @@ class ImapMailbox:
         uids = self.search_uids("ALL")
         return (uids[-1] + 1) if uids else 1
 
+    def _supports_gmail_msgid(self) -> bool:
+        capabilities = getattr(self.conn, "capabilities", ()) or ()
+        normalized = {
+            (item.decode(errors="ignore") if isinstance(item, bytes) else str(item))
+            .strip()
+            .upper()
+            for item in capabilities
+        }
+        return "X-GM-EXT-1" in normalized
+
     def fetch_uid(self, uid: int, *, headers_only: bool = False) -> ParsedMail:
-        query = "(BODY.PEEK[HEADER.FIELDS (SUBJECT FROM REPLY-TO DATE MESSAGE-ID REFERENCES)])" if headers_only else "(RFC822)"
+        payload = (
+            "BODY.PEEK[HEADER.FIELDS "
+            "(SUBJECT FROM REPLY-TO DATE MESSAGE-ID REFERENCES)]"
+            if headers_only
+            else "RFC822"
+        )
+        query = (
+            f"(X-GM-MSGID {payload})"
+            if self._supports_gmail_msgid()
+            else f"({payload})"
+        )
         status, data = self.conn.uid("fetch", str(uid), query)
         if status != "OK" or not data:
             raise MailNotFoundError(f"IMAP UID {uid} 不存在或已无法读取。")
         raw = next(
-            (entry[1] for entry in data if isinstance(entry, tuple) and len(entry) > 1 and isinstance(entry[1], bytes)),
+            (
+                entry[1]
+                for entry in data
+                if isinstance(entry, tuple)
+                and len(entry) > 1
+                and isinstance(entry[1], bytes)
+            ),
             None,
         )
         if raw is None:
             raise MailNotFoundError(f"IMAP UID {uid} 不存在或已无法读取。")
-        return parse_mail(raw, uid)
+        mail = parse_mail(raw, uid)
+        if self._supports_gmail_msgid():
+            metadata = b" ".join(
+                entry[0]
+                if isinstance(entry, tuple) and isinstance(entry[0], bytes)
+                else entry
+                for entry in data
+                if (
+                    isinstance(entry, bytes)
+                    or (
+                        isinstance(entry, tuple)
+                        and entry
+                        and isinstance(entry[0], bytes)
+                    )
+                )
+            )
+            match = re.search(rb"\bX-GM-MSGID\s+(\d+)\b", metadata, flags=re.I)
+            if match:
+                mail.gmail_msgid = match.group(1).decode("ascii")
+        return mail
 
     def list_folders(self) -> list[MailFolder]:
         # imaplib does not quote an explicitly supplied empty string. Calling

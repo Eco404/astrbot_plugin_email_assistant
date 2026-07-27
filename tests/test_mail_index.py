@@ -10,6 +10,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from astrbot_plugin_email_assistant.mail_index import MailHeaderIndex
 from astrbot_plugin_email_assistant.mail_parser import ParsedMail
 from astrbot_plugin_email_assistant.draft_service import confirmation_token_hash
+from astrbot_plugin_email_assistant.db_migration import (
+    DatabaseVersionError,
+    MailDatabaseVersion,
+)
 
 
 def mail(uid: int, timestamp: float, subject: str = "主题") -> ParsedMail:
@@ -118,24 +122,35 @@ class MailHeaderIndexTests(unittest.TestCase):
         with self.index._connection() as connection:
             count = connection.execute(
                 """
-                SELECT COUNT(*) FROM mail_ai_cache
-                WHERE account_id = 'one' AND folder = 'INBOX'
-                  AND uidvalidity = 10 AND uid = 1 AND task LIKE 'translate:%'
+                SELECT COUNT(*) FROM mail_ai_cache AS cache
+                INNER JOIN mail_headers AS headers
+                  ON headers.account_id = cache.account_id
+                 AND headers.message_key = cache.message_key
+                WHERE headers.account_id = 'one' AND headers.folder = 'INBOX'
+                  AND headers.uidvalidity = 10 AND headers.uid = 1
+                  AND cache.task LIKE 'translate:%'
                 """
             ).fetchone()[0]
         self.assertEqual(count, 1)
 
         with self.index._connection() as connection:
+            message_key = connection.execute(
+                """
+                SELECT message_key FROM mail_headers
+                WHERE account_id = 'one' AND folder = 'INBOX'
+                  AND uidvalidity = 10 AND uid = 1
+                """
+            ).fetchone()[0]
             connection.execute(
                 """
                 INSERT INTO mail_ai_cache (
-                    account_id, folder, uidvalidity, uid, content_hash, task,
+                    account_id, message_key, content_hash, task,
                     target_language, result_text, provider_id,
                     created_at, last_accessed_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
-                    "one", "INBOX", 10, 1, "hash-a", "translate:v0",
+                    "one", message_key, "hash-a", "translate:v0",
                     "Deutsch", "older legacy translation", "provider", 1.0, 1.0,
                 ),
             )
@@ -144,10 +159,10 @@ class MailHeaderIndexTests(unittest.TestCase):
             rows = connection.execute(
                 """
                 SELECT target_language, result_text FROM mail_ai_cache
-                WHERE account_id = 'one' AND folder = 'INBOX'
-                  AND uidvalidity = 10 AND uid = 1
+                WHERE account_id = 'one' AND message_key = ?
                   AND task LIKE 'translate:%'
-                """
+                """,
+                (message_key,),
             ).fetchall()
         self.assertEqual(
             [(row["target_language"], row["result_text"]) for row in rows],
@@ -228,15 +243,127 @@ class MailHeaderIndexTests(unittest.TestCase):
         stats = self.index.stats("one", "INBOX")
         self.assertEqual(stats["cached_bodies"], 1)
         self.index.mark_remote_missing("one", "INBOX", 10, 1)
-        self.assertEqual(self.index.purge_remote_missing_bodies("one", "INBOX"), 1)
+        self.assertEqual(
+            self.index.purge_remote_missing_bodies(
+                "one", "INBOX", grace_seconds=0
+            ),
+            1,
+        )
         self.assertIsNone(self.index.get_cached_body("one", "INBOX", 10, 1))
 
-    def test_uidvalidity_change_purges_old_body_cache(self):
+    def test_uidvalidity_change_invalidates_old_body_location(self):
         timestamp = datetime(2026, 7, 1).timestamp()
         self.index.apply_sync("one", "INBOX", 10, 1, [mail(1, timestamp)])
         self.index.cache_body("one", "INBOX", 10, 1, "正文", 1024)
         self.index.apply_sync("one", "INBOX", 11, 1, [mail(1, timestamp)])
         self.assertIsNone(self.index.get_cached_body("one", "INBOX", 10, 1))
+
+    def test_move_to_another_folder_reuses_body_and_ai_cache(self):
+        timestamp = datetime(2026, 7, 1).timestamp()
+        original = mail(1, timestamp, "跨文件夹邮件")
+        self.index.apply_sync("one", "INBOX", 10, 1, [original])
+        body = self.index.cache_body(
+            "one", "INBOX", 10, 1, "已缓存正文", 1024
+        )
+        self.index.cache_ai_result(
+            "one",
+            "INBOX",
+            10,
+            1,
+            body.content_hash,
+            "summarize:v1",
+            "简体中文",
+            "已缓存总结",
+            "provider",
+        )
+
+        self.index.mark_remote_missing("one", "INBOX", 10, 1)
+        moved = mail(55, timestamp, "跨文件夹邮件")
+        moved.message_id = original.message_id
+        self.index.apply_sync("one", "Archive", 20, 55, [moved])
+
+        moved_body = self.index.get_cached_body("one", "Archive", 20, 55)
+        self.assertIsNotNone(moved_body)
+        self.assertEqual(moved_body.body_text, "已缓存正文")
+        moved_summary = self.index.get_cached_ai_result_for_message(
+            "one", "Archive", 20, 55, "summarize:v1", "简体中文"
+        )
+        self.assertIsNotNone(moved_summary)
+        self.assertEqual(moved_summary.result_text, "已缓存总结")
+        self.assertEqual(
+            self.index.purge_remote_missing_bodies(
+                "one", "INBOX", grace_seconds=0
+            ),
+            0,
+        )
+        self.assertEqual(
+            self.index.purge_remote_missing_ai_results(
+                "one", "INBOX", grace_seconds=0
+            ),
+            0,
+        )
+
+    def test_changed_message_content_invalidates_entity_caches(self):
+        timestamp = datetime(2026, 7, 1).timestamp()
+        original = mail(1, timestamp, "原主题")
+        self.index.apply_sync("one", "INBOX", 10, 1, [original])
+        body = self.index.cache_body(
+            "one", "INBOX", 10, 1, "原正文", 1024
+        )
+        self.index.cache_ai_result(
+            "one",
+            "INBOX",
+            10,
+            1,
+            body.content_hash,
+            "summarize:v1",
+            "简体中文",
+            "原总结",
+            "provider",
+        )
+
+        changed = mail(1, timestamp, "新主题")
+        changed.message_id = original.message_id
+        self.index.apply_sync("one", "INBOX", 10, 1, [changed])
+
+        self.assertIsNone(self.index.get_cached_body("one", "INBOX", 10, 1))
+        self.assertIsNone(
+            self.index.get_cached_ai_result_for_message(
+                "one", "INBOX", 10, 1, "summarize:v1", "简体中文"
+            )
+        )
+
+    def test_database_version_is_recorded_and_legacy_database_is_rejected(self):
+        with self.index._connection() as connection:
+            self.assertEqual(
+                MailDatabaseVersion.current_database_version(connection), "1"
+            )
+        self.index.initialize()
+        with self.index._connection() as connection:
+            version_rows = connection.execute(
+                "SELECT COUNT(*) FROM db_version"
+            ).fetchone()[0]
+        self.assertEqual(version_rows, 1)
+
+        legacy_path = Path(self.temp_dir.name) / "legacy.db"
+        with sqlite3.connect(legacy_path) as connection:
+            connection.execute("CREATE TABLE legacy_mail (id INTEGER PRIMARY KEY)")
+        with self.assertRaisesRegex(DatabaseVersionError, "未受版本管理"):
+            MailHeaderIndex(legacy_path).initialize()
+
+        incompatible_path = Path(self.temp_dir.name) / "incompatible.db"
+        with sqlite3.connect(incompatible_path) as connection:
+            MailDatabaseVersion.create_version_table(connection)
+            connection.execute(
+                """
+                INSERT INTO db_version (
+                    version, description, migrated_at,
+                    migration_duration_seconds
+                ) VALUES ('v99', 'future', '2026-07-01T00:00:00+00:00', 0)
+                """
+            )
+        with self.assertRaisesRegex(DatabaseVersionError, "当前插件需要 v1"):
+            MailHeaderIndex(incompatible_path).initialize()
 
     def test_body_cache_prunes_to_total_budget(self):
         timestamp = datetime(2026, 7, 1).timestamp()
