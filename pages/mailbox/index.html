@@ -5,11 +5,19 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="color-scheme" content="light dark" />
     <title>邮件中心</title>
-    <link rel="stylesheet" href="./app.css?v=2.3.0" />
+    <script>
+      document.documentElement.dataset.theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+    </script>
+    <link rel="stylesheet" href="./app.css?v=2.4.0" />
   </head>
-  <body>
+  <body class="quiet-glass-background">
+    <div id="mobile-nav-scrim" class="mobile-nav-scrim hidden" aria-hidden="true"></div>
     <div class="app-shell">
-      <aside class="sidebar">
+      <aside id="sidebar" class="sidebar" aria-label="邮件中心侧边栏">
+        <div class="sidebar-mobile-head">
+          <strong>邮件中心</strong>
+          <button id="nav-close" class="icon-button" type="button" aria-label="关闭导航">×</button>
+        </div>
         <div class="brand">
           <span class="brand-mark">✉</span>
           <div><strong>邮件中心</strong><small>Email Assistant</small></div>
@@ -21,7 +29,7 @@
         <div class="sidebar-label">邮箱账户</div>
         <div id="account-list" class="account-list"></div>
         <div class="sidebar-label folder-heading">
-          <span>文件夹</span><button id="new-folder-button" class="icon-button" title="新建文件夹">＋</button>
+          <span>文件夹</span><button id="new-folder-button" class="icon-button" type="button" title="新建文件夹" aria-label="新建文件夹">＋</button>
         </div>
         <div id="folder-list" class="account-list folder-list"></div>
         <div class="sidebar-foot">
@@ -32,9 +40,12 @@
 
       <main class="workspace">
         <header class="topbar">
-          <div>
+          <div class="topbar-title">
+            <button id="nav-toggle" class="icon-button nav-toggle" type="button" aria-label="打开导航" aria-expanded="false" aria-controls="sidebar">☰</button>
+            <div>
             <h1 id="page-title">收件箱</h1>
             <p id="page-subtitle">从本地索引快速浏览，打开正文时实时验证云端。</p>
+            </div>
           </div>
           <div class="top-actions">
             <select id="mobile-account" class="mobile-account" aria-label="选择邮箱账户"></select>
@@ -110,7 +121,7 @@
       </main>
     </div>
 
-    <div id="modal" class="modal hidden" role="dialog" aria-modal="true">
+    <div id="modal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="modal-title" aria-describedby="modal-message">
       <div class="modal-card">
         <h2 id="modal-title">确认操作</h2>
         <p id="modal-message"></p>
@@ -120,9 +131,9 @@
         </div>
       </div>
     </div>
-    <div id="input-modal" class="modal hidden" role="dialog" aria-modal="true">
+    <div id="input-modal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="folder-modal-title">
       <div class="modal-card">
-        <h2>新建文件夹</h2>
+        <h2 id="folder-modal-title">新建文件夹</h2>
         <label class="modal-input-label">文件夹名称<input id="folder-name-input" maxlength="512" /></label>
         <div class="modal-actions">
           <button id="folder-modal-cancel" class="button secondary">取消</button>
@@ -130,7 +141,7 @@
         </div>
       </div>
     </div>
-    <div id="processing-modal" class="modal hidden" role="dialog" aria-modal="true">
+    <div id="processing-modal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="processing-modal-title" aria-describedby="processing-modal-message">
       <div class="modal-card">
         <h2 id="processing-modal-title">重新处理邮件</h2>
         <p id="processing-modal-message"></p>
@@ -147,6 +158,6 @@
     <div id="toast" class="toast hidden" role="status"></div>
     <script src="./vendor/markdown-it/markdown-it.min.js"></script>
     <script src="./vendor/dompurify/purify.min.js"></script>
-    <script type="module" src="./app.js?v=2.3.0"></script>
+    <script type="module" src="./app.js?v=2.4.0"></script>
   </body>
 </html>

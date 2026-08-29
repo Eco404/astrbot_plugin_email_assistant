@@ -1,4 +1,4 @@
-import { renderMarkdown } from "./markdown.js?v=2.3.0";
+import { renderMarkdown } from "./markdown.js?v=2.4.0";
 
 const state = {
   bridge: null,
@@ -19,6 +19,10 @@ const state = {
 
 const $ = (selector) => document.querySelector(selector);
 const elements = {
+  sidebar: $("#sidebar"),
+  navToggle: $("#nav-toggle"),
+  navClose: $("#nav-close"),
+  navScrim: $("#mobile-nav-scrim"),
   accountList: $("#account-list"),
   mobileAccount: $("#mobile-account"),
   mobileFolder: $("#mobile-folder"),
@@ -85,22 +89,72 @@ function toast(message, error = false) {
   toastTimer = setTimeout(() => node.classList.add("hidden"), 4200);
 }
 
-function confirmAction(title, message, confirmLabel = "确认") {
+function prepareModal(modal, dismiss, focusTarget) {
+  const opener = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+  const onKeydown = (event) => {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      dismiss();
+    }
+  };
+  const onBackdrop = (event) => {
+    if (event.target === modal) dismiss();
+  };
+  document.body.classList.add("modal-open");
+  modal.classList.remove("hidden");
+  document.addEventListener("keydown", onKeydown);
+  modal.addEventListener("click", onBackdrop);
+  requestAnimationFrame(() => focusTarget?.focus());
+  return () => {
+    document.body.classList.remove("modal-open");
+    modal.classList.add("hidden");
+    document.removeEventListener("keydown", onKeydown);
+    modal.removeEventListener("click", onBackdrop);
+    opener?.focus();
+  };
+}
+
+function confirmAction(title, message, confirmLabel = "确认", { destructive = false } = {}) {
   const modal = $("#modal");
+  const confirm = $("#modal-confirm");
+  const cancel = $("#modal-cancel");
   $("#modal-title").textContent = title;
   $("#modal-message").textContent = message;
-  $("#modal-confirm").textContent = confirmLabel;
-  modal.classList.remove("hidden");
+  confirm.textContent = confirmLabel;
+  confirm.className = `button ${destructive ? "danger solid" : "primary"}`;
   return new Promise((resolve) => {
+    let cleanup = () => {};
     const finish = (value) => {
-      modal.classList.add("hidden");
-      $("#modal-confirm").onclick = null;
-      $("#modal-cancel").onclick = null;
+      confirm.onclick = null;
+      cancel.onclick = null;
+      cleanup();
       resolve(value);
     };
-    $("#modal-confirm").onclick = () => finish(true);
-    $("#modal-cancel").onclick = () => finish(false);
+    cleanup = prepareModal(modal, () => finish(false), cancel);
+    confirm.onclick = () => finish(true);
+    cancel.onclick = () => finish(false);
   });
+}
+
+function setSelectedMessage(uid) {
+  state.selectedUid = uid;
+  document.body.classList.toggle("mobile-detail-open", uid !== null);
+}
+
+function returnToMessageList() {
+  setSelectedMessage(null);
+  renderMessageList();
+  elements.messageDetail.className = "detail-panel empty-state";
+  elements.messageDetail.replaceChildren(emptyNode("选择一封邮件"));
+}
+
+function setMobileNavigation(open) {
+  const isOpen = Boolean(open);
+  document.body.classList.toggle("nav-open", isOpen);
+  elements.navToggle.setAttribute("aria-expanded", String(isOpen));
+  elements.sidebar.setAttribute("aria-hidden", String(!isOpen && window.innerWidth <= 900));
+  elements.navScrim.classList.toggle("hidden", !isOpen);
+  if (isOpen) requestAnimationFrame(() => elements.navClose.focus());
 }
 
 function formatDate(timestamp, fallback = "") {
@@ -174,7 +228,8 @@ function renderAccounts() {
     button.onclick = async () => {
       state.accountId = account.account_id;
       state.folder = "";
-      state.selectedUid = null;
+      setSelectedMessage(null);
+      setMobileNavigation(false);
       renderAccounts();
       await loadFolders();
       await loadMessages(true);
@@ -218,7 +273,8 @@ function renderFolders() {
     button.append(name, meta);
     button.onclick = async () => {
       state.folder = folder.name;
-      state.selectedUid = null;
+      setSelectedMessage(null);
+      setMobileNavigation(false);
       renderFolders();
       await loadMessages(true);
     };
@@ -331,7 +387,7 @@ function renderMessageList() {
 async function openMessage(uid) {
   const accountId = state.accountId;
   const folder = state.folder;
-  state.selectedUid = uid;
+  setSelectedMessage(uid);
   renderMessageList();
   elements.messageDetail.className = "detail-panel";
   const indexed = state.messages.find((item) => item.uid === uid);
@@ -417,14 +473,18 @@ async function refreshValidatedMessage(event, message) {
   if (status === "changed" && stillExists) {
     await openMessage(message.uid);
   } else if (!stillExists && state.selectedUid === message.uid) {
-    state.selectedUid = null;
-    elements.messageDetail.className = "detail-panel empty-state";
-    elements.messageDetail.replaceChildren(emptyNode("该邮件已不在当前云端文件夹中。"));
+    returnToMessageList();
+    toast("该邮件已不在当前云端文件夹中。", true);
   }
 }
 
 function renderMessageDetail(message) {
   elements.messageDetail.replaceChildren();
+  const back = document.createElement("button");
+  back.className = "detail-back-button";
+  back.type = "button";
+  back.textContent = "返回列表";
+  back.onclick = returnToMessageList;
   const title = document.createElement("h2");
   title.className = "detail-subject";
   title.textContent = message.subject || "(无主题)";
@@ -450,7 +510,7 @@ function renderMessageDetail(message) {
   const body = document.createElement("div");
   body.className = "detail-body";
   body.textContent = message.body || "（无可显示的纯文本正文）";
-  elements.messageDetail.append(title, meta);
+  elements.messageDetail.append(back, title, meta);
   if (message.from_cache) {
     const verification = document.createElement("div");
     verification.id = "detail-verification";
@@ -565,16 +625,16 @@ function requestProcessingLanguage(task) {
   $("#processing-modal-title").textContent = task === "summary" ? "重新总结邮件" : "重新翻译邮件";
   $("#processing-modal-message").textContent = "输入目标语言后会忽略已有缓存并重新调用模型；留空则使用插件配置或 AstrBot 界面语言。";
   input.value = "";
-  modal.classList.remove("hidden");
-  input.focus();
   return new Promise((resolve) => {
+    let cleanup = () => {};
     const finish = (value) => {
-      modal.classList.add("hidden");
       $("#processing-modal-confirm").onclick = null;
       $("#processing-modal-cancel").onclick = null;
       input.onkeydown = null;
+      cleanup();
       resolve(value);
     };
+    cleanup = prepareModal(modal, () => finish(null), input);
     $("#processing-modal-confirm").onclick = () => finish(input.value.trim());
     $("#processing-modal-cancel").onclick = () => finish(null);
     input.onkeydown = (event) => {
@@ -615,6 +675,7 @@ async function transferCurrentMessage(message, targetFolder, move, button) {
       "移动这封邮件？",
       `将 UID ${message.uid} 从“${message.folder}”移动到“${targetFolder}”。这会修改云端邮箱。`,
       "确认移动",
+      { destructive: true },
     );
     if (!confirmed) return;
   }
@@ -629,7 +690,7 @@ async function transferCurrentMessage(message, targetFolder, move, button) {
     toast(move ? "邮件已移动" : "邮件已复制");
     await loadFolders();
     if (move) {
-      state.selectedUid = null;
+      setSelectedMessage(null);
       await loadMessages(true);
       elements.messageDetail.className = "detail-panel empty-state";
       elements.messageDetail.replaceChildren(emptyNode("邮件已移动，请选择另一封邮件。"));
@@ -659,6 +720,8 @@ async function syncCurrent() {
 }
 
 async function switchTab(tab) {
+  setMobileNavigation(false);
+  if (tab !== "mailbox") setSelectedMessage(null);
   document.querySelectorAll(".nav-button").forEach((button) => button.classList.toggle("active", button.dataset.tab === tab));
   $("#mailbox-view").classList.toggle("active", tab === "mailbox");
   $("#drafts-view").classList.toggle("active", tab === "drafts");
@@ -823,7 +886,7 @@ async function approveDraft() {
 async function sendDraft() {
   if (!state.draft || state.draft.status !== "approved" || state.draftDirty) return;
   const recipient = (state.draft.to_addrs || []).join(", ");
-  const confirmed = await confirmAction("发送这封邮件？", `将使用 ${state.draft.account_id} 向 ${recipient} 发送“${state.draft.subject}”。发送后无法撤回。`, "确认发送");
+  const confirmed = await confirmAction("发送这封邮件？", `将使用 ${state.draft.account_id} 向 ${recipient} 发送“${state.draft.subject}”。发送后无法撤回。`, "确认发送", { destructive: true });
   if (!confirmed) return;
   setBusy(elements.sendDraft, true, "发送中…");
   try {
@@ -847,7 +910,7 @@ async function sendDraft() {
 
 async function deleteDraft() {
   if (!state.draft) return;
-  const confirmed = await confirmAction("删除草稿？", "只删除邮件助手本地草稿，不会删除云端邮件。", "删除");
+  const confirmed = await confirmAction("删除草稿？", "只删除邮件助手本地草稿，不会删除云端邮件。", "删除", { destructive: true });
   if (!confirmed) return;
   try {
     await apiPost("drafts/delete", { draft_id: state.draft.draft_id, revision: state.draft.revision });
@@ -879,17 +942,21 @@ async function createFolderFromUi() {
   const modal = $("#input-modal");
   const input = $("#folder-name-input");
   input.value = "";
-  modal.classList.remove("hidden");
-  input.focus();
   const name = await new Promise((resolve) => {
+    let cleanup = () => {};
     const finish = (value) => {
-      modal.classList.add("hidden");
       $("#folder-modal-confirm").onclick = null;
       $("#folder-modal-cancel").onclick = null;
+      input.onkeydown = null;
+      cleanup();
       resolve(value);
     };
+    cleanup = prepareModal(modal, () => finish(""), input);
     $("#folder-modal-confirm").onclick = () => finish(input.value.trim());
     $("#folder-modal-cancel").onclick = () => finish("");
+    input.onkeydown = (event) => {
+      if (event.key === "Enter") finish(input.value.trim());
+    };
   });
   if (!name) return;
   try {
@@ -902,23 +969,33 @@ async function createFolderFromUi() {
 }
 
 function bindEvents() {
+  setMobileNavigation(false);
   document.querySelectorAll(".nav-button").forEach((button) => button.addEventListener("click", () => switchTab(button.dataset.tab)));
+  elements.navToggle.addEventListener("click", () => setMobileNavigation(true));
+  elements.navClose.addEventListener("click", () => setMobileNavigation(false));
+  elements.navScrim.addEventListener("click", () => setMobileNavigation(false));
+  window.addEventListener("resize", () => {
+    if (window.innerWidth > 900) setMobileNavigation(false);
+  });
   elements.syncButton.addEventListener("click", syncCurrent);
   elements.mobileAccount.addEventListener("change", async () => {
     state.accountId = elements.mobileAccount.value;
     state.folder = "";
-    state.selectedUid = null;
+    setSelectedMessage(null);
     renderAccounts();
     await loadFolders();
     await loadMessages(true);
   });
   elements.mobileFolder.addEventListener("change", async () => {
     state.folder = elements.mobileFolder.value;
-    state.selectedUid = null;
+    setSelectedMessage(null);
     renderFolders();
     await loadMessages(true);
   });
-  $("#new-folder-button").addEventListener("click", createFolderFromUi);
+  $("#new-folder-button").addEventListener("click", () => {
+    setMobileNavigation(false);
+    createFolderFromUi();
+  });
   $("#search-button").addEventListener("click", () => loadMessages(true));
   elements.mailSearch.addEventListener("keydown", (event) => { if (event.key === "Enter") loadMessages(true); });
   elements.loadMore.addEventListener("click", () => loadMessages(false));
