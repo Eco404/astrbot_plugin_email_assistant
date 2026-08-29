@@ -276,7 +276,7 @@ class EmailAssistantPageApi:
             return self._ok(
                 {
                     "plugin": {
-                        "version": "2.2.2",
+                        "version": "2.4.1",
                         "index_enabled": self.plugin._mail_index is not None,
                         "body_cache_mode": str(
                             config_get(self.plugin.config, "body_cache_mode") or "on_demand"

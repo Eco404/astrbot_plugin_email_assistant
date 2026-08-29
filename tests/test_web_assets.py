@@ -27,9 +27,9 @@ class WebAssetTests(unittest.TestCase):
         self.assertIn(r"[^\n*]*?\S", renderer)
         self.assertIn(r"[^\n*]*?[：:]", renderer)
         self.assertNotIn(".innerHTML", renderer)
-        self.assertIn('src="./app.js?v=2.4.0"', page)
+        self.assertIn('src="./app.js?v=2.4.1"', page)
         self.assertIn(
-            'from "./markdown.js?v=2.4.0"',
+            'from "./markdown.js?v=2.4.1"',
             (PLUGIN_DIR / "pages/mailbox/app.js").read_text(encoding="utf-8"),
         )
 
