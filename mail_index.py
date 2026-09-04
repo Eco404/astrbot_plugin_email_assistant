@@ -1496,6 +1496,23 @@ class MailHeaderIndex:
             ).fetchall()
         return [self._row_to_draft(row) for row in rows]
 
+    def has_cancellable_owned_bot_draft(
+        self, owner_umo: str, owner_sender_id: str
+    ) -> bool:
+        with self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT 1 FROM mail_drafts
+                WHERE source = 'bot'
+                  AND owner_umo = ?
+                  AND owner_sender_id = ?
+                  AND status NOT IN ('sending', 'sent', 'cancelled')
+                LIMIT 1
+                """,
+                (str(owner_umo), str(owner_sender_id)),
+            ).fetchone()
+        return row is not None
+
     def update_draft(
         self,
         draft_id: str,

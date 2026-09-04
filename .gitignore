@@ -7,4 +7,5 @@ htmlcov/
 venv/
 .idea/
 .vscode/
+data/
 

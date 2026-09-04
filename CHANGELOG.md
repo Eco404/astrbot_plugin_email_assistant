@@ -3,6 +3,18 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)，
 并且遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [Unreleased]
+
+### 变更
+
+- 将三个邮件查询工具收敛为 `email_assistant_query_mailbox`，通过 `operation=list`、`latest` 或 `read` 区分邮件头列表、最新邮件和按 UID 阅读。
+- 将邮件总结与翻译工具收敛为 `email_assistant_process_message`，通过 `task=summary` 或 `translate` 区分处理类型。
+- 确认发送工具仅在当前消息匹配一次性确认格式时注入；取消草稿工具仅在当前用户存在可取消 Bot 草稿时注入。
+
+### 兼容性
+
+- 已配置人格工具白名单时，将 `email_assistant_list_messages`、`email_assistant_get_latest_message`、`email_assistant_show_message` 替换为 `email_assistant_query_mailbox`；将 `email_assistant_summarize_message`、`email_assistant_translate_message` 替换为 `email_assistant_process_message`。
+
 ## [2.4.1] - 2026-08-29
 
 ### 变更

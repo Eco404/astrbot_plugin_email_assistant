@@ -33,13 +33,19 @@ def confirmation_token_hash(value: Any) -> str:
     return hashlib.sha256(normalized.encode("ascii")).hexdigest()
 
 
+def confirmation_code_from_user_message(message: Any) -> str:
+    text = str(message or "").strip()
+    match = re.fullmatch(
+        r"确认发送\s*[:：]?\s*([23456789ABCDEFGHJKLMNPQRSTUVWXYZ-]+)\s*[。.!！]?",
+        text,
+        flags=re.IGNORECASE,
+    )
+    return normalize_confirmation_code(match.group(1)) if match else ""
+
+
 def confirmation_present_in_user_message(message: Any, code: Any) -> bool:
     normalized = normalize_confirmation_code(code)
-    if not normalized:
-        return False
-    text = str(message or "").strip()
-    pattern = rf"^确认发送\s*[:：]?\s*{re.escape(normalized)}\s*[。.!！]?$"
-    return re.fullmatch(pattern, text, flags=re.IGNORECASE) is not None
+    return bool(normalized) and confirmation_code_from_user_message(message) == normalized
 
 
 class EmailDraftService:

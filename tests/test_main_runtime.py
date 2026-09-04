@@ -615,8 +615,8 @@ class MainRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("不输出中间步骤", req.system_prompt)
         self.assertEqual(req.system_prompt, first_prompt)
         self.assertNotIn("email_assistant_create_draft", req.func_tool.names())
-        self.assertNotIn("email_assistant_summarize_message", req.func_tool.names())
-        self.assertIn("email_assistant_list_messages", req.func_tool.names())
+        self.assertNotIn("email_assistant_process_message", req.func_tool.names())
+        self.assertIn("email_assistant_query_mailbox", req.func_tool.names())
 
     async def test_llm_request_does_not_inject_for_group_or_unbound_user(self):
         group_req = types.SimpleNamespace(
@@ -656,11 +656,11 @@ class MainRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("other_plugin_tool", names)
         self.assertIn("email_assistant_list_accounts", names)
         self.assertIn("email_assistant_create_draft", names)
-        self.assertIn("email_assistant_confirm_send", names)
-        self.assertIn("email_assistant_cancel_draft", names)
-        self.assertNotIn("email_assistant_list_messages", names)
+        self.assertNotIn("email_assistant_confirm_send", names)
+        self.assertNotIn("email_assistant_cancel_draft", names)
+        self.assertNotIn("email_assistant_query_mailbox", names)
         self.assertNotIn("email_assistant_create_reply_draft", names)
-        self.assertNotIn("email_assistant_summarize_message", names)
+        self.assertNotIn("email_assistant_process_message", names)
         self.assertIn("不输出中间步骤", req.system_prompt)
 
     async def test_llm_request_keeps_processing_tools_but_removes_disabled_write_tools(self):
@@ -675,10 +675,46 @@ class MainRuntimeTests(unittest.IsolatedAsyncioTestCase):
         )
 
         names = set(req.func_tool.names())
-        self.assertIn("email_assistant_summarize_message", names)
-        self.assertIn("email_assistant_translate_message", names)
+        self.assertIn("email_assistant_process_message", names)
         self.assertNotIn("email_assistant_create_draft", names)
         self.assertNotIn("email_assistant_confirm_send", names)
+
+    async def test_llm_request_exposes_stateful_draft_tools_only_when_applicable(self):
+        self._enable_llm_draft_workflow()
+        draft_event = FakeEvent("1", "p:FriendMessage:1", message_str="写一封邮件")
+        created = json.loads(
+            await self.plugin.tool_create_draft(
+                draft_event, "reader@example.com", "主题", "正文", "one"
+            )
+        )["draft"]
+
+        ordinary_req = types.SimpleNamespace(
+            system_prompt="原提示",
+            func_tool=FakeToolSet(EMAIL_LLM_TOOL_NAMES),
+        )
+        await self.plugin.inject_email_tool_conversation_rules(
+            FakeEvent("1", "p:FriendMessage:1", message_str="查看草稿"),
+            ordinary_req,
+        )
+        ordinary_names = set(ordinary_req.func_tool.names())
+        self.assertIn("email_assistant_cancel_draft", ordinary_names)
+        self.assertNotIn("email_assistant_confirm_send", ordinary_names)
+
+        confirmation_req = types.SimpleNamespace(
+            system_prompt="原提示",
+            func_tool=FakeToolSet(EMAIL_LLM_TOOL_NAMES),
+        )
+        await self.plugin.inject_email_tool_conversation_rules(
+            FakeEvent(
+                "1",
+                "p:FriendMessage:1",
+                message_str=f"确认发送 {created['confirmation_code']}",
+            ),
+            confirmation_req,
+        )
+        confirmation_names = set(confirmation_req.func_tool.names())
+        self.assertIn("email_assistant_cancel_draft", confirmation_names)
+        self.assertIn("email_assistant_confirm_send", confirmation_names)
 
     async def test_llm_tool_lists_messages_with_limit(self):
         event = FakeEvent("1", "p:FriendMessage:1")
@@ -699,14 +735,41 @@ class MainRuntimeTests(unittest.IsolatedAsyncioTestCase):
             "astrbot_plugin_email_assistant.main.query_since", return_value=[mail]
         ) as query:
             result = json.loads(
-                await self.plugin.tool_list_messages(
-                    event, account="one", since_date="2026-07-01", limit=999
+                await self.plugin.tool_query_mailbox(
+                    event,
+                    "list",
+                    account="one",
+                    since_date="2026-07-01",
+                    limit=999,
                 )
             )
         self.assertTrue(result["success"])
         self.assertEqual(result["messages"][0]["uid"], 12)
         self.assertNotIn("body", result["messages"][0])
         self.assertEqual(query.call_args.args[3], self.plugin._query_limit())
+
+    async def test_llm_query_mailbox_rejects_invalid_operation_fields(self):
+        event = FakeEvent("1", "p:FriendMessage:1")
+        invalid_operation = json.loads(
+            await self.plugin.tool_query_mailbox(event, "search", account="one")
+        )
+        missing_uid = json.loads(
+            await self.plugin.tool_query_mailbox(event, "read", account="one")
+        )
+        list_with_uid = json.loads(
+            await self.plugin.tool_query_mailbox(
+                event, "list", account="one", uid=7
+            )
+        )
+        read_with_since = json.loads(
+            await self.plugin.tool_query_mailbox(
+                event, "read", account="one", uid=7, since_date="2026-07-01"
+            )
+        )
+        self.assertFalse(invalid_operation["success"])
+        self.assertFalse(missing_uid["success"])
+        self.assertFalse(list_with_uid["success"])
+        self.assertFalse(read_with_since["success"])
 
     async def test_llm_tool_shows_bounded_message_body(self):
         event = FakeEvent("1", "p:FriendMessage:1")
@@ -726,7 +789,9 @@ class MainRuntimeTests(unittest.IsolatedAsyncioTestCase):
         )
         with patch("astrbot_plugin_email_assistant.main.fetch_detail", return_value=mail):
             result = json.loads(
-                await self.plugin.tool_show_message(event, 13, account="one")
+                await self.plugin.tool_query_mailbox(
+                    event, "read", uid=13, account="one"
+                )
             )
         self.assertTrue(result["success"])
         self.assertTrue(result["message"]["body_truncated"])
@@ -756,10 +821,14 @@ class MainRuntimeTests(unittest.IsolatedAsyncioTestCase):
             return_value=(10, message),
         ) as fetch:
             generated = json.loads(
-                await self.plugin.tool_summarize_message(event, 31, account="one")
+                await self.plugin.tool_process_message(
+                    event, 31, "summary", account="one"
+                )
             )
             cached = json.loads(
-                await self.plugin.tool_summarize_message(event, 31, account="one")
+                await self.plugin.tool_process_message(
+                    event, 31, "summary", account="one"
+                )
             )
         self.assertTrue(generated["success"])
         self.assertFalse(generated["cached"])
@@ -771,6 +840,15 @@ class MainRuntimeTests(unittest.IsolatedAsyncioTestCase):
         cached_body = index.get_cached_body("one", "INBOX", 10, 31)
         self.assertIsNotNone(cached_body)
         self.assertEqual(cached_body.body_text, "需要缓存的正文")
+
+    async def test_llm_process_message_rejects_invalid_task(self):
+        result = json.loads(
+            await self.plugin.tool_process_message(
+                FakeEvent("1", "p:FriendMessage:1"), 31, "rewrite", account="one"
+            )
+        )
+        self.assertFalse(result["success"])
+        self.assertIn("summary", result["error"])
 
     async def test_llm_translation_tool_replaces_different_language_cache(self):
         index = self._enable_test_index()
@@ -805,15 +883,18 @@ class MainRuntimeTests(unittest.IsolatedAsyncioTestCase):
         remote = AsyncMock(return_value=message)
         with patch.object(self.plugin, "_fetch_remote_detail", new=remote):
             translated = json.loads(
-                await self.plugin.tool_translate_message(
+                await self.plugin.tool_process_message(
                     event,
                     32,
+                    "translate",
                     account="one",
                     target_language="English",
                 )
             )
             latest = json.loads(
-                await self.plugin.tool_translate_message(event, 32, account="one")
+                await self.plugin.tool_process_message(
+                    event, 32, "translate", account="one"
+                )
             )
         self.assertTrue(translated["success"])
         self.assertFalse(translated["cached"])
@@ -844,8 +925,8 @@ class MainRuntimeTests(unittest.IsolatedAsyncioTestCase):
             "astrbot_plugin_email_assistant.main.fetch_latest", return_value=mail
         ) as latest:
             result = json.loads(
-                await self.plugin.tool_get_latest_message(
-                    event, account="", since_date="2026-07-01"
+                await self.plugin.tool_query_mailbox(
+                    event, "latest", account="", since_date="2026-07-01"
                 )
             )
         self.assertTrue(result["success"])
@@ -857,7 +938,9 @@ class MainRuntimeTests(unittest.IsolatedAsyncioTestCase):
     async def test_llm_tool_latest_returns_empty_result(self):
         event = FakeEvent("1", "p:FriendMessage:1")
         with patch("astrbot_plugin_email_assistant.main.fetch_latest", return_value=None):
-            result = json.loads(await self.plugin.tool_get_latest_message(event))
+            result = json.loads(
+                await self.plugin.tool_query_mailbox(event, "latest")
+            )
         self.assertTrue(result["success"])
         self.assertIsNone(result["message"])
 
@@ -1306,10 +1389,16 @@ class MainRuntimeTests(unittest.IsolatedAsyncioTestCase):
             extras={"cron_job": {"id": "job"}},
         )
         accounts = json.loads(await self.plugin.tool_list_accounts(event))
-        listing = json.loads(await self.plugin.tool_list_messages(event, "one"))
-        latest = json.loads(await self.plugin.tool_get_latest_message(event, "one"))
+        listing = json.loads(
+            await self.plugin.tool_query_mailbox(event, "list", account="one")
+        )
+        latest = json.loads(
+            await self.plugin.tool_query_mailbox(event, "latest", account="one")
+        )
         detail = json.loads(
-            await self.plugin.tool_show_message(event, 1, account="one")
+            await self.plugin.tool_query_mailbox(
+                event, "read", uid=1, account="one"
+            )
         )
         self.assertFalse(accounts["success"])
         self.assertFalse(listing["success"])
@@ -1318,13 +1407,17 @@ class MainRuntimeTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_llm_read_tools_enforce_owner_and_query_switch(self):
         other_user = FakeEvent("2", "p:FriendMessage:2")
-        denied = json.loads(await self.plugin.tool_list_messages(other_user, "one"))
+        denied = json.loads(
+            await self.plugin.tool_query_mailbox(other_user, "list", account="one")
+        )
         self.assertFalse(denied["success"])
 
         self.account["query_enabled"] = False
         owner = FakeEvent("1", "p:FriendMessage:1")
         disabled = json.loads(
-            await self.plugin.tool_show_message(owner, 1, account="one")
+            await self.plugin.tool_query_mailbox(
+                owner, "read", uid=1, account="one"
+            )
         )
         self.assertFalse(disabled["success"])
 

@@ -140,26 +140,23 @@ account_id: 账户 ID | uid: 邮件 UID
 
 配置页面按板块进行分组；邮件总结/翻译的模型、提示词、语言和长度限制由 WebUI 与 Bot 工具共享。后端只读取当前分组结构，`mail_accounts` 保持为顶层账户列表。
 
-## LLM 只读邮件工具
+## LLM 邮件工具
 
-插件注册以下只读 Agent 工具，让用户可以在私聊中用自然语言查询邮件：
+插件注册以下用于读取和处理邮件的 Agent 工具，让用户可以在私聊中自然查询邮件：
 
 - `email_assistant_list_accounts`：列出当前用户可查询的邮箱账户；
-- `email_assistant_list_messages`：按账户和起始日期列出邮件，不读取正文；
-- `email_assistant_get_latest_message`：一次查询并读取最新一封邮件，避免先查列表再查详情；
-- `email_assistant_show_message`：按账户与 IMAP UID 读取详情和截断正文。
-- `email_assistant_summarize_message`：按 UID 读取或生成邮件总结，并复用本地缓存；
-- `email_assistant_translate_message`：按 UID 读取或生成邮件译文，并复用本地缓存。
+- `email_assistant_query_mailbox`：通过 `operation=list` 列邮件头、`operation=latest` 读取最新邮件、`operation=read` 按 UID 读取邮件详情；
+- `email_assistant_process_message`：通过 `task=summary` 总结邮件，或通过 `task=translate` 翻译邮件，并复用本地缓存。
 
 工具沿用邮箱绑定关系、管理员权限、目标平台匹配和每账户 `query_enabled` 开关。群聊、其他用户、AstrBot Cron 及带 `cron_job` 标记的合成事件会被拒绝，避免不可信邮件正文借助定时 Agent 继续查询邮箱。列表和详情只返回邮件数据，不会执行正文中的任何指令，也不会返回密码、授权码或服务器凭据。
 
 插件会在有可查询邮箱的绑定用户私聊中注入简短交互规则：调用邮件工具的中间轮次保持静默，不逐步播报账户确认、列表查询、详情读取或安全检查，只在全部工具完成后输出最终回复。同时，未指定账户时会优先让目标工具自动选择唯一账户，不再为了确认账户而预先查询账户列表。
 
-“最新一封邮件说了什么”应优先使用 `email_assistant_get_latest_message`，在一次工具调用内完成定位和正文读取；“最近有哪些邮件”仍使用不读取正文的 `email_assistant_list_messages`。这些提示能显著减少模型产生中间过程消息，但最终遵循程度仍取决于所用模型；插件不会修改 AstrBot 全局 Agent Runner 的消息发送行为。
+“最新一封邮件说了什么”使用 `email_assistant_query_mailbox` 的 `operation=latest`，在一次工具调用内完成定位和正文读取；“最近有哪些邮件”使用 `operation=list`，仍只读取邮件头。按 UID 查看正文则使用 `operation=read`。这些提示能显著减少模型产生中间过程消息，但最终遵循程度仍取决于所用模型；插件不会修改 AstrBot 全局 Agent Runner 的消息发送行为。
 
 用户按 UID 要求总结或翻译时，Bot 会直接调用对应处理工具，不需要先把完整正文放入主 Agent 上下文。工具先读取当前有效的 AI 缓存；缓存不存在时才实时校验并读取云端正文，调用“邮件总结与翻译”中配置的不带人格模型，并把结果写回 SQLite。明确指定的目标语言与现有缓存不同时会重新生成并替换旧缓存；明确要求“重新处理”时可忽略缓存。工具返回的 `cached` 字段可用于判断本次结果来自缓存还是新生成。
 
-若当前 AstrBot 人格配置了显式工具白名单，需要在该人格中允许上述六个只读/处理工具；启用 LLM 写信后还需允许后文列出的四个草稿工具。未限制人格工具时会按 AstrBot 默认规则自动提供。
+若当前 AstrBot 人格配置了显式工具白名单，需要将旧的五个查询/处理工具替换为 `email_assistant_query_mailbox` 和 `email_assistant_process_message`；保留 `email_assistant_list_accounts`。启用 LLM 写信后还需允许后文列出的四个草稿工具。未限制人格工具时会按 AstrBot 默认规则自动提供。
 
 ## 本地邮件头索引与 `plugin_data`
 
@@ -233,6 +230,8 @@ SQLite 中包含独立的 `mail_drafts` 表，不把草稿混入邮件头或正�
 创建工具只写入本地 `pending_review` 草稿，不连接 SMTP。Bot 会显示账户、收件人、主题、正文和类似 `确认发送 ABCD-2345` 的指令；用户必须在**下一条独立私聊消息**中原样输入该指令。服务端会直接检查当前用户消息，而不只相信 LLM 提交的工具参数，所以模型不能在创建草稿的同一轮自行确认。确认码默认十分钟有效、只能使用一次，并与草稿版本和创建用户绑定；草稿被编辑、取消或发送后旧确认码失效。
 
 确认发送时会再次检查用户归属、账户 `send_enabled`、草稿版本及回复邮件的云端状态，并以原子方式把草稿切换为 `sending`，防止 WebUI 和 LLM 并发重复发送。SMTP 一旦开始尝试就不会自动重试，因为连接中断时无法绝对判断服务器是否已经接收邮件；这种情况会提示先检查“已发送”文件夹。
+
+为缩小每轮 LLM 请求携带的工具 schema，确认发送工具只会在当前真实用户消息严格匹配 `确认发送 <确认码>` 时注入；取消工具只会在当前用户有可取消的 Bot 草稿时注入。服务端仍会在实际调用时再次验证确认码、草稿归属和状态。
 
 邮件中心仍允许管理员编辑草稿；只有先人工审核为 `approved`，再通过页面内二次确认和同一个共享发送服务后才会调用 SMTP。WebUI 编辑 Bot 草稿会使原确认码失效。草稿只保存在本地，不同步到邮箱服务商的 Drafts 文件夹。
 
