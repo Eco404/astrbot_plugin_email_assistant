@@ -3,14 +3,17 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import inspect
+import os
 import re
 import time
 from dataclasses import asdict
 from datetime import datetime
-from email.utils import parseaddr
+from pathlib import Path
 from typing import Any
 
 from astrbot.api import logger
+from starlette.responses import FileResponse, JSONResponse
 
 from .config_utils import config_get
 from .imap_client import (
@@ -19,7 +22,7 @@ from .imap_client import (
     create_folder as imap_create_folder,
     transfer_message,
 )
-from .mail_index import IndexedMailHeader, MailDraft
+from .mail_index import IndexedMailHeader, MailDraft, attachment_storage_lock
 from .smtp_client import build_draft_message
 
 try:  # AstrBot's current Plugin Pages request facade.
@@ -38,6 +41,45 @@ _DRAFT_STATUSES = {
     "sent", "failed", "cancelled",
 }
 _VERIFICATION_CACHE_MAX_ITEMS = 512
+
+
+class _AttachmentDownload(FileResponse):
+    """Hold the cache lease until ASGI finishes or disconnects the response."""
+
+    def __init__(self, store: Any, record: Any) -> None:
+        self.store = store
+        self.record = record
+        super().__init__(
+            record.path,
+            filename=record.filename,
+            media_type="application/octet-stream",
+            headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"},
+        )
+
+    async def __call__(self, scope, receive, send) -> None:
+        lease = self.store.lease((self.record.attachment_id,), self.record.account_id)
+        acquisition = asyncio.create_task(asyncio.to_thread(lease.__enter__))
+        try:
+            records = await asyncio.shield(acquisition)
+        except asyncio.CancelledError:
+            try:
+                await acquisition
+            except Exception:
+                pass
+            else:
+                await asyncio.to_thread(lease.__exit__, None, None, None)
+            raise
+        except (ValueError, OSError, KeyError, RuntimeError) as exc:
+            response = JSONResponse(
+                {"status": "error", "message": _one_line(exc, 240)}, status_code=404
+            )
+            await response(scope, receive, send)
+            return
+        try:
+            self.path = records[0].path
+            await super().__call__(scope, receive, send)
+        finally:
+            await asyncio.to_thread(lease.__exit__, None, None, None)
 
 
 def _one_line(value: Any, limit: int = 180) -> str:
@@ -62,6 +104,10 @@ class EmailAssistantPageApi:
             ("/message", self.get_message, ["GET"], "Email Assistant message detail"),
             ("/message/cached", self.get_cached_message, ["GET"], "Email Assistant cached message detail"),
             ("/message/verify", self.verify_message, ["POST"], "Email Assistant verify message detail"),
+            ("/message/attachments", self.list_message_attachments, ["GET"], "Email Assistant message attachments"),
+            ("/message/attachment/download", self.download_message_attachment, ["GET"], "Email Assistant download message attachment"),
+            ("/attachments/upload/<account_id>/<draft_id>/<revision>", self.upload_attachment, ["POST"], "Email Assistant upload draft attachment"),
+            ("/attachments/download", self.download_attachment, ["GET"], "Email Assistant download saved attachment"),
             ("/folders", self.list_folders, ["GET"], "Email Assistant folders"),
             ("/folders/refresh", self.refresh_folders, ["POST"], "Email Assistant refresh folders"),
             ("/folders/create", self.create_folder, ["POST"], "Email Assistant create folder"),
@@ -250,6 +296,17 @@ class EmailAssistantPageApi:
                 "ok": status.get("ok"),
                 "detail": _one_line(status.get("detail"), 180),
                 "checked_at": _one_line(status.get("checked_at"), 32),
+                **{
+                    key: status.get(key)
+                    for key in (
+                        "last_success_at", "consecutive_failures", "next_retry_at",
+                        "last_poll_duration_ms", "notification_delivered",
+                        "notification_failed", "last_notification_at",
+                        "last_imap_duration_ms", "last_smtp_duration_ms",
+                        "notification_scheduled", "last_error_type",
+                        "body_cache_hits", "body_cache_misses",
+                    )
+                },
             },
             "sync_warning": _one_line(
                 self.plugin._index_warnings.get(account_id, ""), 180
@@ -276,7 +333,7 @@ class EmailAssistantPageApi:
             return self._ok(
                 {
                     "plugin": {
-                        "version": "2.4.1",
+                        "version": "3.0.0",
                         "index_enabled": self.plugin._mail_index is not None,
                         "body_cache_mode": str(
                             config_get(self.plugin.config, "body_cache_mode") or "on_demand"
@@ -284,6 +341,9 @@ class EmailAssistantPageApi:
                         "webui_auto_show_cached_ai": self._auto_show_cached_ai(),
                     },
                     "accounts": accounts,
+                    "attachment_cache": await asyncio.to_thread(
+                        self.plugin._attachment_store().stats
+                    ) if self.plugin._mail_index is not None else None,
                 }
             )
         except Exception as exc:
@@ -292,6 +352,108 @@ class EmailAssistantPageApi:
 
     async def list_accounts(self) -> dict[str, Any]:
         return await self.get_overview()
+
+    async def _attachment_message_args(self):
+        query = self._query()
+        account = self._resolve_account(query.get("account_id"), capability="query_enabled")
+        folder = await self._folder(account, query.get("folder"))
+        try:
+            uid = int(query.get("uid", 0))
+        except (TypeError, ValueError):
+            uid = 0
+        if uid <= 0:
+            raise ValueError("邮件 UID 必须是正整数。")
+        return account, folder, uid
+
+    async def list_message_attachments(self):
+        try:
+            account, folder, uid = await self._attachment_message_args()
+            items = await self.plugin._list_mail_attachments(account, uid, folder)
+            return self._ok({"items": items})
+        except Exception as exc:
+            return self._error(exc)
+
+    async def download_message_attachment(self):
+        try:
+            account, folder, uid = await self._attachment_message_args()
+            part_id = str(self._query().get("part_id") or "")
+            if not part_id or len(part_id) > 128:
+                raise ValueError("缺少有效的附件标识。")
+            record = await self.plugin._download_mail_attachment(account, uid, part_id, folder)
+            return _AttachmentDownload(self.plugin._attachment_store(), record)
+        except Exception as exc:
+            return JSONResponse(self._error(exc), status_code=400)
+
+    async def download_attachment(self):
+        try:
+            account = self._resolve_account(self._query().get("account_id"))
+            store = self.plugin._attachment_store()
+            record = await asyncio.to_thread(
+                store.get, str(self._query().get("attachment_id") or ""),
+                self.plugin._account_key(account),
+            )
+            return _AttachmentDownload(store, record)
+        except Exception as exc:
+            return JSONResponse(self._error(exc), status_code=400)
+
+    async def upload_attachment(self, account_id: str, draft_id: str, revision: str):
+        try:
+            account = self._resolve_account(account_id, capability="send_enabled")
+            index = self._require_index()
+            expected_revision = int(revision)
+            files = request.files() if callable(request.files) else request.files
+            if inspect.isawaitable(files):
+                files = await files
+            upload = files.get("file")
+            if upload is None:
+                raise ValueError("请选择要添加的文件。")
+            raw = getattr(upload, "_upload_file", upload)
+            stream = getattr(raw, "file", None) or getattr(raw, "stream", None)
+            if stream is None:
+                raise RuntimeError("当前 AstrBot 不支持流式附件上传，请升级宿主。")
+
+            def writer(path: Path, max_bytes: int):
+                stream.seek(0)
+                written = 0
+                with os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "wb") as output:
+                    while chunk := stream.read(64 * 1024):
+                        written += len(chunk)
+                        if written > max_bytes:
+                            raise ValueError("附件缓存容量不足，请释放空间或调整总容量。")
+                        output.write(chunk)
+
+            def attach_to_draft():
+                with attachment_storage_lock(index.path):
+                    draft = index.get_draft(draft_id)
+                    if draft is None or draft.account_id != self.plugin._account_key(account):
+                        raise ValueError("草稿不存在或不属于当前账户。")
+                    if draft.status in {"sending", "sent", "cancelled"}:
+                        raise ValueError("当前草稿不能添加附件。")
+                    if draft.revision != expected_revision:
+                        raise ValueError("草稿已被其他操作修改，请刷新后重试。")
+                    record = self.plugin._attachment_store().receive_file(
+                        draft.account_id, writer,
+                        filename=str(upload.filename or "attachment"),
+                        content_type=str(upload.content_type or "application/octet-stream"),
+                        expected_size=int(getattr(raw, "size", 0) or 0),
+                    )
+                    return index.update_draft(
+                        draft_id, expected_revision,
+                        attachment_ids=(*draft.attachment_ids, record.attachment_id),
+                        status="editing", last_error="",
+                    )
+
+            lock = self._draft_send_locks.setdefault(draft_id, asyncio.Lock())
+            async with lock:
+                operation = asyncio.create_task(asyncio.to_thread(attach_to_draft))
+                try:
+                    updated = await asyncio.shield(operation)
+                except asyncio.CancelledError:
+                    await operation
+                    raise
+            return self._ok(await asyncio.to_thread(self._draft_payload, updated))
+        except Exception as exc:
+            return self._error(exc)
 
     @staticmethod
     def _encode_cursor(item: IndexedMailHeader) -> str:
@@ -532,13 +694,19 @@ class EmailAssistantPageApi:
             account_id = self.plugin._account_key(account)
             state = await asyncio.to_thread(index.get_state, account_id, folder)
             if state is None:
+                status = self.plugin._status.setdefault(account_id, {})
+                status["body_cache_misses"] = int(status.get("body_cache_misses", 0)) + 1
                 raise KeyError("该文件夹尚无本地索引。")
             header = await asyncio.to_thread(index.get_header, account_id, folder, uid)
             cached = await asyncio.to_thread(
                 index.get_cached_body, account_id, folder, state.uidvalidity, uid
             )
             if header is None or cached is None:
+                status = self.plugin._status.setdefault(account_id, {})
+                status["body_cache_misses"] = int(status.get("body_cache_misses", 0)) + 1
                 raise KeyError("这封邮件没有可用的本地正文缓存。")
+            status = self.plugin._status.setdefault(account_id, {})
+            status["body_cache_hits"] = int(status.get("body_cache_hits", 0)) + 1
             body_limit = self._int(
                 config_get(self.plugin.config, "detail_body_max_chars"),
                 4000,
@@ -865,9 +1033,45 @@ class EmailAssistantPageApi:
         values = value if isinstance(value, list) else re.split(r"[,;\n]", str(value))
         return tuple(_one_line(item, 320) for item in values if _one_line(item, 320))
 
+    def _draft_payload(self, draft: MailDraft) -> dict[str, Any]:
+        payload = asdict(draft)
+        payload["attachments"] = []
+        for attachment_id in getattr(draft, "attachment_ids", ()):
+            try:
+                record = self.plugin._attachment_store().get(attachment_id, draft.account_id)
+                payload["attachments"].append(record.payload())
+            except (ValueError, KeyError, OSError, RuntimeError):
+                payload["attachments"].append({
+                    "attachment_id": attachment_id,
+                    "filename": "附件不可用",
+                    "missing": True,
+                })
+        return payload
+
     @staticmethod
-    def _draft_payload(draft: MailDraft) -> dict[str, Any]:
-        return asdict(draft)
+    def _attachment_ids(value: Any) -> tuple[str, ...]:
+        if not isinstance(value, list) or any(
+            not isinstance(item, str) or not item or len(item) > 128 for item in value
+        ):
+            raise ValueError("附件列表必须是有效的附件 ID 数组。")
+        if len(value) != len(set(value)):
+            raise ValueError("同一附件不能重复添加。")
+        return tuple(value)
+
+    def _write_draft(self, account_id: str, attachment_ids, operation, *args, **kwargs):
+        if attachment_ids is None:
+            return operation(*args, **kwargs)
+        with self.plugin._attachment_store().lease(attachment_ids, account_id):
+            return operation(*args, attachment_ids=attachment_ids, **kwargs)
+
+    def _validate_draft(self, account, draft):
+        with self.plugin._attachment_store().lease(
+            getattr(draft, "attachment_ids", ()), draft.account_id
+        ):
+            build_draft_message(
+                account, draft.to_addrs, draft.cc_addrs, draft.bcc_addrs,
+                draft.subject, draft.body_text,
+            )
 
     @staticmethod
     def _draft_summary_payload(draft: MailDraft) -> dict[str, Any]:
@@ -883,6 +1087,7 @@ class EmailAssistantPageApi:
             "sent_at": draft.sent_at,
             "last_error": draft.last_error,
             "reply_uid": draft.reply_uid,
+            "attachment_count": len(getattr(draft, "attachment_ids", ())),
         }
 
     async def list_drafts(self) -> dict[str, Any]:
@@ -917,7 +1122,7 @@ class EmailAssistantPageApi:
             if draft is None:
                 raise KeyError("草稿不存在。")
             self._resolve_account(draft.account_id)
-            return self._ok(self._draft_payload(draft))
+            return self._ok(await asyncio.to_thread(self._draft_payload, draft))
         except Exception as exc:
             return self._error(exc)
 
@@ -935,6 +1140,9 @@ class EmailAssistantPageApi:
                 if reply_uid <= 0:
                     raise ValueError("回复邮件 UID 必须是正整数。")
             draft = await asyncio.to_thread(
+                self._write_draft,
+                self.plugin._account_key(account),
+                self._attachment_ids(payload.get("attachment_ids", [])),
                 index.create_draft,
                 self.plugin._account_key(account),
                 to_addrs=self._addresses(payload.get("to_addrs")),
@@ -947,7 +1155,7 @@ class EmailAssistantPageApi:
                 source="user",
                 status="editing",
             )
-            return self._ok(self._draft_payload(draft))
+            return self._ok(await asyncio.to_thread(self._draft_payload, draft))
         except Exception as exc:
             return self._error(exc)
 
@@ -977,12 +1185,16 @@ class EmailAssistantPageApi:
                 changes["status"] = "editing"
                 changes["last_error"] = ""
                 updated = await asyncio.to_thread(
+                    self._write_draft,
+                    current.account_id,
+                    self._attachment_ids(payload["attachment_ids"])
+                    if "attachment_ids" in payload else None,
                     index.update_draft,
                     draft_id,
                     self._int(payload.get("revision"), 0, 0, 2_147_483_647),
                     **changes,
                 )
-            return self._ok(self._draft_payload(updated))
+            return self._ok(await asyncio.to_thread(self._draft_payload, updated))
         except Exception as exc:
             return self._error(exc)
 
@@ -1003,14 +1215,7 @@ class EmailAssistantPageApi:
                 account = self._resolve_account(
                     draft.account_id, capability="send_enabled"
                 )
-                build_draft_message(
-                    account,
-                    draft.to_addrs,
-                    draft.cc_addrs,
-                    draft.bcc_addrs,
-                    draft.subject,
-                    draft.body_text,
-                )
+                await asyncio.to_thread(self._validate_draft, account, draft)
                 approved = await asyncio.to_thread(
                     index.update_draft,
                     draft_id,
@@ -1018,7 +1223,7 @@ class EmailAssistantPageApi:
                     status="approved",
                     last_error="",
                 )
-            return self._ok(self._draft_payload(approved))
+            return self._ok(await asyncio.to_thread(self._draft_payload, approved))
         except Exception as exc:
             return self._error(exc)
 
@@ -1064,7 +1269,7 @@ class EmailAssistantPageApi:
                     account_id, capability="send_enabled"
                 ),
             )
-            return self._ok(self._draft_payload(sent))
+            return self._ok(await asyncio.to_thread(self._draft_payload, sent))
         except Exception as exc:
             logger.warning(
                 "[EmailAssistantPage] 草稿发送失败 draft=%s error=%s",

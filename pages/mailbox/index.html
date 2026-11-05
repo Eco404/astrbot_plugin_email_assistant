@@ -8,7 +8,7 @@
     <script>
       document.documentElement.dataset.theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
     </script>
-    <link rel="stylesheet" href="./app.css?v=2.4.1" />
+    <link rel="stylesheet" href="./app.css?v=3.0.0" />
   </head>
   <body class="quiet-glass-background">
     <div id="mobile-nav-scrim" class="mobile-nav-scrim hidden" aria-hidden="true"></div>
@@ -54,6 +54,10 @@
             <button id="sync-button" class="button secondary">同步云端</button>
           </div>
         </header>
+        <div class="workspace-health" aria-label="邮箱与附件存储状态">
+          <span id="account-health"></span>
+          <span id="attachment-cache-status"></span>
+        </div>
 
         <section id="mailbox-view" class="view active">
           <div class="mail-layout">
@@ -113,8 +117,17 @@
                 </div>
                 <label>主题<input id="draft-subject" type="text" maxlength="998" placeholder="邮件主题" /></label>
                 <label class="body-field">正文<textarea id="draft-body" placeholder="输入纯文本邮件正文"></textarea></label>
+                <section class="attachment-section" aria-labelledby="draft-attachment-heading">
+                  <div class="attachment-heading">
+                    <div><strong id="draft-attachment-heading">附件</strong><small id="draft-attachment-total">未添加附件</small></div>
+                    <button id="add-attachment-button" class="button secondary" type="button">添加文件或图片</button>
+                    <input id="draft-attachment-input" type="file" multiple hidden aria-label="选择附件文件或图片" />
+                  </div>
+                  <div id="draft-attachments" class="attachment-list"></div>
+                  <p id="attachment-progress" class="attachment-help" role="status" aria-live="polite"></p>
+                </section>
               </div>
-              <div class="composer-note">当前版本只发送纯文本；页面不会渲染邮件 HTML，也不支持附件。</div>
+              <div class="composer-note">正文以纯文本发送；图片作为附件发送。添加附件会先保存当前草稿，修改正文或附件后需重新审核。</div>
             </section>
           </div>
         </section>
@@ -158,6 +171,6 @@
     <div id="toast" class="toast hidden" role="status"></div>
     <script src="./vendor/markdown-it/markdown-it.min.js"></script>
     <script src="./vendor/dompurify/purify.min.js"></script>
-    <script type="module" src="./app.js?v=2.4.1"></script>
+    <script type="module" src="./app.js?v=3.0.0"></script>
   </body>
 </html>

@@ -315,6 +315,48 @@ body[data-theme="dark"].quiet-glass-background {
 
 .workspace { min-width: 0; }
 
+.workspace-health {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 4px 16px;
+  padding: 8px 4px;
+  color: var(--muted);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.workspace-health span:empty { display: none; }
+
+.attachment-section { min-width: 0; margin-block: 12px; }
+.attachment-heading, .attachment-row, .attachment-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.attachment-heading { justify-content: space-between; flex-wrap: wrap; margin-bottom: 8px; }
+.attachment-heading > div { display: grid; gap: 3px; }
+.attachment-heading small, .attachment-info small, .attachment-help {
+  color: var(--muted);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+.attachment-row { padding: 10px 0; box-shadow: inset 0 -1px var(--line); }
+.attachment-info { display: grid; gap: 3px; min-width: 0; flex: 1; }
+.attachment-info strong { font-weight: 600; overflow-wrap: anywhere; }
+.attachment-row > .button, .attachment-actions { flex-shrink: 0; }
+.attachment-help { min-height: 18px; margin: 8px 0 0; }
+.attachment-actions { gap: 4px; }
+#modal .modal-card { display: flex; flex-direction: column; }
+#modal .modal-card h2, #modal .modal-actions { flex-shrink: 0; }
+#modal-message {
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
 .topbar {
   position: sticky;
   top: 12px;

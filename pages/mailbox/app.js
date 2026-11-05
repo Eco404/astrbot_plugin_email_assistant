@@ -1,4 +1,4 @@
-import { renderMarkdown } from "./markdown.js?v=2.4.1";
+import { renderMarkdown } from "./markdown.js?v=3.0.0";
 
 const state = {
   bridge: null,
@@ -14,6 +14,9 @@ const state = {
   drafts: [],
   draft: null,
   draftDirty: false,
+  draftBusy: false,
+  draftSession: 0,
+  draftAttachments: [],
   autoShowCachedAi: "none",
 };
 
@@ -48,7 +51,28 @@ const elements = {
   approveDraft: $("#approve-draft-button"),
   sendDraft: $("#send-draft-button"),
   deleteDraft: $("#delete-draft-button"),
+  draftAttachments: $("#draft-attachments"),
+  attachmentInput: $("#draft-attachment-input"),
+  addAttachment: $("#add-attachment-button"),
+  attachmentProgress: $("#attachment-progress"),
 };
+
+function formatBytes(value) {
+  const size = Math.max(0, Number(value) || 0);
+  if (size < 1024) return `${size} B`;
+  if (size < 1024 ** 2) return `${(size / 1024).toFixed(1)} KiB`;
+  if (size < 1024 ** 3) return `${(size / 1024 ** 2).toFixed(1)} MiB`;
+  return `${(size / 1024 ** 3).toFixed(2)} GiB`;
+}
+
+function renderAccountHealth() {
+  const status = currentAccount()?.runtime_status || {};
+  const parts = [];
+  if (status.last_success_at) parts.push(`最近成功：${new Date(status.last_success_at * 1000).toLocaleString()}`);
+  if (status.consecutive_failures) parts.push(`连续失败 ${status.consecutive_failures} 次`);
+  if (status.next_retry_at > Date.now() / 1000) parts.push(`下次重试：${new Date(status.next_retry_at * 1000).toLocaleTimeString()}`);
+  $("#account-health").textContent = parts.join(" · ");
+}
 
 function unwrap(response) {
   if (response?.status === "error" || response?.success === false) {
@@ -90,6 +114,8 @@ function toast(message, error = false) {
 }
 
 function prepareModal(modal, dismiss, focusTarget) {
+  clearTimeout(toastTimer);
+  $("#toast").classList.add("hidden");
   const opener = document.activeElement instanceof HTMLElement ? document.activeElement : null;
   const onKeydown = (event) => {
     if (event.key === "Escape") {
@@ -195,6 +221,10 @@ async function loadOverview() {
   state.autoShowCachedAi = data.plugin?.webui_auto_show_cached_ai || "none";
   elements.runtimeState.textContent = enabled ? `${state.accounts.length} 个账户 · 索引就绪` : "本地索引不可用";
   elements.runtimeState.classList.toggle("error", !enabled);
+  const cache = data.attachment_cache;
+  $("#attachment-cache-status").textContent = cache
+    ? `附件缓存 ${formatBytes(cache.total_bytes)} / ${formatBytes(cache.max_total_bytes)} · 保留 ${cache.retention_days} 天`
+    : "";
 }
 
 function renderAccounts() {
@@ -237,6 +267,7 @@ function renderAccounts() {
     elements.accountList.append(button);
   }
   elements.mobileAccount.value = state.accountId;
+  renderAccountHealth();
 }
 
 function currentAccount() {
@@ -519,10 +550,11 @@ function renderMessageDetail(message) {
     elements.messageDetail.append(verification);
   }
   if (message.has_attachments) {
-    const banner = document.createElement("div");
-    banner.className = "detail-banner";
-    banner.textContent = "这封邮件包含附件；当前版本只显示附件存在状态，不下载附件。";
-    elements.messageDetail.append(banner);
+    const attachments = document.createElement("section");
+    attachments.className = "attachment-section";
+    attachments.setAttribute("aria-label", "邮件附件");
+    elements.messageDetail.append(attachments);
+    loadMessageAttachments(message, attachments);
   }
   if (message.body_truncated) {
     const banner = document.createElement("div");
@@ -554,6 +586,65 @@ function renderMessageDetail(message) {
   }
   elements.messageDetail.append(aiResult, body);
   void showConfiguredCachedResult(message, aiResult);
+}
+
+function attachmentRow(item) {
+  const row = document.createElement("div");
+  row.className = "attachment-row";
+  const info = document.createElement("div");
+  info.className = "attachment-info";
+  const name = document.createElement("strong");
+  name.textContent = item.filename || "未命名附件";
+  name.title = name.textContent;
+  const meta = document.createElement("small");
+  meta.textContent = item.missing ? "文件不可用，请移除后重新添加" : `${item.content_type || "文件"} · ${formatBytes(item.size_bytes)}`;
+  info.append(name, meta);
+  row.append(info);
+  return row;
+}
+
+async function downloadAttachment(endpoint, params, filename, button) {
+  if (button.disabled) return;
+  setBusy(button, true, "下载中…");
+  try {
+    if (!state.bridge.download) throw new Error("请升级 AstrBot 以使用附件下载。");
+    await state.bridge.download(endpoint, params, filename);
+    toast("附件已交给浏览器下载");
+  } catch (error) {
+    toast(error.message, true);
+  } finally {
+    setBusy(button, false);
+  }
+}
+
+async function loadMessageAttachments(message, container) {
+  container.replaceChildren(emptyNode("正在读取附件清单…"));
+  try {
+    const params = { account_id: message.account_id, folder: message.folder, uid: message.uid };
+    const data = await apiGet("message/attachments", params);
+    if (!container.isConnected) return;
+    const title = document.createElement("strong");
+    title.textContent = `附件 · ${(data.items || []).length}`;
+    container.replaceChildren(title);
+    if (!data.items?.length) container.append(emptyNode("没有可下载的附件。"));
+    for (const item of data.items || []) {
+      const row = attachmentRow(item);
+      const download = document.createElement("button");
+      download.className = "button secondary compact";
+      download.textContent = "下载";
+      download.setAttribute("aria-label", `下载 ${item.filename}`);
+      download.onclick = () => downloadAttachment("message/attachment/download", { ...params, part_id: item.part_id }, item.filename, download);
+      row.append(download);
+      container.append(row);
+    }
+  } catch (error) {
+    if (!container.isConnected) return;
+    const retry = document.createElement("button");
+    retry.className = "button secondary compact";
+    retry.textContent = "重试读取附件";
+    retry.onclick = () => loadMessageAttachments(message, container);
+    container.replaceChildren(emptyNode(error.message), retry);
+  }
 }
 
 function createProcessingButton(message, task, resultNode) {
@@ -756,7 +847,7 @@ function renderDraftList() {
     status.textContent = draftStatusLabel(draft.status);
     row.append(subject, status);
     const to = document.createElement("small");
-    to.textContent = `${draft.account_id} → ${(draft.to_addrs || []).join(", ") || "未填写收件人"}`;
+    to.textContent = `${draft.account_id} → ${(draft.to_addrs || []).join(", ") || "未填写收件人"}${draft.attachment_count ? ` · ${draft.attachment_count} 个附件` : ""}`;
     button.append(row, to);
     button.onclick = () => openDraft(draft.draft_id);
     elements.draftList.append(button);
@@ -764,18 +855,31 @@ function renderDraftList() {
 }
 
 async function openDraft(draftId) {
+  if (!(await canReplaceDraft())) return;
+  if (state.draftBusy) return;
+  state.draftBusy = true;
+  renderDraftStatus();
+  const session = ++state.draftSession;
   try {
     const draft = await apiGet("draft", { draft_id: draftId });
+    if (session !== state.draftSession) return;
     selectDraft(draft);
   } catch (error) {
     toast(error.message, true);
     await loadDrafts();
+  } finally {
+    state.draftBusy = false;
+    renderDraftStatus();
   }
 }
 
 function selectDraft(draft) {
+  state.draftSession += 1;
   state.draft = draft;
   state.draftDirty = false;
+  state.draftAttachments = [...(draft.attachments || [])];
+  state.replyPrefill = null;
+  elements.attachmentProgress.textContent = "";
   elements.draftAccount.value = draft.account_id;
   elements.draftAccount.disabled = true;
   elements.draftTo.value = (draft.to_addrs || []).join(", ");
@@ -786,12 +890,26 @@ function selectDraft(draft) {
   elements.draftHeading.textContent = draft.subject || "未命名草稿";
   elements.deleteDraft.classList.remove("hidden");
   renderDraftStatus();
+  renderDraftAttachments();
   renderDraftList();
 }
 
-function newDraft(prefill = {}) {
+async function canReplaceDraft() {
+  if (state.draftBusy) {
+    toast("请等待当前草稿操作完成。");
+    return false;
+  }
+  if (!state.draftDirty) return true;
+  return confirmAction("放弃未保存的修改？", "当前正文和附件选择尚未保存，切换草稿将丢弃这些修改。", "放弃修改", { destructive: true });
+}
+
+async function newDraft(prefill = {}, skipPrompt = false) {
+  if (!skipPrompt && !(await canReplaceDraft())) return;
+  state.draftSession += 1;
   state.draft = null;
-  state.draftDirty = true;
+  state.draftDirty = Boolean(prefill.subject || prefill.body || prefill.to);
+  state.draftAttachments = [];
+  elements.attachmentProgress.textContent = "";
   elements.draftAccount.disabled = false;
   for (const input of [elements.draftTo, elements.draftCc, elements.draftBcc, elements.draftSubject, elements.draftBody]) {
     input.disabled = false;
@@ -810,20 +928,96 @@ function newDraft(prefill = {}) {
   elements.sendDraft.disabled = true;
   elements.approveDraft.disabled = true;
   state.replyPrefill = prefill.reply_uid ? { reply_uid: prefill.reply_uid, reply_folder: prefill.reply_folder } : null;
+  renderDraftAttachments();
+  renderDraftStatus();
   renderDraftList();
 }
 
 function renderDraftStatus() {
   const status = state.draft?.status || "editing";
   const immutable = ["sending", "sent", "cancelled"].includes(status);
-  elements.draftStatus.textContent = state.draftDirty ? "有未保存修改" : draftStatusLabel(status);
+  elements.draftStatus.textContent = state.draftDirty ? "有未保存修改" : state.draft ? draftStatusLabel(status) : "未保存";
   elements.draftStatus.className = `status-chip ${state.draftDirty ? "neutral" : status}`;
-  $("#approve-draft-button").disabled = !state.draft || state.draftDirty || immutable;
-  elements.sendDraft.disabled = !state.draft || state.draftDirty || status !== "approved";
-  elements.deleteDraft.disabled = !state.draft || status === "sending";
-  elements.saveDraft.disabled = immutable;
+  $("#approve-draft-button").disabled = state.draftBusy || !state.draft || state.draftDirty || immutable;
+  elements.sendDraft.disabled = state.draftBusy || !state.draft || state.draftDirty || status !== "approved";
+  elements.deleteDraft.disabled = state.draftBusy || !state.draft || status === "sending";
+  elements.saveDraft.disabled = state.draftBusy || immutable;
+  elements.addAttachment.disabled = state.draftBusy || immutable || !elements.draftAccount.value;
+  elements.attachmentInput.disabled = state.draftBusy || immutable;
+  elements.draftAccount.disabled = state.draftBusy || Boolean(state.draft) || state.draftAttachments.length > 0;
+  $("#new-draft-button").disabled = state.draftBusy;
+  elements.draftAttachments.querySelectorAll("[data-remove-attachment]").forEach((button) => { button.disabled = state.draftBusy || immutable; });
   for (const input of [elements.draftTo, elements.draftCc, elements.draftBcc, elements.draftSubject, elements.draftBody]) {
-    input.disabled = immutable;
+    input.disabled = state.draftBusy || immutable;
+  }
+}
+
+function renderDraftAttachments() {
+  elements.draftAttachments.replaceChildren();
+  const total = state.draftAttachments.reduce((sum, item) => sum + (item.size_bytes || 0), 0);
+  $("#draft-attachment-total").textContent = state.draftAttachments.length
+    ? `${state.draftAttachments.length} 个附件 · ${formatBytes(total)}` : "未添加附件";
+  for (const item of state.draftAttachments) {
+    const row = attachmentRow(item);
+    const actions = document.createElement("div");
+    actions.className = "attachment-actions";
+    const download = document.createElement("button");
+    download.className = "button secondary compact";
+    download.textContent = "下载";
+    download.disabled = Boolean(item.missing);
+    download.setAttribute("aria-label", `下载 ${item.filename}`);
+    download.onclick = () => downloadAttachment("attachments/download", { account_id: elements.draftAccount.value, attachment_id: item.attachment_id }, item.filename, download);
+    const remove = document.createElement("button");
+    remove.className = "button danger ghost compact";
+    remove.textContent = "移除";
+    remove.dataset.removeAttachment = item.attachment_id;
+    remove.setAttribute("aria-label", `移除 ${item.filename}`);
+    remove.onclick = () => {
+      if (state.draftBusy || ["sending", "sent", "cancelled"].includes(state.draft?.status)) return;
+      state.draftAttachments = state.draftAttachments.filter((value) => value.attachment_id !== item.attachment_id);
+      state.draftDirty = true;
+      renderDraftAttachments();
+      renderDraftStatus();
+    };
+    actions.append(download, remove);
+    row.append(actions);
+    elements.draftAttachments.append(row);
+  }
+  renderDraftStatus();
+}
+
+async function uploadDraftAttachments() {
+  const files = [...elements.attachmentInput.files];
+  elements.attachmentInput.value = "";
+  if (!files.length || state.draftBusy || ["sending", "sent", "cancelled"].includes(state.draft?.status)) return;
+  if ((!state.draft || state.draftDirty) && !(await saveDraft())) return;
+  const accountId = elements.draftAccount.value;
+  const session = state.draftSession;
+  state.draftBusy = true;
+  renderDraftStatus();
+  let completed = 0;
+  try {
+    if (!state.bridge.upload) throw new Error("请升级 AstrBot 以使用附件上传。");
+    for (const file of files) {
+      elements.attachmentProgress.textContent = `正在上传 ${completed + 1}/${files.length}：${file.name}`;
+      const draft = unwrap(await state.bridge.upload(`attachments/upload/${accountId}/${state.draft.draft_id}/${state.draft.revision}`, file));
+      if (session !== state.draftSession) return;
+      state.draft = draft;
+      state.draftAttachments = [...(draft.attachments || [])];
+      state.draftDirty = false;
+      completed += 1;
+      renderDraftAttachments();
+    }
+    elements.attachmentProgress.textContent = `已保存 ${completed} 个附件，请审核后发送。`;
+  } catch (error) {
+    if (session === state.draftSession) {
+      elements.attachmentProgress.textContent = `${error.message}${completed ? ` 已保留 ${completed} 个上传成功的附件。` : ""}`;
+      toast(error.message, true);
+    }
+  } finally {
+    await loadDrafts();
+    state.draftBusy = false;
+    renderDraftStatus();
   }
 }
 
@@ -835,10 +1029,14 @@ function draftFormPayload() {
     bcc_addrs: elements.draftBcc.value,
     subject: elements.draftSubject.value,
     body_text: elements.draftBody.value,
+    attachment_ids: state.draftAttachments.map((item) => item.attachment_id),
   };
 }
 
 async function saveDraft() {
+  if (state.draftBusy) return null;
+  state.draftBusy = true;
+  renderDraftStatus();
   const button = elements.saveDraft;
   setBusy(button, true, "保存中…");
   try {
@@ -860,13 +1058,16 @@ async function saveDraft() {
     toast(error.message, true);
     return null;
   } finally {
+    state.draftBusy = false;
     setBusy(button, false);
     renderDraftStatus();
   }
 }
 
 async function approveDraft() {
-  if (!state.draft || state.draftDirty) return;
+  if (state.draftBusy || !state.draft || state.draftDirty) return;
+  state.draftBusy = true;
+  renderDraftStatus();
   const button = elements.approveDraft;
   setBusy(button, true, "审核中…");
   try {
@@ -878,16 +1079,26 @@ async function approveDraft() {
   } catch (error) {
     toast(error.message, true);
   } finally {
+    state.draftBusy = false;
     setBusy(button, false);
     renderDraftStatus();
   }
 }
 
 async function sendDraft() {
-  if (!state.draft || state.draft.status !== "approved" || state.draftDirty) return;
+  if (state.draftBusy || !state.draft || state.draft.status !== "approved" || state.draftDirty) return;
+  state.draftBusy = true;
+  renderDraftStatus();
   const recipient = (state.draft.to_addrs || []).join(", ");
-  const confirmed = await confirmAction("发送这封邮件？", `将使用 ${state.draft.account_id} 向 ${recipient} 发送“${state.draft.subject}”。发送后无法撤回。`, "确认发送", { destructive: true });
-  if (!confirmed) return;
+  const attachments = state.draftAttachments;
+  const attachmentSummary = attachments.length ? `\n附件 ${attachments.length} 个，共 ${formatBytes(attachments.reduce((sum, item) => sum + (item.size_bytes || 0), 0))}：\n${attachments.map((item) => `${item.filename}（${formatBytes(item.size_bytes)}）`).join("\n")}` : "\n不含附件。";
+  const confirmed = await confirmAction("发送这封邮件？", `将使用 ${state.draft.account_id} 向 ${recipient} 发送“${state.draft.subject}”。${attachmentSummary}\n发送后无法撤回。`, "确认发送", { destructive: true });
+  if (!confirmed) {
+    state.draftBusy = false;
+    renderDraftStatus();
+    elements.sendDraft.focus();
+    return;
+  }
   setBusy(elements.sendDraft, true, "发送中…");
   try {
     const sent = await apiPost("drafts/send", { draft_id: state.draft.draft_id, revision: state.draft.revision });
@@ -900,25 +1111,39 @@ async function sendDraft() {
     await loadDrafts();
     if (state.draft) {
       const latest = state.drafts.find((item) => item.draft_id === state.draft.draft_id);
-      if (latest) await openDraft(latest.draft_id);
+      if (latest) {
+        try { selectDraft(await apiGet("draft", { draft_id: latest.draft_id })); }
+        catch (refreshError) { toast(`发送状态刷新失败：${refreshError.message}`, true); }
+      }
     }
   } finally {
+    state.draftBusy = false;
     setBusy(elements.sendDraft, false);
     renderDraftStatus();
   }
 }
 
 async function deleteDraft() {
-  if (!state.draft) return;
+  if (state.draftBusy || !state.draft) return;
+  state.draftBusy = true;
+  renderDraftStatus();
   const confirmed = await confirmAction("删除草稿？", "只删除邮件助手本地草稿，不会删除云端邮件。", "删除", { destructive: true });
-  if (!confirmed) return;
+  if (!confirmed) {
+    state.draftBusy = false;
+    renderDraftStatus();
+    elements.deleteDraft.focus();
+    return;
+  }
   try {
     await apiPost("drafts/delete", { draft_id: state.draft.draft_id, revision: state.draft.revision });
-    newDraft();
+    await newDraft({}, true);
     await loadDrafts();
     toast("草稿已删除");
   } catch (error) {
     toast(error.message, true);
+  } finally {
+    state.draftBusy = false;
+    renderDraftStatus();
   }
 }
 
@@ -1004,6 +1229,14 @@ function bindEvents() {
   $("#approve-draft-button").addEventListener("click", approveDraft);
   elements.sendDraft.addEventListener("click", sendDraft);
   elements.deleteDraft.addEventListener("click", deleteDraft);
+  elements.addAttachment.addEventListener("click", () => elements.attachmentInput.click());
+  elements.attachmentInput.addEventListener("change", uploadDraftAttachments);
+  window.addEventListener("beforeunload", (event) => {
+    if (state.draftDirty || state.draftBusy) {
+      event.preventDefault();
+      event.returnValue = "";
+    }
+  });
   [elements.draftAccount, elements.draftTo, elements.draftCc, elements.draftBcc, elements.draftSubject, elements.draftBody].forEach((input) => {
     input.addEventListener("input", () => { state.draftDirty = true; elements.draftHeading.textContent = elements.draftSubject.value || "新草稿"; renderDraftStatus(); });
   });
