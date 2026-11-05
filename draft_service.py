@@ -5,6 +5,8 @@ import hashlib
 import re
 import secrets
 import time
+from contextlib import asynccontextmanager
+from collections.abc import Iterable
 from typing import Any, Callable
 
 from .config_utils import config_get
@@ -64,12 +66,62 @@ class EmailDraftService:
             raise RuntimeError("本地邮件索引未启用，无法使用安全草稿工作流。")
         return index
 
+    @asynccontextmanager
+    async def _lease_attachments(
+        self,
+        attachment_ids: Iterable[str],
+        account_id: str,
+        *,
+        owner_umo: str | None = None,
+        owner_sender_id: str | None = None,
+    ):
+        ids = tuple(attachment_ids)
+        if not ids:
+            yield ()
+            return
+        manager = self.plugin._attachment_store().lease(ids, account_id)
+        acquisition = asyncio.create_task(asyncio.to_thread(manager.__enter__))
+        cancelled = False
+        while True:
+            try:
+                records = await asyncio.shield(acquisition)
+                break
+            except asyncio.CancelledError:
+                if acquisition.cancelled():
+                    raise
+                cancelled = True
+        try:
+            if cancelled:
+                raise asyncio.CancelledError
+            for record in records:
+                if owner_umo is not None and (
+                    (record.owner_umo and record.owner_umo != owner_umo)
+                    or (record.owner_sender_id and record.owner_sender_id != owner_sender_id)
+                ):
+                    raise PermissionError("不能使用其他用户上传的附件。")
+            yield records
+        finally:
+            await asyncio.shield(asyncio.to_thread(manager.__exit__, None, None, None))
+
     def _confirmation_ttl_minutes(self) -> int:
         try:
             value = int(config_get(self.plugin.config, "llm_send_confirmation_ttl_minutes", 10))
         except (TypeError, ValueError):
             value = 10
         return max(1, min(60, value))
+
+    @staticmethod
+    async def _index_operation(function, *args, **kwargs):
+        """Wait for a SQLite worker to finish before reacting to cancellation."""
+        task = asyncio.create_task(asyncio.to_thread(function, *args, **kwargs))
+        cancelled = False
+        while True:
+            try:
+                return await asyncio.shield(task), cancelled
+            except asyncio.CancelledError:
+                if task.cancelled():
+                    raise
+                cancelled = True
 
     @staticmethod
     def _new_confirmation_code() -> str:
@@ -81,7 +133,7 @@ class EmailDraftService:
     ) -> tuple[str, float]:
         code = self._new_confirmation_code()
         expires_at = time.time() + self._confirmation_ttl_minutes() * 60
-        await asyncio.to_thread(
+        _, cancelled = await self._index_operation(
             self._index().create_draft_confirmation,
             draft.draft_id,
             draft.revision,
@@ -90,7 +142,40 @@ class EmailDraftService:
             owner_sender_id,
             expires_at,
         )
+        if cancelled:
+            raise asyncio.CancelledError
         return code, expires_at
+
+    async def _create_confirmed_draft(
+        self, account_id: str, owner_umo: str, owner_sender_id: str, **fields,
+    ) -> tuple[MailDraft, str, float]:
+        draft = None
+        try:
+            draft, cancelled = await self._index_operation(
+                self._index().create_draft,
+                account_id,
+                source="bot",
+                owner_umo=owner_umo,
+                owner_sender_id=owner_sender_id,
+                status="pending_review",
+                **fields,
+            )
+            if cancelled:
+                raise asyncio.CancelledError
+            code, expires_at = await self._issue_confirmation(
+                draft, owner_umo, owner_sender_id
+            )
+        except BaseException:
+            if draft is not None:
+                try:
+                    await self._index_operation(
+                        self._index().delete_draft, draft.draft_id, draft.revision
+                    )
+                except Exception:
+                    # A separately edited draft must keep its current content.
+                    pass
+            raise
+        return draft, code, expires_at
 
     async def create_bot_draft(
         self,
@@ -101,29 +186,21 @@ class EmailDraftService:
         body: str,
         owner_umo: str,
         owner_sender_id: str,
+        attachment_ids: Iterable[str] = (),
     ) -> tuple[MailDraft, str, float]:
-        build_draft_message(account, (recipient,), (), (), subject, body)
-        draft = await asyncio.to_thread(
-            self._index().create_draft,
-            self.plugin._account_key(account),
-            to_addrs=(recipient,),
-            subject=str(subject),
-            body_text=str(body),
-            source="bot",
-            owner_umo=owner_umo,
-            owner_sender_id=owner_sender_id,
-            status="pending_review",
-        )
-        try:
-            code, expires_at = await self._issue_confirmation(
-                draft, owner_umo, owner_sender_id
+        ids = tuple(attachment_ids)
+        account_id = self.plugin._account_key(account)
+        async with self._lease_attachments(ids, account_id, owner_umo=owner_umo, owner_sender_id=owner_sender_id):
+            build_draft_message(account, (recipient,), (), (), subject, body)
+            return await self._create_confirmed_draft(
+                account_id,
+                owner_umo,
+                owner_sender_id,
+                to_addrs=(recipient,),
+                subject=str(subject),
+                body_text=str(body),
+                attachment_ids=ids,
             )
-        except Exception:
-            await asyncio.to_thread(
-                self._index().delete_draft, draft.draft_id, draft.revision
-            )
-            raise
-        return draft, code, expires_at
 
     async def create_bot_reply_draft(
         self,
@@ -134,6 +211,7 @@ class EmailDraftService:
         body: str,
         owner_umo: str,
         owner_sender_id: str,
+        attachment_ids: Iterable[str] = (),
     ) -> tuple[MailDraft, str, float]:
         original = await self.plugin._fetch_remote_detail(account, uid, folder or None)
         recipient = original.reply_to or original.from_addr
@@ -142,33 +220,24 @@ class EmailDraftService:
         subject = original.subject.strip() or "(无主题)"
         if not subject.lower().startswith("re:"):
             subject = f"Re: {subject}"
-        build_draft_message(
-            account, (recipient,), (), (), subject, body, original=original
-        )
-        draft = await asyncio.to_thread(
-            self._index().create_draft,
-            self.plugin._account_key(account),
-            to_addrs=(recipient,),
-            subject=subject,
-            body_text=str(body),
-            reply_folder=folder or self.plugin._folder(account),
-            reply_uid=int(uid),
-            reply_message_id=original.message_id,
-            source="bot",
-            owner_umo=owner_umo,
-            owner_sender_id=owner_sender_id,
-            status="pending_review",
-        )
-        try:
-            code, expires_at = await self._issue_confirmation(
-                draft, owner_umo, owner_sender_id
+        ids = tuple(attachment_ids)
+        account_id = self.plugin._account_key(account)
+        async with self._lease_attachments(ids, account_id, owner_umo=owner_umo, owner_sender_id=owner_sender_id):
+            build_draft_message(
+                account, (recipient,), (), (), subject, body, original=original
             )
-        except Exception:
-            await asyncio.to_thread(
-                self._index().delete_draft, draft.draft_id, draft.revision
+            return await self._create_confirmed_draft(
+                account_id,
+                owner_umo,
+                owner_sender_id,
+                to_addrs=(recipient,),
+                subject=subject,
+                body_text=str(body),
+                reply_folder=folder or self.plugin._folder(account),
+                reply_uid=int(uid),
+                reply_message_id=original.message_id,
+                attachment_ids=ids,
             )
-            raise
-        return draft, code, expires_at
 
     async def _load_original(
         self, draft: MailDraft, account: dict[str, Any]
@@ -187,6 +256,7 @@ class EmailDraftService:
         account: dict[str, Any],
         original: Any,
         operation: str,
+        attachments: Iterable[Any] = (),
     ) -> MailDraft:
         self.plugin._log_mail_operation(
             operation,
@@ -194,8 +264,9 @@ class EmailDraftService:
             uid=claimed.reply_uid,
             detail=f"draft={claimed.draft_id[:12]}",
         )
+        started = time.monotonic()
         try:
-            await asyncio.to_thread(
+            delivery_task = asyncio.create_task(asyncio.to_thread(
                 send_draft_message,
                 account,
                 claimed.to_addrs,
@@ -205,10 +276,21 @@ class EmailDraftService:
                 claimed.body_text,
                 self.plugin._timeout(),
                 original=original,
-            )
+                attachments=attachments,
+            ))
+            cancelled = False
+            while True:
+                try:
+                    await asyncio.shield(delivery_task)
+                    break
+                except asyncio.CancelledError:
+                    # A worker thread can still be reading the leased files.
+                    if delivery_task.cancelled():
+                        raise
+                    cancelled = True
         except Exception as exc:
             try:
-                await asyncio.to_thread(
+                await self._index_operation(
                     self._index().finish_draft_send,
                     claimed.draft_id,
                     claimed.revision,
@@ -220,8 +302,14 @@ class EmailDraftService:
             raise DraftDeliveryError(
                 "SMTP 发送尝试失败，投递结果可能不确定；系统不会自动重试，请先检查已发送文件夹。"
             ) from exc
+        finally:
+            status = getattr(self.plugin, "_status", None)
+            if isinstance(status, dict):
+                status.setdefault(claimed.account_id, {})["last_smtp_duration_ms"] = round(
+                    (time.monotonic() - started) * 1000
+                )
         try:
-            sent = await asyncio.to_thread(
+            sent, finish_cancelled = await self._index_operation(
                 self._index().finish_draft_send,
                 claimed.draft_id,
                 claimed.revision,
@@ -238,7 +326,18 @@ class EmailDraftService:
             uid=claimed.reply_uid,
             detail=f"draft={claimed.draft_id[:12]}",
         )
+        if cancelled or finish_cancelled:
+            raise asyncio.CancelledError
         return sent
+
+    async def _abort_before_smtp(self, claimed: MailDraft) -> None:
+        await self._index_operation(
+            self._index().finish_draft_send,
+            claimed.draft_id,
+            claimed.revision,
+            success=False,
+            error="发送请求已取消，尚未尝试 SMTP。",
+        )
 
     async def send_approved_draft(
         self,
@@ -258,23 +357,27 @@ class EmailDraftService:
                 raise PermissionError("草稿必须先审核通过才能发送。")
             account = resolve_account(draft.account_id)
             original = await self._load_original(draft, account)
-            build_draft_message(
-                account,
-                draft.to_addrs,
-                draft.cc_addrs,
-                draft.bcc_addrs,
-                draft.subject,
-                draft.body_text,
-                original=original,
-            )
-            claimed = await asyncio.to_thread(
-                self._index().claim_approved_draft_send,
-                draft_id,
-                expected_revision,
-            )
-            return await self._deliver_claimed(
-                claimed, account, original, operation
-            )
+            async with self._lease_attachments(draft.attachment_ids, draft.account_id) as attachments:
+                build_draft_message(
+                    account,
+                    draft.to_addrs,
+                    draft.cc_addrs,
+                    draft.bcc_addrs,
+                    draft.subject,
+                    draft.body_text,
+                    original=original,
+                )
+                claimed, cancelled = await self._index_operation(
+                    self._index().claim_approved_draft_send,
+                    draft_id,
+                    expected_revision,
+                )
+                if cancelled:
+                    await self._abort_before_smtp(claimed)
+                    raise asyncio.CancelledError
+                return await self._deliver_claimed(
+                    claimed, account, original, operation, attachments
+                )
 
     async def send_confirmed_draft(
         self,
@@ -295,25 +398,32 @@ class EmailDraftService:
                 raise PermissionError("不能发送其他用户的草稿。")
             account = resolve_account(draft.account_id)
             original = await self._load_original(draft, account)
-            build_draft_message(
-                account,
-                draft.to_addrs,
-                draft.cc_addrs,
-                draft.bcc_addrs,
-                draft.subject,
-                draft.body_text,
-                original=original,
-            )
-            claimed = await asyncio.to_thread(
-                self._index().claim_confirmed_draft_send,
-                draft_id,
-                confirmation_token_hash(confirmation_code),
-                owner_umo,
-                owner_sender_id,
-            )
-            return await self._deliver_claimed(
-                claimed, account, original, "llm_confirmed_send"
-            )
+            async with self._lease_attachments(
+                draft.attachment_ids, draft.account_id,
+                owner_umo=owner_umo, owner_sender_id=owner_sender_id,
+            ) as attachments:
+                build_draft_message(
+                    account,
+                    draft.to_addrs,
+                    draft.cc_addrs,
+                    draft.bcc_addrs,
+                    draft.subject,
+                    draft.body_text,
+                    original=original,
+                )
+                claimed, cancelled = await self._index_operation(
+                    self._index().claim_confirmed_draft_send,
+                    draft_id,
+                    confirmation_token_hash(confirmation_code),
+                    owner_umo,
+                    owner_sender_id,
+                )
+                if cancelled:
+                    await self._abort_before_smtp(claimed)
+                    raise asyncio.CancelledError
+                return await self._deliver_claimed(
+                    claimed, account, original, "llm_confirmed_send", attachments
+                )
 
     async def cancel_owned_draft(
         self, draft_id: str, owner_umo: str, owner_sender_id: str

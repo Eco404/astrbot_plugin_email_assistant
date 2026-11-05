@@ -2,6 +2,7 @@ import asyncio
 import json
 import sys
 import tempfile
+import threading
 import types
 import unittest
 from datetime import datetime
@@ -40,6 +41,21 @@ def _install_astrbot_stubs():
     class Plain:
         def __init__(self, text):
             self.text = text
+
+    class File:
+        def __init__(self, name, file=""):
+            self.name = name
+            self.file_ = file
+
+        async def get_file(self):
+            return self.file_
+
+    class Image:
+        def __init__(self, file):
+            self.file = file
+
+        async def convert_to_file_path(self):
+            return self.file
 
     class MessageChain(list):
         pass
@@ -97,6 +113,8 @@ def _install_astrbot_stubs():
     star_mod.StarTools = StarTools
     star_mod.register = register
     components.Plain = Plain
+    components.File = File
+    components.Image = Image
 
     sys.modules.update(
         {
@@ -327,6 +345,215 @@ class MainRuntimeTests(unittest.IsolatedAsyncioTestCase):
         index.initialize()
         self.plugin._mail_index = index
         return index
+
+    async def test_history_placeholder_default_custom_and_exact_empty_sentinel(self):
+        self.context.conversation_manager = FakeConversationManager()
+        values = ["", "  ", " 自定义通知\n占位 ", "{none}", " \n{none} ", "前缀{none}"]
+        for value in values:
+            with self.subTest(value=value):
+                self.plugin.config["notification_settings"]["official_history_placeholder"] = value
+                await self.plugin._archive_narration("p:FriendMessage:1", "正文")
+                pair = self.context.conversation_manager.pairs[-1]
+                content = pair["user_message"]["content"]
+                if not value.strip():
+                    self.assertIn("邮件主动承接占位", content)
+                else:
+                    self.assertEqual(content, "" if value.strip() == "{none}" else value)
+                self.assertEqual(json.loads(json.dumps(pair))["user_message"]["content"], content)
+
+    async def test_archive_failure_does_not_retry_delivered_notification(self):
+        self.plugin.config["notification_settings"].update(
+            notification_mode="llm", llm_write_official_history=True,
+        )
+        self.context.provider = FakeProvider()
+        await self.plugin.put_kv_data(self.plugin._cursor_key(self.account), 1)
+        with patch("astrbot_plugin_email_assistant.main.fetch_after_uid", return_value=[FetchItem(2, parsed())]), patch.object(
+            self.plugin, "_archive_narration", side_effect=RuntimeError("database unavailable"),
+        ):
+            await self.plugin._check_account(self.account)
+        self.assertEqual(await self.plugin.get_kv_data(self.plugin._cursor_key(self.account)), 2)
+        self.assertEqual(len(self.context.sent), 1)
+        self.assertEqual(self.plugin._status["one"]["notification_delivered"], 1)
+
+    async def test_poll_backoff_is_per_account_and_recovers(self):
+        other = dict(self.account, account_id="two")
+        async def check(account):
+            if account["account_id"] == "one":
+                raise OSError("offline")
+
+        with patch.object(self.plugin, "_check_account", side_effect=check) as checked, patch.object(
+            self.plugin, "_sync_secondary_folder_step", new_callable=AsyncMock,
+        ), patch("astrbot_plugin_email_assistant.main.time.time", return_value=1000), patch(
+            "astrbot_plugin_email_assistant.main.random.uniform", return_value=1.0,
+        ):
+            await self.plugin._poll_account(self.account)
+            await self.plugin._poll_account(self.account)
+            await self.plugin._poll_account(other)
+        self.assertEqual(checked.await_count, 2)
+        status = self.plugin._status["one"]
+        self.assertEqual(status["consecutive_failures"], 1)
+        self.assertEqual(status["next_retry_at"], 1060)
+        self.assertTrue(self.plugin._status["two"]["ok"])
+        with patch.object(self.plugin, "_check_account", side_effect=OSError("offline")), patch(
+            "astrbot_plugin_email_assistant.main.time.time", return_value=1061,
+        ), patch("astrbot_plugin_email_assistant.main.random.uniform", return_value=1.0):
+            await self.plugin._poll_account(self.account)
+        self.assertEqual(status["consecutive_failures"], 2)
+        self.assertEqual(status["next_retry_at"], 1181)
+        with patch.object(self.plugin, "_check_account", new_callable=AsyncMock), patch.object(
+            self.plugin, "_sync_secondary_folder_step", new_callable=AsyncMock,
+        ), patch("astrbot_plugin_email_assistant.main.time.time", return_value=1182):
+            await self.plugin._poll_account(self.account)
+        self.assertTrue(status["ok"])
+        self.assertEqual(status["consecutive_failures"], 0)
+        self.assertEqual(status["next_retry_at"], 0)
+
+    async def test_index_failure_is_not_hidden_by_successful_notification(self):
+        await self.plugin.put_kv_data(self.plugin._cursor_key(self.account), 1)
+        with patch.object(self.plugin, "_sync_index_locked", side_effect=OSError("index offline")), patch(
+            "astrbot_plugin_email_assistant.main.fetch_after_uid", return_value=[FetchItem(2, parsed())],
+        ):
+            await self.plugin._poll_account(self.account)
+        self.assertEqual(len(self.context.sent), 1)
+        self.assertEqual(await self.plugin.get_kv_data(self.plugin._cursor_key(self.account)), 2)
+        self.assertFalse(self.plugin._status["one"]["ok"])
+        self.assertEqual(self.plugin._status["one"]["consecutive_failures"], 1)
+        self.assertNotIn("last_success_at", self.plugin._status["one"])
+
+    async def test_secondary_folder_failure_enters_backoff(self):
+        with patch.object(self.plugin, "_check_account", new_callable=AsyncMock), patch.object(
+            self.plugin, "_sync_secondary_folder_step", side_effect=OSError("folder offline"),
+        ):
+            await self.plugin._poll_account(self.account)
+        self.assertFalse(self.plugin._status["one"]["ok"])
+        self.assertEqual(self.plugin._status["one"]["consecutive_failures"], 1)
+
+    async def test_message_file_and_image_references_are_imported_and_scoped(self):
+        from astrbot.core.message.components import File, Image
+
+        index = self._enable_test_index()
+        path = index.path.parent / "attachment.txt"
+        path.write_bytes(b"file content")
+        event = FakeEvent("1", "p:FriendMessage:1", platform_name="p")
+        event.get_messages = lambda: [File("file.txt", str(path)), Image(str(path))]
+        store = self.plugin._attachment_store()
+        async with self.plugin._resolve_draft_attachments(event, self.account, ["message:1", "message:2", "message:1"]) as ids:
+            self.assertEqual(len(ids), 2)
+            self.assertEqual(store.get(ids[0], "one").path.read_bytes(), b"file content")
+            self.assertEqual(store.stats()["protected_bytes"], 24)
+        async with self.plugin._resolve_draft_attachments(event, self.account, [ids[0]]) as reused:
+            self.assertEqual(reused, (ids[0],))
+        stranger = FakeEvent("2", "p:FriendMessage:2", platform_name="p")
+        with self.assertRaises(PermissionError):
+            async with self.plugin._resolve_draft_attachments(stranger, self.account, [ids[0]]):
+                self.fail("foreign attachment accepted")
+        for invalid in [str(path), "https://example.com/file", "message:0", "message:3"]:
+            with self.subTest(reference=invalid), self.assertRaises((ValueError, KeyError)):
+                async with self.plugin._resolve_draft_attachments(event, self.account, [invalid]):
+                    self.fail("invalid attachment reference accepted")
+
+    async def test_batch_attachment_import_cannot_evict_an_earlier_batch_member(self):
+        from astrbot.core.message.components import File
+        from astrbot_plugin_email_assistant.attachment_store import AttachmentQuotaError
+
+        index = self._enable_test_index()
+        first = index.path.parent / "first.txt"
+        second = index.path.parent / "second.txt"
+        first.write_bytes(b"first!")
+        second.write_bytes(b"second")
+        store = self.plugin._attachment_store()
+        store.max_total_bytes = 10
+        event = FakeEvent("1", "p:FriendMessage:1", platform_name="p")
+        event.get_messages = lambda: [File("first.txt", str(first)), File("second.txt", str(second))]
+        with self.assertRaises(AttachmentQuotaError):
+            async with self.plugin._resolve_draft_attachments(event, self.account, ["message:1", "message:2"]):
+                self.fail("batch larger than total quota accepted")
+        self.assertEqual(store.stats()["protected_bytes"], 0)
+        self.assertEqual(store.stats()["total_bytes"], 6)
+        self.assertEqual(next(store.root.iterdir()).read_bytes(), b"first!")
+        self.assertEqual(index.list_drafts(), [])
+
+    async def test_attachment_import_cancellation_waits_for_worker_and_releases_leases(self):
+        from astrbot.core.message.components import File
+
+        self._to_thread_patcher.stop()
+        index = self._enable_test_index()
+        path = index.path.parent / "cancelled.txt"
+        path.write_bytes(b"payload")
+        store = self.plugin._attachment_store()
+        event = FakeEvent("1", "p:FriendMessage:1", platform_name="p")
+        event.get_messages = lambda: [File("cancelled.txt", str(path))]
+        entered = threading.Event()
+        release = threading.Event()
+        original_import = store.import_file
+
+        def blocked_import(*args, **kwargs):
+            record = original_import(*args, **kwargs)
+            entered.set()
+            if not release.wait(5):
+                raise TimeoutError("test worker was not released")
+            return record
+
+        async def resolve():
+            async with self.plugin._resolve_draft_attachments(event, self.account, ["message:1"]):
+                self.fail("cancelled resolver yielded attachments")
+
+        with patch.object(store, "import_file", side_effect=blocked_import):
+            task = asyncio.create_task(resolve())
+            self.assertTrue(await asyncio.to_thread(entered.wait, 5))
+            task.cancel()
+            release.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await asyncio.wait_for(task, 5)
+        self.assertEqual(store.stats()["protected_bytes"], 0)
+        self.assertEqual(store.stats()["total_bytes"], 7)
+        self.assertEqual(index.list_drafts(), [])
+
+    async def test_terminal_draft_payload_survives_reclaimed_attachments(self):
+        index = self._enable_test_index()
+        path = index.path.parent / "terminal.txt"
+        path.write_bytes(b"payload")
+        store = self.plugin._attachment_store()
+        record = store.import_file("one", path, filename="terminal.txt")
+        draft = index.create_draft("one", attachment_ids=[record.attachment_id])
+        cancelled = index.update_draft(draft.draft_id, draft.revision, status="cancelled")
+        with index._connection() as connection:
+            connection.execute("UPDATE mail_attachments SET last_accessed_at = 1")
+        store.prune()
+        payload = self.plugin._draft_tool_payload(cancelled)
+        self.assertEqual(payload["status"], "cancelled")
+        self.assertEqual(payload["attachments"], [{"attachment_id": record.attachment_id, "available": False}])
+        self.assertEqual(payload["attachment_total_bytes"], 0)
+
+    async def test_attachment_tool_routes_and_rejects_unauthorized_access(self):
+        event = FakeEvent("1", "p:FriendMessage:1", platform_name="p")
+        items = [{"part_id": "2", "filename": "文档.pdf", "size_bytes": 128}]
+        with patch.object(self.plugin, "_list_mail_attachments", return_value=items) as listing:
+            result = json.loads(await self.plugin.tool_query_mailbox(event, "attachments", uid=3, folder="Archive"))
+            self.assertTrue(result["success"])
+            self.assertEqual(result["attachments"], items)
+            listing.assert_awaited_once_with(self.account, 3, "Archive")
+            for args in [dict(uid=0), dict(uid=3, since_date="2026-01-01"), dict(uid=3, attachment_id="2")]:
+                self.assertFalse(json.loads(await self.plugin.tool_query_mailbox(event, "attachments", **args))["success"])
+            stranger = FakeEvent("2", "p:FriendMessage:2", platform_name="p")
+            self.assertFalse(json.loads(await self.plugin.tool_query_mailbox(stranger, "attachments", uid=3))["success"])
+            self.assertEqual(listing.await_count, 1)
+
+    async def test_download_tool_delivers_managed_file_while_leased(self):
+        index = self._enable_test_index()
+        path = index.path.parent / "source.bin"
+        path.write_bytes(b"download")
+        store = self.plugin._attachment_store()
+        record = store.import_file("one", path, filename="download.bin")
+        event = FakeEvent("1", "p:FriendMessage:1", platform_name="p")
+        event.send = AsyncMock(return_value=True)
+        with patch.object(self.plugin, "_download_mail_attachment", return_value=record) as download:
+            result = json.loads(await self.plugin.tool_query_mailbox(event, "download_attachment", uid=3, attachment_id="2"))
+        self.assertTrue(result["success"])
+        self.assertTrue(result["delivered"])
+        self.assertEqual(result["attachment"]["attachment_id"], record.attachment_id)
+        download.assert_awaited_once_with(self.account, 3, "2", "INBOX")
+        event.send.assert_awaited_once()
 
     async def test_first_check_only_establishes_baseline(self):
         with patch("astrbot_plugin_email_assistant.main.get_max_uid", return_value=8):

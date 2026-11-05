@@ -1,14 +1,22 @@
 from __future__ import annotations
 
 import base64
+import binascii
+import hashlib
 import imaplib
+import quopri
 import re
 import ssl
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
+from email import policy
+from email.message import Message
+from email.parser import BytesParser
+from pathlib import Path
 from typing import Any
 
-from .mail_parser import ParsedMail, parse_mail
+from .mail_parser import ParsedMail, extract_text_body, parse_mail, safe_attachment_filename
 from .proxy_utils import ProxyConfig, create_connection, proxy_config_from_account
 
 
@@ -61,6 +69,178 @@ class MailboxChangedError(RuntimeError):
         super().__init__(
             "IMAP 文件夹 UIDVALIDITY 已变化，原 UID 已失效。"
         )
+
+
+_ATTACHMENT_CHUNK_BYTES = 64 * 1024
+_SECTION_PATTERN = re.compile(r"[1-9]\d*(?:\.[1-9]\d*)*")
+
+
+@contextmanager
+def _literal_budget(connection: Any, limit: int):
+    """Reject oversized server literals before imaplib allocates their payload."""
+    original = getattr(connection, "read", None)
+    if original is None:
+        yield
+        return
+    consumed = 0
+
+    def bounded_read(size: int):
+        nonlocal consumed
+        if size < 0 or consumed + size > limit:
+            raise ValueError("IMAP 返回的数据超过本次请求的容量限制。")
+        consumed += size
+        return original(size)
+
+    connection.read = bounded_read
+    try:
+        yield
+    finally:
+        connection.read = original
+
+
+def _parse_structure_value(raw: bytes, offset: int = 0, depth: int = 0) -> tuple[Any, int]:
+    if depth > 50:
+        raise ValueError("邮件 MIME 结构嵌套过深。")
+    while offset < len(raw) and raw[offset:offset + 1].isspace():
+        offset += 1
+    if offset >= len(raw):
+        raise ValueError("邮件 MIME 结构不完整。")
+    char = raw[offset:offset + 1]
+    if char == b"(":
+        result = []
+        offset += 1
+        while True:
+            while offset < len(raw) and raw[offset:offset + 1].isspace():
+                offset += 1
+            if raw[offset:offset + 1] == b")":
+                return result, offset + 1
+            value, offset = _parse_structure_value(raw, offset, depth + 1)
+            result.append(value)
+            if len(result) > 10000:
+                raise ValueError("邮件 MIME 结构过大。")
+    if char == b'"':
+        result = bytearray()
+        offset += 1
+        while offset < len(raw):
+            char = raw[offset]
+            offset += 1
+            if char == 34:
+                return result.decode("utf-8", errors="replace"), offset
+            if char == 92:
+                if offset >= len(raw):
+                    break
+                char = raw[offset]
+                offset += 1
+            result.append(char)
+        raise ValueError("邮件 MIME 字符串不完整。")
+    if char == b"{":
+        match = re.match(rb"\{(\d+)\}\r?\n", raw[offset:])
+        if not match:
+            raise ValueError("邮件 MIME literal 格式无效。")
+        start = offset + match.end()
+        end = start + int(match.group(1))
+        if end > len(raw):
+            raise ValueError("邮件 MIME literal 不完整。")
+        return raw[start:end].decode("utf-8", errors="replace"), end
+    match = re.match(rb"[^\s()]+", raw[offset:])
+    if not match:
+        raise ValueError("邮件 MIME 结构无效。")
+    token = match.group(0)
+    value = None if token.upper() == b"NIL" else int(token) if token.isdigit() else token.decode("ascii", errors="replace")
+    return value, offset + match.end()
+
+
+def _structure_params(value: Any) -> list[tuple[str, str]]:
+    if not isinstance(value, list):
+        return []
+    return [(str(value[i]).lower(), str(value[i + 1])) for i in range(0, len(value) - 1, 2) if value[i] is not None and value[i + 1] is not None]
+
+
+def _parameter_header(main: str, params: list[tuple[str, str]]) -> str:
+    pieces = [main]
+    for key, value in params:
+        if not re.fullmatch(r"[a-z0-9*_-]+", key) or any(char in value for char in "\r\n\x00"):
+            continue
+        pieces.append(key + '="' + value.replace("\\", "\\\\").replace('"', '\\"') + '"')
+    return "; ".join(pieces)
+
+
+def _structure_parts(structure: Any, prefix: str = "") -> list[dict[str, Any]]:
+    if not isinstance(structure, list) or not structure:
+        raise ValueError("邮件 MIME 结构无效。")
+    if isinstance(structure[0], list):
+        parts = []
+        for number, child in enumerate(structure, 1):
+            if not isinstance(child, list):
+                break
+            parts.extend(_structure_parts(child, f"{prefix}.{number}" if prefix else str(number)))
+        return parts
+    if len(structure) < 7:
+        raise ValueError("邮件 MIME 字段不完整。")
+    main_type, subtype = str(structure[0]).lower(), str(structure[1]).lower()
+    content_type = f"{main_type}/{subtype}"
+    params = _structure_params(structure[2])
+    disposition_index = 9 if main_type == "text" else 11 if content_type == "message/rfc822" else 8
+    disposition = structure[disposition_index] if len(structure) > disposition_index else None
+    message = Message(policy=policy.default)
+    message["Content-Type"] = _parameter_header(content_type, params)
+    if isinstance(disposition, list) and disposition:
+        disposition_name = str(disposition[0]).lower()
+        message["Content-Disposition"] = _parameter_header(disposition_name, _structure_params(disposition[1] if len(disposition) > 1 else None))
+    filename = message.get_filename()
+    is_attachment = bool(filename or message.get_content_disposition() == "attachment" or main_type not in {"text", "multipart"})
+    encoding = str(structure[5] or "7bit").lower()
+    try:
+        size = int(structure[6])
+    except (ValueError, TypeError) as exc:
+        raise ValueError("邮件 MIME 大小无效。") from exc
+    if size < 0:
+        raise ValueError("邮件 MIME 大小无效。")
+    return [{
+        "part_id": prefix or "1",
+        "filename": safe_attachment_filename(filename, content_type),
+        "content_type": content_type,
+        "size_bytes": size,
+        "encoded_size_bytes": size,
+        "size_is_estimate": encoding in {"base64", "quoted-printable"},
+        "transfer_encoding": encoding,
+        "content_type_header": str(message["Content-Type"]),
+        "is_attachment": is_attachment,
+    }]
+
+
+class _TransferDecoder:
+    def __init__(self, encoding: str):
+        if encoding not in {"base64", "quoted-printable", "7bit", "8bit", "binary"}:
+            raise ValueError("不支持此附件的 MIME 传输编码。")
+        self.encoding = encoding
+        self.pending = b""
+        self.ended = False
+
+    def feed(self, data: bytes, *, final: bool = False) -> bytes:
+        if self.encoding == "base64":
+            data = re.sub(rb"[\t\r\n ]", b"", data)
+            if self.ended and data:
+                raise ValueError("附件 Base64 编码在结束标记后仍有内容。")
+            buffered = self.pending + data
+            length = len(buffered) if final else len(buffered) // 4 * 4
+            chunk, self.pending = buffered[:length], buffered[length:]
+            try:
+                decoded = base64.b64decode(chunk, validate=True)
+            except binascii.Error as exc:
+                raise ValueError("附件 Base64 编码不完整或已损坏。") from exc
+            self.ended = self.ended or b"=" in chunk
+            return decoded
+        if self.encoding == "quoted-printable":
+            buffered = self.pending + data
+            cut = len(buffered)
+            if not final:
+                last_equals = buffered.rfind(b"=", max(0, len(buffered) - 2))
+                if last_equals >= 0:
+                    cut = last_equals
+            self.pending = buffered[cut:]
+            return quopri.decodestring(buffered[:cut])
+        return data
 
 
 def _positive_int(value: Any, default: int) -> int:
@@ -342,6 +522,24 @@ class ImapMailbox:
         return "X-GM-EXT-1" in normalized
 
     def fetch_uid(self, uid: int, *, headers_only: bool = False) -> ParsedMail:
+        if not headers_only:
+            parts = self.fetch_structure(uid)
+            mail = self.fetch_uid(uid, headers_only=True)
+            body_message = Message(policy=policy.default)
+            body_message.set_type("multipart/mixed")
+            for part in parts:
+                if part["is_attachment"] or part["content_type"] not in {"text/plain", "text/html"}:
+                    continue
+                decoder = _TransferDecoder(part["transfer_encoding"])
+                raw = bytearray()
+                for chunk in self.iter_section(uid, part["part_id"], part["encoded_size_bytes"]):
+                    raw.extend(decoder.feed(chunk))
+                raw.extend(decoder.feed(b"", final=True))
+                header = ("Content-Type: " + part["content_type_header"] + "\r\n\r\n").encode("utf-8")
+                body_message.attach(BytesParser(policy=policy.default).parsebytes(header + raw))
+            mail.body, _ = extract_text_body(body_message)
+            mail.has_attachments = any(part["is_attachment"] for part in parts)
+            return mail
         payload = (
             "BODY.PEEK[HEADER.FIELDS "
             "(SUBJECT FROM REPLY-TO DATE MESSAGE-ID REFERENCES)]"
@@ -388,6 +586,58 @@ class ImapMailbox:
             if match:
                 mail.gmail_msgid = match.group(1).decode("ascii")
         return mail
+
+    def fetch_structure(self, uid: int) -> list[dict[str, Any]]:
+        if int(uid) <= 0:
+            raise ValueError("邮件 UID 必须是正整数。")
+        with _literal_budget(self.conn, 2 * 1024 * 1024):
+            status, data = self.conn.uid("fetch", str(int(uid)), "(UID BODYSTRUCTURE)")
+        if status != "OK" or not data:
+            raise MailNotFoundError(f"IMAP UID {uid} 不存在或已无法读取。")
+        segments = []
+        for entry in data:
+            if isinstance(entry, tuple) and len(entry) == 2 and all(isinstance(item, bytes) for item in entry):
+                segments.append(entry[0] + b"\r\n" + entry[1])
+            elif isinstance(entry, bytes):
+                segments.append(entry)
+        raw = b" ".join(segments)
+        if len(raw) > 2 * 1024 * 1024:
+            raise ValueError("邮件 MIME 结构过大。")
+        marker = re.search(rb"\bBODYSTRUCTURE\s+", raw, flags=re.I)
+        if marker is None:
+            raise RuntimeError("IMAP 服务器未返回邮件 MIME 结构。")
+        structure, end = _parse_structure_value(raw, marker.end())
+        envelope = raw[:marker.start()] + raw[end:]
+        uid_values = re.findall(rb"\bUID\s+(\d+)\b", envelope, flags=re.I)
+        if not uid_values or any(int(value) != int(uid) for value in uid_values):
+            raise ValueError("IMAP 返回的邮件 UID 与请求不符。")
+        return _structure_parts(structure)
+
+    def iter_section(self, uid: int, part_id: str, encoded_size: int):
+        if not _SECTION_PATTERN.fullmatch(str(part_id)):
+            raise ValueError("附件 MIME 标识无效。")
+        offset = 0
+        while offset < encoded_size:
+            count = min(_ATTACHMENT_CHUNK_BYTES, encoded_size - offset)
+            with _literal_budget(self.conn, count):
+                status, data = self.conn.uid("fetch", str(int(uid)), f"(UID BODY.PEEK[{part_id}]<{offset}.{count}>)")
+            if status != "OK" or not data:
+                raise MailNotFoundError("附件不存在或已无法读取。")
+            metadata = b" ".join(entry[0] if isinstance(entry, tuple) else entry for entry in data if isinstance(entry, bytes) or (isinstance(entry, tuple) and entry and isinstance(entry[0], bytes)))
+            uid_values = re.findall(rb"\bUID\s+(\d+)\b", metadata, flags=re.I)
+            if not uid_values or any(int(value) != int(uid) for value in uid_values):
+                raise ValueError("IMAP 返回的邮件 UID 与请求不符。")
+            literals = [(entry[0], entry[1]) for entry in data if isinstance(entry, tuple) and len(entry) == 2 and isinstance(entry[1], bytes)]
+            if len(literals) != 1:
+                raise ValueError("IMAP 返回的附件分段无效。")
+            header, chunk = literals[0]
+            match = re.search(rb"BODY\[([^\]]+)\](?:<(\d+)>)?\s+\{(\d+)\}", header, flags=re.I)
+            if match is None or match.group(1).decode("ascii", errors="replace") != part_id or int(match.group(2) or 0) != offset:
+                raise ValueError("IMAP 返回了不匹配的附件分段。")
+            if not chunk or len(chunk) > count or int(match.group(3)) != len(chunk):
+                raise ValueError("IMAP 附件分段长度与请求不符。")
+            offset += len(chunk)
+            yield chunk
 
     def list_folders(self) -> list[MailFolder]:
         # imaplib does not quote an explicitly supplied empty string. Calling
@@ -571,6 +821,86 @@ def fetch_detail_checked(
 def fetch_detail(account: dict[str, Any], uid: int, timeout: int = 20) -> ParsedMail:
     with ImapMailbox(account, timeout) as mailbox:
         return mailbox.fetch_uid(uid)
+
+
+def list_attachments(
+    account: dict[str, Any],
+    uid: int,
+    expected_uidvalidity: int | None,
+    timeout: int = 20,
+    *,
+    folder: str | None = None,
+) -> tuple[int, list[dict[str, Any]]]:
+    with ImapMailbox(account, timeout, folder=folder) as mailbox:
+        current_uidvalidity = mailbox.uidvalidity
+        if expected_uidvalidity is not None and int(expected_uidvalidity) != current_uidvalidity:
+            raise MailboxChangedError(expected_uidvalidity, current_uidvalidity)
+        parts = mailbox.fetch_structure(int(uid))
+        return current_uidvalidity, [
+            {key: value for key, value in part.items() if key not in {"is_attachment", "content_type_header"}}
+            for part in parts if part["is_attachment"]
+        ]
+
+
+def download_attachment(
+    account: dict[str, Any],
+    uid: int,
+    part_id: str,
+    destination: Path,
+    expected_uidvalidity: int | None,
+    timeout: int = 20,
+    *,
+    folder: str | None = None,
+    max_bytes: int,
+) -> dict[str, Any]:
+    """Download a selected MIME part into a new file, removing partial failures."""
+    if not _SECTION_PATTERN.fullmatch(str(part_id)) or int(max_bytes) <= 0:
+        raise ValueError("附件标识或下载容量限制无效。")
+    destination = Path(destination)
+    created = False
+    try:
+        with ImapMailbox(account, timeout, folder=folder) as mailbox:
+            current_uidvalidity = mailbox.uidvalidity
+            if expected_uidvalidity is not None and int(expected_uidvalidity) != current_uidvalidity:
+                raise MailboxChangedError(expected_uidvalidity, current_uidvalidity)
+            parts = mailbox.fetch_structure(int(uid))
+            part = next((item for item in parts if item["part_id"] == str(part_id) and item["is_attachment"]), None)
+            if part is None:
+                raise MailNotFoundError("指定的附件不存在。")
+            if part["encoded_size_bytes"] > int(max_bytes) * 2 + _ATTACHMENT_CHUNK_BYTES:
+                raise ValueError("附件超过可用缓存容量。")
+            decoder = _TransferDecoder(part["transfer_encoding"])
+            digest = hashlib.sha256()
+            size = 0
+            with destination.open("xb") as output:
+                created = True
+                destination.chmod(0o600)
+                for encoded in mailbox.iter_section(int(uid), str(part_id), part["encoded_size_bytes"]):
+                    decoded = decoder.feed(encoded)
+                    size += len(decoded)
+                    if size > int(max_bytes):
+                        raise ValueError("附件超过可用缓存容量。")
+                    output.write(decoded)
+                    digest.update(decoded)
+                tail = decoder.feed(b"", final=True)
+                size += len(tail)
+                if size > int(max_bytes):
+                    raise ValueError("附件超过可用缓存容量。")
+                output.write(tail)
+                digest.update(tail)
+            return {
+                "part_id": str(part_id),
+                "filename": part["filename"],
+                "content_type": part["content_type"],
+                "size_bytes": size,
+                "size_is_estimate": False,
+                "sha256": digest.hexdigest(),
+                "uidvalidity": current_uidvalidity,
+            }
+    except BaseException:
+        if created:
+            destination.unlink(missing_ok=True)
+        raise
 
 
 def test_imap(account: dict[str, Any], timeout: int = 20) -> None:

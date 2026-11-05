@@ -17,6 +17,7 @@ CONFIG_SECTIONS: dict[str, str] = {
     "notification_mode": "notification_settings",
     "narration_provider_id": "notification_settings",
     "llm_write_official_history": "notification_settings",
+    "official_history_placeholder": "notification_settings",
     "narration_prompt": "notification_settings",
     "narration_body_max_chars": "notification_settings",
     "narration_max_tokens": "notification_settings",
@@ -39,8 +40,9 @@ CONFIG_SECTIONS: dict[str, str] = {
     "folder_list_refresh_interval_hours": "storage_settings",
     "body_cache_mode": "storage_settings",
     "body_cache_retention_days": "storage_settings",
-    "body_cache_max_item_kb": "storage_settings",
     "body_cache_max_total_mb": "storage_settings",
+    "attachment_retention_days": "storage_settings",
+    "attachment_cache_max_total_mb": "storage_settings",
     "body_cache_purge_on_remote_delete": "storage_settings",
 }
 

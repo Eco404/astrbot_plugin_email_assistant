@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import smtplib
 import ssl
+import hashlib
+import re
 from collections.abc import Iterable
 from email.message import EmailMessage
 from email.utils import formataddr, parseaddr
 from typing import Any
 
-from .mail_parser import ParsedMail
+from .mail_parser import ParsedMail, safe_attachment_filename
 from .proxy_utils import ProxyConfig, create_connection, proxy_config_from_account
 
 
@@ -132,8 +134,9 @@ def build_draft_message(
     body: str,
     *,
     original: ParsedMail | None = None,
+    attachments: Iterable[Any] = (),
 ) -> EmailMessage:
-    """Build a plain-text draft while preserving optional reply threading headers."""
+    """Build a draft with verified managed files and optional reply headers."""
     from_addr, _, _ = _smtp_identity(account)
     to_values = _validated_addresses(to_addrs, "收件人")
     cc_values = _validated_addresses(cc_addrs, "抄送")
@@ -163,6 +166,24 @@ def build_draft_message(
         if references:
             message["References"] = references
     message.set_content(body)
+    for attachment in attachments:
+        expected_size = int(attachment.size_bytes)
+        if expected_size < 0:
+            raise ValueError("附件大小无效。")
+        with attachment.path.open("rb") as source:
+            payload = source.read(expected_size + 1)
+        if len(payload) != expected_size or hashlib.sha256(payload).hexdigest() != attachment.sha256:
+            raise ValueError("附件内容缺失或已改变，请重新添加附件。")
+        content_type = str(attachment.content_type or "application/octet-stream").lower()
+        if not re.fullmatch(r"[a-z0-9!#$&^_.+-]+/[a-z0-9!#$&^_.+-]+", content_type):
+            content_type = "application/octet-stream"
+        maintype, subtype = content_type.split("/", 1)
+        message.add_attachment(
+            payload,
+            maintype=maintype,
+            subtype=subtype,
+            filename=safe_attachment_filename(attachment.filename, content_type),
+        )
     return message
 
 
@@ -198,6 +219,7 @@ def send_draft_message(
     timeout: int = 20,
     *,
     original: ParsedMail | None = None,
+    attachments: Iterable[Any] = (),
 ) -> None:
     message = build_draft_message(
         account,
@@ -207,6 +229,7 @@ def send_draft_message(
         subject,
         body,
         original=original,
+        attachments=attachments,
     )
     send_message(account, message, timeout)
 

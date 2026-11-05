@@ -5,7 +5,7 @@ from email.message import EmailMessage
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from astrbot_plugin_email_assistant.mail_parser import parse_mail
+from astrbot_plugin_email_assistant.mail_parser import parse_mail, safe_attachment_filename
 
 
 class MailParserTests(unittest.TestCase):
@@ -48,6 +48,20 @@ class MailParserTests(unittest.TestCase):
         message.set_content("abcdefghij")
         parsed = parse_mail(message.as_bytes(), 1)
         self.assertEqual(parsed.body_preview(5), "abcde…")
+
+    def test_inline_image_without_filename_counts_as_attachment(self):
+        message = EmailMessage()
+        message.set_content("<p>image</p>", subtype="html")
+        message.add_related(b"image", maintype="image", subtype="png", cid="<image@example.com>")
+        parsed = parse_mail(message.as_bytes(), 1)
+        self.assertTrue(parsed.has_attachments)
+        self.assertEqual(parsed.body, "image")
+
+    def test_attachment_filename_drops_paths_and_control_characters(self):
+        self.assertEqual(safe_attachment_filename("../../secret.txt"), "secret.txt")
+        self.assertEqual(safe_attachment_filename("C:\\files\\报告.pdf"), "报告.pdf")
+        self.assertEqual(safe_attachment_filename("bad\x00name.bin"), "badname.bin")
+        self.assertEqual(safe_attachment_filename("...", "image/png"), "attachment.png")
 
 
 if __name__ == "__main__":

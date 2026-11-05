@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import mimetypes
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from email import policy
@@ -54,6 +55,14 @@ def decode_mime_header(value: str | None) -> str:
     return "".join(decoded).strip()
 
 
+def safe_attachment_filename(value: str | None, content_type: str = "application/octet-stream") -> str:
+    """Keep an attachment's display name without directories or control bytes."""
+    decoded = decode_mime_header(value).replace("\\", "/").rsplit("/", 1)[-1]
+    cleaned = "".join(char for char in decoded if ord(char) >= 32 and ord(char) != 127)
+    cleaned = cleaned.strip().strip(".")[:240]
+    return cleaned or "attachment" + (mimetypes.guess_extension(content_type) or ".bin")
+
+
 def _html_to_text(html: str) -> str:
     parser = _HTMLTextExtractor()
     parser.feed(html)
@@ -83,7 +92,7 @@ def extract_text_body(message: Message) -> tuple[str, bool]:
             continue
         disposition = (part.get_content_disposition() or "").lower()
         filename = part.get_filename()
-        if disposition == "attachment" or filename:
+        if disposition == "attachment" or filename or part.get_content_maintype() == "image":
             has_attachments = True
             continue
         content_type = part.get_content_type().lower()

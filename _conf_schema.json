@@ -192,6 +192,7 @@
       "notification_mode": {"type": "string", "description": "新邮件通知模式", "hint": "title 模式不调用 LLM 仅通知邮件标题。llm 模式会读取当前 AstrBot 人格后生成邮件转述，不会触发其他插件的 LLM 请求/响应处理。cron 模式使用官方定时任务创建一个很近的一次性主动 Agent 任务，进入完整 AstrBot Agent 与插件事件链，可能受到其他插件的注入、审核或协同处理影响。", "options": ["title", "llm", "cron"], "default": "title"},
       "narration_provider_id": {"type": "string", "description": "邮件转述模型", "hint": "仅用于 llm 模式。留空时使用目标私聊会话当前生效的模型；官方定时任务仍使用该会话的主 Agent 模型。", "_special": "select_provider", "default": ""},
       "llm_write_official_history": {"type": "bool", "description": "LLM 转述写入官方对话历史", "hint": "仅在通知模式为 llm 时生效。发送成功后在对话历史中写入“邮件主动承接占位 + 实际转述”。", "default": false},
+      "official_history_placeholder": {"type": "text", "description": "官方历史用户占位内容", "hint": "仅在 llm 模式且开启历史写入时生效。留空使用内置占位；仅填写 {none} 时使用空占位，写入空字符串。其他文本按原样保存。空用户消息能被 AstrBot 存储和解析，上游模型的兼容性取决于所用 Provider。", "default": ""},
       "narration_prompt": {"type": "text", "description": "邮件转述提示词", "hint": "留空时使用内置提示词。支持 {account_name}、{sender}、{date}、{subject}、{has_attachments}、{body}、{uid}。", "default": ""},
       "narration_body_max_chars": {"type": "int", "description": "转述模型输入的正文最大字符数", "hint": "默认 5000，只作用于新邮件转述。", "default": 5000},
       "narration_max_tokens": {"type": "int", "description": "llm 模式转述最大输出 Token", "hint": "填 0 时不传递 max_tokens；正数只限制 llm 模式转述输出。", "default": 500},
@@ -232,8 +233,8 @@
   },
   "storage_settings": {
     "type": "object",
-    "description": "索引、文件夹与正文缓存",
-    "hint": "控制 plugin_data 中的本地索引、渐进同步和正文缓存。",
+    "description": "索引、文件夹与缓存",
+    "hint": "控制 plugin_data 中的本地索引、渐进同步、正文和附件缓存；正文与附件分别计算总容量。",
     "items": {
       "local_index_enabled": {"type": "bool", "description": "启用本地邮件头索引", "hint": "保存邮件头、同步状态、草稿，并按正文缓存设置保存已读取的纯文本。", "default": true},
       "local_index_initial_days": {"type": "int", "description": "首次索引最近天数", "hint": "随后会分批向更早邮件回填，直到覆盖整个文件夹。", "default": 90},
@@ -245,8 +246,9 @@
       "folder_list_refresh_interval_hours": {"type": "int", "description": "邮件文件夹清单刷新间隔（小时）", "hint": "后台自动执行 IMAP LIST，范围 1 到 720 小时。", "default": 6},
       "body_cache_mode": {"type": "string", "description": "邮件正文缓存模式", "hint": "off 不保存正文；on_demand 缓存已读取的规范化纯文本，不批量下载历史正文。", "options": ["off", "on_demand"], "default": "on_demand"},
       "body_cache_retention_days": {"type": "int", "description": "正文缓存保留天数", "hint": "按最后访问时间清理。", "default": 90},
-      "body_cache_max_item_kb": {"type": "int", "description": "单封正文缓存上限（KB）", "hint": "超过上限只缓存前半部分并记录截断状态。", "default": 512},
-      "body_cache_max_total_mb": {"type": "int", "description": "正文缓存总容量（MB）", "hint": "超过容量后按最久未访问顺序清理。", "default": 200},
+      "body_cache_max_total_mb": {"type": "int", "description": "正文缓存总容量（MiB）", "hint": "完整保存纯文本，超过容量按最久未访问顺序清理；单封超过总容量时正常读取但不保存缓存。", "default": 200},
+      "attachment_retention_days": {"type": "int", "description": "附件保留天数", "hint": "按最后访问时间清理可回收附件，默认 90 天；未完成草稿引用和传输中的文件受保护。", "default": 90},
+      "attachment_cache_max_total_mb": {"type": "int", "description": "附件缓存总容量（MiB）", "hint": "所有账户共享，默认 1024 MiB（1 GiB）。包括草稿附件和传输预留空间；空间不足时回收最久未访问且未被引用的附件，无法回收则拒绝新文件。", "default": 1024},
       "body_cache_purge_on_remote_delete": {"type": "bool", "description": "云端删除时清理正文缓存", "hint": "建议保持开启。邮件移出当前文件夹后会先保留 24 小时供目标文件夹复用；仅在没有其他有效位置时清理，避免把移动误判为删除。", "default": true}
     }
   }
