@@ -6,6 +6,7 @@ import json
 import sqlite3
 import time
 import uuid
+import threading
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
@@ -16,6 +17,14 @@ from .mail_parser import ParsedMail
 
 
 MESSAGE_RELOCATION_GRACE_SECONDS = 86400
+_ATTACHMENT_LOCKS: dict[str, threading.RLock] = {}
+_ATTACHMENT_LOCKS_GUARD = threading.Lock()
+
+
+def attachment_storage_lock(path: Path):
+    key = str(Path(path).resolve())
+    with _ATTACHMENT_LOCKS_GUARD:
+        return _ATTACHMENT_LOCKS.setdefault(key, threading.RLock())
 
 
 def mail_content_hash(mail: ParsedMail) -> str:
@@ -143,6 +152,7 @@ class MailDraft:
     updated_at: float
     sent_at: float | None
     last_error: str
+    attachment_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -329,7 +339,8 @@ class MailHeaderIndex:
                     created_at REAL NOT NULL,
                     updated_at REAL NOT NULL,
                     sent_at REAL,
-                    last_error TEXT NOT NULL DEFAULT ''
+                    last_error TEXT NOT NULL DEFAULT '',
+                    attachment_ids_json TEXT NOT NULL DEFAULT '[]'
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_mail_drafts_list
@@ -337,6 +348,7 @@ class MailHeaderIndex:
                 """
             )
             self._prune_duplicate_ai_cache(connection)
+            MailDatabaseVersion.create_attachment_table(connection)
             connection.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS mail_send_confirmations (
@@ -837,15 +849,6 @@ class MailHeaderIndex:
                 (time.time(), account_id, folder, int(uidvalidity), int(uid)),
             )
 
-    @staticmethod
-    def _truncate_utf8(value: str, max_bytes: int) -> tuple[str, int, bool]:
-        raw = str(value or "").encode("utf-8")
-        limit = max(1, int(max_bytes))
-        if len(raw) <= limit:
-            return str(value or ""), len(raw), False
-        truncated = raw[:limit].decode("utf-8", errors="ignore")
-        return truncated, len(truncated.encode("utf-8")), True
-
     def cache_body(
         self,
         account_id: str,
@@ -853,15 +856,15 @@ class MailHeaderIndex:
         uidvalidity: int,
         uid: int,
         body_text: str,
-        max_item_bytes: int,
+        max_total_bytes: int,
     ) -> CachedMailBody:
         original = str(body_text or "")
         content_hash = hashlib.sha256(original.encode("utf-8")).hexdigest()
-        cached_text, size_bytes, truncated = self._truncate_utf8(
-            original, max_item_bytes
-        )
+        size_bytes = len(original.encode("utf-8"))
+        budget = max(0, int(max_total_bytes))
         now = time.time()
         with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
             message_key = self._message_key_for_location(
                 connection,
                 account_id,
@@ -872,6 +875,15 @@ class MailHeaderIndex:
             )
             if message_key is None:
                 raise KeyError("邮件位置尚未写入本地索引。")
+            if size_bytes > budget or budget == 0:
+                connection.execute(
+                    "DELETE FROM mail_bodies WHERE account_id = ? AND message_key = ?",
+                    (account_id, message_key),
+                )
+                return CachedMailBody(
+                    account_id, folder, int(uidvalidity), int(uid), original,
+                    content_hash, size_bytes, False, now,
+                )
             connection.execute(
                 """
                 INSERT INTO mail_bodies (
@@ -890,23 +902,40 @@ class MailHeaderIndex:
                 (
                     account_id,
                     message_key,
-                    cached_text,
+                    original,
                     content_hash,
                     size_bytes,
-                    1 if truncated else 0,
+                    0,
                     now,
                     now,
                 ),
             )
+            total = int(connection.execute(
+                "SELECT COALESCE(SUM(size_bytes), 0) FROM mail_bodies"
+            ).fetchone()[0])
+            rows = connection.execute(
+                "SELECT account_id, message_key, size_bytes FROM mail_bodies "
+                "WHERE NOT (account_id = ? AND message_key = ?) "
+                "ORDER BY last_accessed_at, fetched_at",
+                (account_id, message_key),
+            ).fetchall()
+            for row in rows:
+                if total <= budget:
+                    break
+                connection.execute(
+                    "DELETE FROM mail_bodies WHERE account_id = ? AND message_key = ?",
+                    (row["account_id"], row["message_key"]),
+                )
+                total -= int(row["size_bytes"])
         return CachedMailBody(
             account_id,
             folder,
             int(uidvalidity),
             int(uid),
-            cached_text,
+            original,
             content_hash,
             size_bytes,
-            truncated,
+            False,
             now,
         )
 
@@ -924,6 +953,7 @@ class MailHeaderIndex:
                 WHERE headers.account_id = ? AND headers.folder = ?
                   AND headers.uidvalidity = ? AND headers.uid = ?
                   AND headers.remote_state = 'active'
+                  AND bodies.truncated = 0
                 """,
                 (account_id, folder, int(uidvalidity), int(uid)),
             ).fetchone()
@@ -1397,7 +1427,34 @@ class MailHeaderIndex:
             updated_at=float(row["updated_at"]),
             sent_at=(float(row["sent_at"]) if row["sent_at"] is not None else None),
             last_error=str(row["last_error"]),
+            attachment_ids=cls._decode_addresses(str(row["attachment_ids_json"])),
         )
+
+    def _validate_draft_attachments(
+        self, connection: sqlite3.Connection, attachment_ids,
+        account_id: str, owner_umo: str, owner_sender_id: str,
+    ) -> tuple[str, ...]:
+        if isinstance(attachment_ids, str):
+            raise ValueError("附件必须是附件标识列表。")
+        normalized = tuple(dict.fromkeys(str(value) for value in (attachment_ids or ())))
+        for attachment_id in normalized:
+            row = connection.execute(
+                "SELECT * FROM mail_attachments WHERE attachment_id = ? AND account_id = ?",
+                (attachment_id, str(account_id)),
+            ).fetchone()
+            if row is None:
+                raise ValueError("附件不存在、已过期或不属于当前邮箱。")
+            if owner_umo and row["owner_umo"] and (
+                str(row["owner_umo"]) != str(owner_umo)
+                or str(row["owner_sender_id"]) != str(owner_sender_id)
+            ):
+                raise PermissionError("不能使用其他会话的附件。")
+            if len(attachment_id) != 32 or any(c not in "0123456789abcdef" for c in attachment_id):
+                raise ValueError("附件标识无效。")
+            path = self.path.parent / "attachments" / attachment_id
+            if path.is_symlink() or not path.is_file() or path.stat().st_size != int(row["size_bytes"]):
+                raise ValueError("附件文件缺失或已损坏，请重新添加。")
+        return normalized
 
     def create_draft(
         self,
@@ -1416,6 +1473,7 @@ class MailHeaderIndex:
         owner_umo: str = "",
         owner_sender_id: str = "",
         status: str = "editing",
+        attachment_ids=(),
     ) -> MailDraft:
         allowed_statuses = {
             "editing", "pending_review", "approved", "sending",
@@ -1430,15 +1488,20 @@ class MailHeaderIndex:
         normalized_to = self._normalize_addresses(to_addrs)
         normalized_cc = self._normalize_addresses(cc_addrs)
         normalized_bcc = self._normalize_addresses(bcc_addrs)
-        with self._connection() as connection:
+        with attachment_storage_lock(self.path), self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            normalized_attachments = self._validate_draft_attachments(
+                connection, attachment_ids, account_id, owner_umo, owner_sender_id,
+            )
             connection.execute(
                 """
                 INSERT INTO mail_drafts (
                     draft_id, account_id, to_json, cc_json, bcc_json,
                     subject, body_text, body_html, reply_folder, reply_uid,
                     reply_message_id, source, owner_umo, owner_sender_id,
-                    status, revision, created_at, updated_at, sent_at, last_error
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, NULL, '')
+                    status, revision, created_at, updated_at, sent_at, last_error,
+                    attachment_ids_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, NULL, '', ?)
                 """,
                 (
                     draft_id,
@@ -1458,6 +1521,7 @@ class MailHeaderIndex:
                     status,
                     now,
                     now,
+                    json.dumps(normalized_attachments),
                 ),
             )
         draft = self.get_draft(draft_id)
@@ -1533,6 +1597,7 @@ class MailHeaderIndex:
             "owner_sender_id",
             "status",
             "last_error",
+            "attachment_ids",
         }
         unknown = set(changes) - allowed
         if unknown:
@@ -1552,7 +1617,14 @@ class MailHeaderIndex:
             "to_addrs": "to_json",
             "cc_addrs": "cc_json",
             "bcc_addrs": "bcc_json",
+            "attachment_ids": "attachment_ids_json",
         }
+        if "attachment_ids" in changes:
+            if isinstance(changes["attachment_ids"], str):
+                raise ValueError("附件必须是附件标识列表。")
+            changes["attachment_ids"] = tuple(dict.fromkeys(
+                str(value) for value in (changes["attachment_ids"] or ())
+            ))
         assignments = []
         params: list[object] = []
         for key, value in changes.items():
@@ -1574,7 +1646,26 @@ class MailHeaderIndex:
             assignments.append("sent_at = ?")
             params.append(now)
         params.extend([str(draft_id), int(expected_revision)])
-        with self._connection() as connection:
+        with attachment_storage_lock(self.path), self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                "SELECT * FROM mail_drafts WHERE draft_id = ?", (str(draft_id),),
+            ).fetchone()
+            if existing is None:
+                raise KeyError("草稿不存在。")
+            if int(existing["revision"]) != int(expected_revision):
+                raise RuntimeError("草稿已被其他操作修改，请刷新后重试。")
+            if "attachment_ids" in changes:
+                normalized = self._validate_draft_attachments(
+                    connection, changes["attachment_ids"], existing["account_id"],
+                    changes.get("owner_umo", existing["owner_umo"]),
+                    changes.get("owner_sender_id", existing["owner_sender_id"]),
+                )
+                if normalized != self._decode_addresses(existing["attachment_ids_json"]):
+                    if existing["status"] in {"sending", "sent", "cancelled"}:
+                        raise PermissionError("当前草稿状态不允许修改附件。")
+                    # Attachment changes require a fresh approval of the complete draft.
+                    assignments.append("status = 'editing'")
             cursor = connection.execute(
                 f"""
                 UPDATE mail_drafts SET {', '.join(assignments)}

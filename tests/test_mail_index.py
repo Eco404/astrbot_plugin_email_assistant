@@ -229,17 +229,17 @@ class MailHeaderIndexTests(unittest.TestCase):
         latest = self.index.latest("one", "INBOX")
         self.assertEqual(latest.uid, 2)
 
-    def test_body_cache_truncates_and_purges_remote_missing(self):
+    def test_body_cache_preserves_full_text_and_purges_remote_missing(self):
         timestamp = datetime(2026, 7, 1).timestamp()
         self.index.apply_sync(
             "one", "INBOX", 10, 1, [mail(1, timestamp)]
         )
         cached = self.index.cache_body(
-            "one", "INBOX", 10, 1, "abcdef", max_item_bytes=5
+            "one", "INBOX", 10, 1, "abcdef", max_total_bytes=6
         )
-        self.assertEqual(cached.body_text, "abcde")
-        self.assertTrue(cached.truncated)
-        self.assertEqual(self.index.get_cached_body("one", "INBOX", 10, 1).body_text, "abcde")
+        self.assertEqual(cached.body_text, "abcdef")
+        self.assertFalse(cached.truncated)
+        self.assertEqual(self.index.get_cached_body("one", "INBOX", 10, 1).body_text, "abcdef")
         stats = self.index.stats("one", "INBOX")
         self.assertEqual(stats["cached_bodies"], 1)
         self.index.mark_remote_missing("one", "INBOX", 10, 1)
@@ -336,7 +336,7 @@ class MailHeaderIndexTests(unittest.TestCase):
     def test_database_version_is_recorded_and_legacy_database_is_rejected(self):
         with self.index._connection() as connection:
             self.assertEqual(
-                MailDatabaseVersion.current_database_version(connection), "1"
+                MailDatabaseVersion.current_database_version(connection), "2"
             )
         self.index.initialize()
         with self.index._connection() as connection:
@@ -362,7 +362,7 @@ class MailHeaderIndexTests(unittest.TestCase):
                 ) VALUES ('v99', 'future', '2026-07-01T00:00:00+00:00', 0)
                 """
             )
-        with self.assertRaisesRegex(DatabaseVersionError, "当前插件需要 v1"):
+        with self.assertRaisesRegex(DatabaseVersionError, "当前插件需要 v2"):
             MailHeaderIndex(incompatible_path).initialize()
 
     def test_body_cache_prunes_to_total_budget(self):
@@ -375,6 +375,28 @@ class MailHeaderIndexTests(unittest.TestCase):
         self.index.cache_body("one", "INBOX", 10, 2, "5678", 1024)
         self.assertEqual(self.index.prune_body_cache(90, 4), 1)
         self.assertEqual(self.index.stats("one", "INBOX")["cached_bodies"], 1)
+
+    def test_oversized_body_is_returned_complete_without_evicting_other_cache(self):
+        timestamp = datetime(2026, 7, 1).timestamp()
+        self.index.apply_sync(
+            "one", "INBOX", 10, 2,
+            [mail(1, timestamp), mail(2, timestamp + 60)],
+        )
+        self.index.cache_body("one", "INBOX", 10, 1, "abcd", 6)
+        result = self.index.cache_body("one", "INBOX", 10, 2, "邮件正文", 6)
+        self.assertEqual(result.body_text, "邮件正文")
+        self.assertFalse(result.truncated)
+        self.assertIsNone(self.index.get_cached_body("one", "INBOX", 10, 2))
+        self.assertEqual(self.index.get_cached_body("one", "INBOX", 10, 1).body_text, "abcd")
+
+    def test_body_insertion_enforces_total_budget_across_accounts(self):
+        timestamp = datetime(2026, 7, 1).timestamp()
+        self.index.apply_sync("one", "INBOX", 10, 1, [mail(1, timestamp)])
+        self.index.apply_sync("two", "INBOX", 10, 2, [mail(2, timestamp)])
+        self.index.cache_body("one", "INBOX", 10, 1, "abcd", 6)
+        self.index.cache_body("two", "INBOX", 10, 2, "1234", 6)
+        self.assertIsNone(self.index.get_cached_body("one", "INBOX", 10, 1))
+        self.assertEqual(self.index.get_cached_body("two", "INBOX", 10, 2).body_text, "1234")
 
     def test_draft_crud_uses_optimistic_revision(self):
         draft = self.index.create_draft(
