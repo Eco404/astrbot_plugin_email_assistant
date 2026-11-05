@@ -3,17 +3,37 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)，
 并且遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
-## [Unreleased]
+## [3.0.0] - 2026-11-05
+
+### 新增
+
+- 支持按需列举和分块下载邮件附件，WebUI 可下载到电脑或手机，Bot 可向当前私聊发送文件。
+- 新邮件与回复草稿支持文件和图片，WebUI 支持多文件上传、移除、审核与发送前确认；普通正文读取不下载二进制附件。
+- 附件共用独立缓存预算，默认保留 90 天、总容量 1024 MiB；草稿引用与传输租约保护文件，容量不足明确拒绝新增。
+- 支持自定义官方历史用户占位；留空使用内置占位，仅填写 `{none}` 时存储空字符串。
+- 增加账户独立轮询退避和抖动，以及同步/发送耗时、通知结果、正文缓存命中和附件用量指标。
+- 数据库 v1 到 v2 的启动期迁移包含完整性校验备份、事务回滚和数据保留；提供独立升级及恢复指南。
 
 ### 变更
 
 - 将三个邮件查询工具收敛为 `email_assistant_query_mailbox`，通过 `operation=list`、`latest` 或 `read` 区分邮件头列表、最新邮件和按 UID 阅读。
 - 将邮件总结与翻译工具收敛为 `email_assistant_process_message`，通过 `task=summary` 或 `translate` 区分处理类型。
 - 确认发送工具仅在当前消息匹配一次性确认格式时注入；取消草稿工具仅在当前用户存在可取消 Bot 草稿时注入。
+- 移除单封正文缓存上限，保存完整正文；单封超过总预算时只读取、不缓存，旧截断缓存按需重新读取。
+- 附件修改使审核和确认码失效；发送前校验文件完整性，异步取消与并发操作保留文件保护及一次性发送约束。
+- 邮件中心扩展附件列表、上传进度与失败反馈，适配窄屏触控及长文件名确认弹层。
 
 ### 兼容性
 
 - 已配置人格工具白名单时，将 `email_assistant_list_messages`、`email_assistant_get_latest_message`、`email_assistant_show_message` 替换为 `email_assistant_query_mailbox`；将 `email_assistant_summarize_message`、`email_assistant_translate_message` 替换为 `email_assistant_process_message`。
+- 七个 `email_assistant_` 工具作为 3.0 公共契约发布，不注册旧查询/处理名称的兼容别名；详细映射与宿主要求见 [3.0 升级指南](docs/upgrade-3.0.md)。
+- WebUI 附件要求宿主 Bridge 支持上传、下载及二进制响应；空历史用户内容可持久化，但各 Provider 出站处理存在差异。
+
+### 验证
+
+- 自动化验证迁移保留与失败回滚、跨账户附件配额、草稿保护、完整性、确认失效、并发/取消发送、MIME 往返及接口权限。
+- Chromium 验证桌面、断点、390px/320px 手机浅色和深色场景，WebKit 验证 390px 手机双主题；包含附件下载请求、上传部分失败、未保存内容、审核与确认交互。
+- 本机 AstrBot 4.29.3 离线验证实际工具注册、附件数组 schema，以及通过真实会话管理器与 SQLite 保存、重新加载空用户内容。未调用真实邮箱或模型服务。
 
 ## [2.4.1] - 2026-08-29
 
